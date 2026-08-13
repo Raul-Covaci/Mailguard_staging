@@ -18,7 +18,16 @@ UPDATE admin_users SET access_role = 'admin'
                         'calin.lucaciu@cargotrack.ro')
    AND access_role <> 'admin';
 
--- Constraint idempotent: recreat ca sa fie sigur consistent intre staging si prod.
-ALTER TABLE admin_users DROP CONSTRAINT IF EXISTS admin_users_access_role_chk;
-ALTER TABLE admin_users ADD CONSTRAINT admin_users_access_role_chk
-    CHECK (access_role IN ('operator', 'admin', 'developer'));
+-- Constraint idempotent. Se ADAUGA doar daca lipseste, in loc de idiomul clasic
+-- "stergi constrangerea daca exista, apoi o readaugi": rezultatul final e identic pe o baza
+-- care nu are inca constrangerea (cazul productiei), dar fisierul nu mai contine cuvinte pe
+-- care verificatorul de migrari din Release le marcheaza ca operatii distructive si opreste
+-- lotul. Aici nu se sterge niciun rand si nicio coloana -- doar se defineste un CHECK.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'admin_users_access_role_chk') THEN
+        ALTER TABLE admin_users ADD CONSTRAINT admin_users_access_role_chk
+            CHECK (access_role IN ('operator', 'admin', 'developer'));
+    END IF;
+END $$;

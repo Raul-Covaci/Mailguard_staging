@@ -801,18 +801,40 @@ def _fetch_device_ops_rows(db: Session, department: str, first: _dt.date, catego
             for op_id, p_start, p_end in raw]
 
 
+# ---------------------------------------------------------------- directia apelului
+#
+# Feed-ul CTS `/cts/calls` NU trimite directia apelului -- payload-ul complet e status / priority /
+# client_id / started_at / ring_seconds / duration_seconds / assignee_* / calltrack_id /
+# ctk_uniqueid (verificat pe raw). Singura sursa e ingestul local While1 (`calls.direction`,
+# valori 'inbound' / 'outbound'), legat prin `cts_calls_ground_truth.call_local_id`.
+#
+# Se scoreaza DOAR apelurile PRIMITE (decizie business owner, 2026-08-13): un apel dat de operator
+# nu are timp de asteptare al clientului, deci `cts_response_seconds` (= ring, timpul pana la
+# raspuns) nu masoara nimic acolo. Distorsiunea era mare: pe contabilitate/august intrau in scor
+# 78 de apeluri iesite fata de 18 primite.
+#
+# Acoperirea joinului: 2425 din 2446 de randuri pe august (99.1%). Cele 21 nepotrivite au TOATE
+# `cts_response_seconds` NULL, deci erau deja in afara scorului -- filtrul strict pe 'inbound'
+# nu pierde niciun rand masurabil.
+_APEL_INBOUND_JOIN = "LEFT JOIN calls cdir ON cdir.id = cgt.call_local_id"
+_APEL_INBOUND_WHERE = "cdir.direction = 'inbound'"
+
+
 def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
-    """Apeluri raspunse de operatorii dept-ului -- (op_id, mins), unde `mins` e de fapt SECUNDE
-    (cts_response_seconds = ring_seconds = timp pana la raspuns, confirmat in cts_calls_sync.py).
+    """Apeluri PRIMITE raspunse de operatorii dept-ului -- (op_id, mins), unde `mins` e de fapt
+    SECUNDE (cts_response_seconds = ring_seconds = timp pana la raspuns, confirmat in
+    cts_calls_sync.py).
 
     Masurabil = cts_response_seconds IS NOT NULL si departamentul era activ in ziua apelului.
     Filtru hibrid: pontaj (department_attendance) > program (department_schedule) > backward compat.
-    Daca departamentul nu are niciun program configurat (department_schedule gol): includem tot."""
+    Daca departamentul nu are niciun program configurat (department_schedule gol): includem tot.
+    Apelurile de IESIRE sint excluse -- vezi _APEL_INBOUND_WHERE."""
     return db.execute(
-        text("""
+        text(f"""
             SELECT edm.id AS op_id, cgt.cts_response_seconds AS mins
             FROM cts_calls_ground_truth cgt
             JOIN employee_department_mapping edm ON lower(cgt.cts_assignee_email) = lower(edm.email)
+            {_APEL_INBOUND_JOIN}
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
                 AND da.work_date = (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date
@@ -826,6 +848,7 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
             ) dsc ON dsc.department = edm.department
             WHERE edm.department=:d AND edm.enabled=true
               AND cgt.cts_response_seconds IS NOT NULL
+              AND {_APEL_INBOUND_WHERE}
               AND date_trunc('month', cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
               AND (
                 CASE
@@ -1047,6 +1070,9 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 LEFT JOIN calls ca ON ca.id = c.call_local_id
                 WHERE edm.department=:d AND edm.enabled=true
                   AND c.cts_response_seconds IS NOT NULL
+                  -- doar apeluri PRIMITE, ca in _fetch_apel_rows (aici tabela `calls` e deja
+                  -- alaturata ca `ca`, pentru numarul de telefon)
+                  AND ca.direction = 'inbound'
                   AND date_trunc('month', c.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
             """),
             {"d": department, "first": first},
@@ -2567,6 +2593,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
                    cgt.cts_duration_seconds AS dur_secs
             FROM cts_calls_ground_truth cgt
             JOIN employee_department_mapping edm ON lower(cgt.cts_assignee_email) = lower(edm.email)
+            LEFT JOIN calls cdir ON cdir.id = cgt.call_local_id
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
                 AND da.work_date = (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date
@@ -2580,6 +2607,8 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             ) dsc ON dsc.department = edm.department
             WHERE edm.enabled = true AND edm.department = ANY(:depts)
               AND cgt.cts_response_seconds IS NOT NULL
+              -- doar apeluri PRIMITE, aceeasi regula ca in raportul lunar (_APEL_INBOUND_WHERE)
+              AND cdir.direction = 'inbound'
               """ + apel_uid_filter + """
               AND (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
               AND (
