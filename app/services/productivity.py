@@ -20,6 +20,7 @@ from __future__ import annotations
 import calendar
 import datetime as _dt
 import json
+import re as _re
 import statistics
 from typing import Optional
 
@@ -663,6 +664,40 @@ def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: O
             for op_id, cat, p_start, p_end in raw]
 
 
+# ---------------------------------------------------------------- identificarea device-ului (task-uri)
+#
+# Feed-ul CTS `/cts/tasks` NU trimite niciun camp de device -- payload-ul complet e:
+# task_name / description / category_name / client_id / assignee_* (verificat pe raw_payload).
+# Numarul de inmatriculare apare doar in TEXT (titlu sau descriere), iar pentru unele tipuri de
+# task nici acolo (ex. "HU-GO: suspended device went into HU" -> descrierea e doar pozitia GPS).
+# Extragem ce se poate din text; restul raman fara device pana cand IRIS expune campul in feed.
+#
+# Formate reale observate: B39GIN, SM11AGM, SV88ZKX, BH99CTS (numar RO), DGD022 / AKD318 / CQL177
+# (cod device 3 litere + 3 cifre), 000070000398754 (IMEI, 15 cifre).
+_DEVICE_PATTERNS = [
+    _re.compile(r"\b[A-Z]{1,2}[- ]?\d{2,3}[- ]?[A-Z]{3}\b"),   # numar RO
+    _re.compile(r"\b[A-Z]{3}\d{3}\b"),                          # cod device
+    _re.compile(r"\b\d{15}\b"),                                 # IMEI
+]
+
+
+def _extract_device(*texts) -> Optional[str]:
+    """Primul identificator de device gasit in textele date (in ordinea patternurilor).
+
+    Ordinea conteaza: cautam intai numarul de inmatriculare in TOATE textele, abia apoi codul
+    de device, apoi IMEI-ul -- altfel un titlu fara numar ar face sa castige IMEI-ul din descriere
+    desi numarul exista mai jos in acelasi text.
+    """
+    for rx in _DEVICE_PATTERNS:
+        for t in texts:
+            if not t:
+                continue
+            m = rx.search(str(t))
+            if m:
+                return m.group(0).strip()
+    return None
+
+
 _TASK_FAMILY_KEYWORDS = ("cargobox", "bgtoll", "etoll", "hugo")
 
 # task_type exact care intra in fiecare familie -- restul (BGToll: sub balance etc.) merg la general.
@@ -908,7 +943,8 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
         raw = db.execute(
             text(f"""
                 SELECT t.assignee_employee_id AS op_id, edm.name AS op_name, t.id AS row_id,
-                       t.task_type, t.title AS subiect, cl.name AS client,
+                       t.task_type, t.title AS subiect, t.description AS descriere,
+                       cl.name AS client,
                        t.cts_created_at AS p_start, t.cts_updated_at AS p_end
                 FROM cts_task_ground_truth t
                 JOIN employee_department_mapping edm ON edm.id = t.assignee_employee_id
@@ -931,6 +967,11 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
             out.append({
                 "id": r.row_id, "op_id": r.op_id, "solved_by": r.op_name,
                 "client": r.client, "subiect": r.subiect, "categorie": r.task_type,
+                # Numarul de device nu vine ca atare din CTS -- se extrage din titlu/descriere
+                # (vezi _extract_device). `descriere` ramane expusa integral ca sa se poata
+                # identifica task-ul si acolo unde textul nu contine un numar recunoscut.
+                "device": _extract_device(r.subiect, r.descriere),
+                "descriere": r.descriere,
                 "created_at": _iso(r.p_start), "solved_at": _iso(r.p_end),
                 "durata": round(mins, 1) if mins is not None else None,
                 "status": _bd_status(mins, limita),
@@ -943,11 +984,18 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
         raw = db.execute(
             text("""
                 SELECT d.closed_by_employee_id AS op_id, edm.name AS op_name, d.id AS row_id,
-                       d.action_type, d.device_serial AS subiect, cl.name AS client,
+                       d.action_type, d.description AS subiect,
+                       d.device_serial AS device, d.device_imei AS device_imei,
+                       -- `device_operations.client_id` e NULL pe toate randurile (view-ul DV nu-l
+                       -- trimite), deci join-ul pe clients nu returna niciodata nimic si coloana
+                       -- Client aparea goala. `client_name` vine din DV si e populat -- il folosim
+                       -- ca sursa, pastrand join-ul ca prioritate pentru cand campul se va popula.
+                       COALESCE(cl.name, cx.name, d.client_name) AS client,
                        d.finished_at AS p_start, d.closed_at AS p_end
                 FROM device_operations d
                 LEFT JOIN employee_department_mapping edm ON edm.id = d.closed_by_employee_id
                 LEFT JOIN clients cl ON cl.id = d.client_id
+                LEFT JOIN clients cx ON cx.iris_client_id = d.client_id
                 WHERE d.closed_by_employee_id IS NOT NULL
                   AND d.action_type = :cat
                   AND d.finished_at IS NOT NULL AND d.closed_at IS NOT NULL
@@ -960,6 +1008,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
             out.append({
                 "id": r.row_id, "op_id": r.op_id, "solved_by": r.op_name,
                 "client": r.client, "subiect": r.subiect, "categorie": r.action_type,
+                "device": r.device, "device_imei": r.device_imei,
                 "created_at": _iso(r.p_start), "solved_at": _iso(r.p_end),
                 "durata": round(mins, 1) if mins is not None else None,
                 "status": _bd_status(mins, limita),
@@ -1419,6 +1468,30 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
             o = op_vol_by_tip.get(tip, 0)
             return round(100.0 * o / d, 2) if d > 0 else None
 
+        # CONTRIBUTIE PONDERATA (cerinta 2026-08-13): cat la suta din productivitatea echipei
+        # tine de acest om, dupa REGULILE departamentului. `cotizare` simpla numara bucati si
+        # trateaza un mail la fel ca un task CargoBox; aici fiecare obiectiv intra cu ponderea
+        # lui din configurare (ex. suport_2: email 20, task 20, apel 8, device_ops 52 cumulat).
+        #
+        #   contributie = Σ_obiectiv ( pondere_o × volum_op_o / volum_dept_o ) / Σ_obiectiv pondere_o
+        #
+        # Se insumeaza doar obiectivele cu volum de departament > 0 (un obiectiv fara nicio
+        # intrare in luna nu poate imparti nimic si i-ar dilua pe ceilalti).
+        # Suma pe echipa da 100% mai putin partea rezolvata de oameni care nu mai sunt operatori
+        # activi ai departamentului in luna respectiva (plecati, mutati) -- randurile lor exista
+        # in volumul de departament, dar nu au un rand in tabel.
+        contrib_sum = 0.0
+        contrib_weight = 0.0
+        for o in objectives:
+            key = (o["tip"], o["categorie"] or "__general__")
+            dept_total = per_obj[key]["total"]
+            if dept_total <= 0:
+                continue
+            op_total = (obj_slots.get(key) or {}).get("total", 0)
+            contrib_sum += o["pondere"] * (op_total / dept_total)
+            contrib_weight += o["pondere"]
+        contributie = round(100.0 * contrib_sum / contrib_weight, 2) if contrib_weight > 0 else None
+
         operatori.append({
             "id": oid,
             "name": op_meta[oid]["name"],
@@ -1428,6 +1501,7 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
             "measurable": po["measurable"],
             "measurable_total": measurable_total_op,
             "achieved": achieved_op,
+            "contributie": contributie,
             "vol_email": op_vol_by_tip.get("email", 0),
             "vol_task": op_vol_by_tip.get("task", 0),
             "vol_apel": op_vol_by_tip.get("apel", 0),
@@ -1605,7 +1679,7 @@ def aggregate_reports(reports: list) -> dict:
                     "department_label": op.get("department_label", ""),
                     "mails": 0, "volum_total": 0, "measurable": 0, "in_timp_w": 0.0,
                     "weight_active": 0.0,
-                    "vol_email": 0, "vol_task": 0, "vol_apel": 0,
+                    "vol_email": 0, "vol_task": 0, "vol_apel": 0, "vol_device_ops": 0,
                     "_obj_slots": {},  # (tip, cat) -> {measurable, in_timp, pondere}
                 }
             a = op_acc[oid]
@@ -1615,6 +1689,7 @@ def aggregate_reports(reports: list) -> dict:
             a["vol_email"] += op.get("vol_email") or 0
             a["vol_task"] += op.get("vol_task") or 0
             a["vol_apel"] += op.get("vol_apel") or 0
+            a["vol_device_ops"] += op.get("vol_device_ops") or 0
 
     # Recalcul achieved per operator din obiectivele agregate per operator
     for r in reports:
@@ -1635,22 +1710,41 @@ def aggregate_reports(reports: list) -> dict:
                     a["weight_active"] += op["measurable"]
 
     dept_vol_by_tip: dict = {}
+    pondere_by_tip: dict = {}
     for acc in obj_acc.values():
         tip = acc["tip"]
         dept_vol_by_tip[tip] = dept_vol_by_tip.get(tip, 0) + acc["total"]
+        pondere_by_tip[tip] = pondere_by_tip.get(tip, 0.0) + float(acc["pondere"])
 
     operatori_out = []
     for a in op_acc.values():
         achieved_op = round(a["in_timp_w"] / a["weight_active"], 2) if a["weight_active"] > 0 else None
+
+        # Contributia ponderata pe interval. Pe multi-luna raspunsul lunar nu pastreaza volumele
+        # per (tip, categorie) ale operatorului, doar per TIP, deci ponderile se cumuleaza la
+        # nivel de tip (ex. suport_1: task general 20 + CargoBox 5 = 25). Diferenta apare doar
+        # daca omul are un mix pe categorii diferit de al echipei in interiorul aceluiasi tip;
+        # raportul pe 1 luna (department_report) ramane calculul exact, per obiectiv.
+        contrib_sum = 0.0
+        contrib_weight = 0.0
+        for tip_key, pond in pondere_by_tip.items():
+            dept_v = dept_vol_by_tip.get(tip_key, 0)
+            if dept_v <= 0:
+                continue
+            contrib_sum += pond * (a.get("vol_" + tip_key, 0) / dept_v)
+            contrib_weight += pond
+        contributie = round(100.0 * contrib_sum / contrib_weight, 2) if contrib_weight > 0 else None
 
         def _cotiz(tip_key):
             d = dept_vol_by_tip.get(tip_key, 0)
             o = a.get("vol_" + tip_key, 0)
             return round(100.0 * o / d, 2) if d > 0 else None
 
-        task_vol = a["vol_task"]
-        dept_task = dept_vol_by_tip.get("task", 0) + dept_vol_by_tip.get("device_ops", 0)
-        cotiz_task = round(100.0 * task_vol / dept_task, 2) if dept_task > 0 else None
+        # `cotiz_task` imparte la volumul de TASK-uri, nu la task + device_ops cum facea pana
+        # acum: operatiunile pe echipamente au propria coloana (`cotiz_device_ops`), iar
+        # denominatorul comun facea ca aceeasi persoana sa aiba alt procent pe 1 luna
+        # (department_report, doar task) fata de 3/6/12 luni (agregat, task + operatiuni).
+        cotiz_task = _cotiz("task")
 
         operatori_out.append({
             "id": a["id"], "name": a["name"],
@@ -1659,10 +1753,13 @@ def aggregate_reports(reports: list) -> dict:
             "cotizare": round(100.0 * a["mails"] / volum, 2) if volum > 0 else 0.0,
             "measurable": a["measurable"],
             "achieved": achieved_op,
+            "contributie": contributie,
             "vol_email": a["vol_email"], "vol_task": a["vol_task"], "vol_apel": a["vol_apel"],
+            "vol_device_ops": a["vol_device_ops"],
             "cotiz_email": _cotiz("email"),
             "cotiz_task": cotiz_task,
             "cotiz_apel": _cotiz("apel"),
+            "cotiz_device_ops": _cotiz("device_ops"),
         })
     operatori_out.sort(key=lambda x: x["volum_total"], reverse=True)
 

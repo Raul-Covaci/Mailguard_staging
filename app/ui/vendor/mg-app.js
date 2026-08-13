@@ -10653,7 +10653,9 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
         onChange:function(e){ setDFrom(e.target.value); } }),
       h('input', { key:'dt', type:'date', value:dTo, style:inp, title:'Soluționat până la',
         onChange:function(e){ setDTo(e.target.value); } }),
-      h('input', { key:'q', type:'search', value:search, placeholder:'Caută client sau subiect…',
+      h('input', { key:'q', type:'search', value:search,
+        placeholder:(tip === 'task' || tip === 'device_ops')
+          ? 'Caută client, subiect sau device…' : 'Caută client sau subiect…',
         style:Object.assign({}, inp, { flex:'1 1 220px', minWidth:180 }),
         onChange:function(e){ setSearch(e.target.value); } }),
       (status || userId || search || dFrom || dTo)
@@ -10691,6 +10693,10 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
             }
             return [
               sortTh('client', 'Client'),
+              // Numărul de device: la operațiuni vine direct din CTS (device_serial), la task-uri
+              // e extras din titlu/descriere (CTS nu trimite câmpul) — vezi _extract_device.
+              (tip === 'task' || tip === 'device_ops')
+                ? h('th', { key:'device', style:th }, 'Device') : null,
               h('th', { key:'subiect', style:th }, tip === 'apel' ? 'Telefon' : 'Subiect'),
               sortTh('created_at', 'Creat'),
               sortTh('solved_at', 'Soluționat'),
@@ -10704,10 +10710,22 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
             return h('tr', { key:(it.id || i) }, [
               h('td', { key:'a', style:Object.assign({}, td, { fontWeight:600, maxWidth:200 }) },
                 it.client || '—'),
-              h('td', { key:'b', style:Object.assign({}, td, { maxWidth:340, color:'var(--t2)' }) },
+              (tip === 'task' || tip === 'device_ops')
+                ? h('td', { key:'dev', style:Object.assign({}, td, { whiteSpace:'nowrap',
+                      fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize:12.5 }),
+                    title: it.device_imei ? ('ID device CTS: ' + it.device_imei) : null },
+                    it.device
+                      ? it.device
+                      : h('span', { style:{ color:'var(--t3)' },
+                          title:'CTS nu trimite numărul de device pe task-uri; aici nu apare nici în text.' }, '—'))
+                : null,
+              h('td', { key:'b', style:Object.assign({}, td, { maxWidth:340, color:'var(--t2)' }),
+                  // Descrierea completă a task-ului, pentru cazurile în care titlul e generic
+                  // („carGObox: device discrepancy") și nu identifică singur task-ul.
+                  title: it.descriere || null },
                 tip === 'apel'
                   ? (it.telefon || '—')
-                  : (it.subiect || '[fără subiect]')),
+                  : (it.subiect || (it.descriere ? String(it.descriere).slice(0, 120) : '[fără subiect]'))),
               h('td', { key:'c', style:Object.assign({}, tdN, { textAlign:'left' }) },
                 prodBdDT(it.created_at)),
               h('td', { key:'d', style:Object.assign({}, tdN, { textAlign:'left' }) },
@@ -11023,7 +11041,8 @@ function ProdDeptCard({ d, isForecast }) {
       var hasTask = !!hasTips['task'];
       var hasApel = !!hasTips['apel'];
       var hasDeviceOps = !!hasTips['device_ops'];
-      var colSpan = 1 + (hasEmail ? 2 : 0) + (hasTask ? 2 : 0) + (hasApel ? 2 : 0) + (hasDeviceOps ? 2 : 0) + 1;
+      // +1 pentru coloana „Contribuție", +1 pentru „Performanță"
+      var colSpan = 1 + (hasEmail ? 2 : 0) + (hasTask ? 2 : 0) + (hasApel ? 2 : 0) + (hasDeviceOps ? 2 : 0) + 2;
       var thS = Object.assign({}, th,  { borderBottom:'1px solid var(--bd)', paddingTop:10, paddingBottom:10 });
       var thNS = Object.assign({}, thNum, { borderBottom:'1px solid var(--bd)', paddingTop:10, paddingBottom:10 });
       return h('div', { key:'ops', style:{ overflowX:'auto', marginTop:14, borderRadius:10, border:'1px solid var(--bd)' } }, h('table', { style:{ width:'100%', minWidth:720, borderCollapse:'collapse' } }, [
@@ -11037,6 +11056,15 @@ function ProdDeptCard({ d, isForecast }) {
           hasApel  ? h('th', { key:'ca', style:thNS, onClick:function(){ sortBy('cotiz_apel'); } }, 'Cotiz. apel%'  + sortArrow('cotiz_apel'))  : null,
           hasDeviceOps ? h('th', { key:'dv', style:thNS, onClick:function(){ sortBy('vol_device_ops'); } }, 'Operațiuni' + sortArrow('vol_device_ops')) : null,
           hasDeviceOps ? h('th', { key:'dc', style:thNS, onClick:function(){ sortBy('cotiz_device_ops'); } }, 'Cotiz. oper.%' + sortArrow('cotiz_device_ops')) : null,
+          // Contribuție = cât din productivitatea echipei ține de acest om, cu ponderea fiecărui
+          // obiectiv al departamentului (un mail nu cântărește cât o operațiune pe echipament).
+          // Coloanele „Cotiz." de mai sus numără bucăți, fără pondere.
+          h('th', { key:'cb', style:thNS, onClick:function(){ sortBy('contributie'); },
+            title:'Cât din productivitatea echipei ține de acest om, ponderat cu obiectivele '
+                + 'departamentului (email/task/apel/operațiuni), nu doar ca număr de bucăți. '
+                + 'Suma pe echipă dă 100% minus partea rezolvată de oameni care nu mai sunt '
+                + 'operatori activi ai departamentului în perioada afișată.' },
+            'Contribuție%' + sortArrow('contributie')),
           h('th', { style:thNS, onClick:function(){ sortBy('achieved'); } }, 'Performanță' + sortArrow('achieved'))
         ])),
         h('tbody', { key:'b' }, ops.length ? (function(){
@@ -11066,17 +11094,20 @@ function ProdDeptCard({ d, isForecast }) {
           var taskVals  = ops.map(function(o){ return o.cotiz_task; });
           var apelVals  = ops.map(function(o){ return o.cotiz_apel; });
           var deviceOpsVals = ops.map(function(o){ return o.cotiz_device_ops; });
+          var contribVals = ops.map(function(o){ return o.contributie; });
           var achVals   = ops.map(function(o){ return o.achieved; });
           var colColorEmail = buildColRank(emailVals.filter(function(v){ return v != null; }));
           var colColorTask  = buildColRank(taskVals.filter(function(v){ return v != null; }));
           var colColorApel  = buildColRank(apelVals.filter(function(v){ return v != null; }));
           var colColorDeviceOps = buildColRank(deviceOpsVals.filter(function(v){ return v != null; }));
+          var colColorContrib = buildColRank(contribVals.filter(function(v){ return v != null; }));
           var colColorAch   = buildColRank(achVals.filter(function(v){ return v != null; }));
 
           var maxEmail = Math.max.apply(null, emailVals.map(function(v){ return v || 0; }));
           var maxTask  = Math.max.apply(null, taskVals.map(function(v){ return v || 0; }));
           var maxApel  = Math.max.apply(null, apelVals.map(function(v){ return v || 0; }));
           var maxDeviceOps = Math.max.apply(null, deviceOpsVals.map(function(v){ return v || 0; }));
+          var maxContrib = Math.max.apply(null, contribVals.map(function(v){ return v || 0; }));
 
           function miniBar(val, maxVal, color){
             var pct = maxVal > 0 ? Math.round((val / maxVal) * 100) : 0;
@@ -11121,6 +11152,9 @@ function ProdDeptCard({ d, isForecast }) {
               hasApel  ? h('td', { key:'ca', style:Object.assign({}, td, { minWidth:110 }) }, o.cotiz_apel  == null ? h('span', { style:{ color:'var(--t3)' } }, '—') : miniBar(o.cotiz_apel,  maxApel,  colColorApel(o.cotiz_apel))) : null,
               hasDeviceOps ? h('td', { key:'dv', style:tdNum }, prodNum(o.vol_device_ops)) : null,
               hasDeviceOps ? h('td', { key:'dc', style:Object.assign({}, td, { minWidth:110 }) }, o.cotiz_device_ops == null ? h('span', { style:{ color:'var(--t3)' } }, '—') : miniBar(o.cotiz_device_ops, maxDeviceOps, colColorDeviceOps(o.cotiz_device_ops))) : null,
+              h('td', { key:'cb', style:Object.assign({}, td, { minWidth:110 }) },
+                o.contributie == null ? h('span', { style:{ color:'var(--t3)' } }, '—')
+                  : miniBar(o.contributie, maxContrib, colColorContrib(o.contributie))),
               h('td', { style:Object.assign({}, tdNum, { paddingRight:10 }) }, perfBadge(o.achieved))
             ]);
             if (!hasBreakdown || !isOpen) return mainRow;
@@ -11296,16 +11330,17 @@ function prodExportPdf(opts) {
       if (hasTips['device_ops']) cols.push({ v:'vol_device_ops', c:'cotiz_device_ops', l:'Operațiuni', cl:'Cotiz. oper.' });
       parts.push('<h3>Ponderi per operator</h3><table><thead><tr><th>Operator</th>');
       cols.forEach(function(c){ parts.push('<th class="n">' + esc(c.l) + '</th><th class="n">' + esc(c.cl) + '%</th>'); });
-      parts.push('<th class="n">Performanță</th></tr></thead><tbody>');
+      parts.push('<th class="n">Contribuție%</th><th class="n">Performanță</th></tr></thead><tbody>');
       ops.forEach(function(o){
         parts.push('<tr><td>' + esc(o.name) + '</td>');
         cols.forEach(function(c){
           parts.push('<td class="n">' + num(o[c.v]) + '</td><td class="n">' + pct(o[c.c]) + '</td>');
         });
+        parts.push('<td class="n">' + pct(o.contributie) + '</td>');
         parts.push('<td class="n" style="color:' + scoreColor(o.achieved) + ';font-weight:700">' + pct(o.achieved) + '</td></tr>');
         // Detaliu Operațiuni pe categorii — randul expandabil din tab
         if ((o.device_ops_breakdown || []).length) {
-          parts.push('<tr><td class="bd" colspan="' + (2 + cols.length * 2) + '">'
+          parts.push('<tr><td class="bd" colspan="' + (3 + cols.length * 2) + '">'
             + esc(o.device_ops_breakdown.map(function(b){ return prodCategorieLabel(b.categorie) + ': ' + b.total + ' (' + b.pct.toFixed(1) + '%)'; }).join('  ·  '))
             + '</td></tr>');
         }
@@ -12579,20 +12614,21 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   // monitor de perete. Iconițele vin din MonitorIcon (line-style, stroke=currentColor) — fără
   // emoji, conform regulilor de design. Accentul colorează DOAR badge-ul categoriei; barele
   // rămân colorate pe stare (verde/galben/albastru), ca lectura să nu devină ambiguă.
+  // Toate cifrele sunt pe ZIUA CURENTĂ: „Soluționate" = închise azi, „În lucru" / „Noi" = din
+  // ce a SOSIT azi, cât e încă deschis (backend, 2026-08-13). Înainte, stările deschise se
+  // numărau fără limită de vechime și cardul arăta restanța istorică din CTS, nu ziua.
   var groups = [
-    { name: 'Mail-uri', icon: 'mail', accent: 'var(--am)', bars: [
+    { name: 'Mail-uri', icon: 'mail', accent: 'var(--am)', azi: true, bars: [
       { label: 'Soluționate', v: em.rezolvate_azi || 0, c: C_DONE },
       { label: 'În lucru',    v: em.in_lucru || 0,      c: C_WIP },
-      { label: 'Noi',         v: em.noi || 0,           c: C_NEW,
-        sub: em.noi_vechi ? ('din care ' + em.noi_vechi + ' vechi') : null }
+      { label: 'Noi',         v: em.noi || 0,           c: C_NEW }
     ]},
-    { name: 'Task-uri', icon: 'task', accent: 'var(--bl)', bars: [
+    { name: 'Task-uri', icon: 'task', accent: 'var(--bl)', azi: true, bars: [
       { label: 'Soluționate', v: tk.rezolvate_azi || 0, c: C_DONE },
       { label: 'În lucru',    v: tk.in_progress || 0,   c: C_WIP },
-      { label: 'Noi',         v: tk.noi || tk.pending || 0, c: C_NEW,
-        sub: tk.pending_vechi ? ('din care ' + tk.pending_vechi + ' vechi') : null }
+      { label: 'Noi',         v: tk.noi || tk.pending || 0, c: C_NEW }
     ]},
-    { name: 'Apeluri', icon: 'call', accent: 'var(--gn)', bars: [
+    { name: 'Apeluri', icon: 'call', accent: 'var(--gn)', azi: true, bars: [
       { label: 'Total azi',   v: ap.azi || 0,           c: C_DONE }
     ]},
     // „Deschise" e ancora: primite_azi și rezolvate_azi sunt seturi diferite (o reclamație
@@ -12608,6 +12644,7 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   // Totalul soluționat azi = pulsul departamentului pe toate canalele; restanțele = ce
   // rămâne deschis acum. Ambele se derivă din date deja aduse, fără cereri suplimentare.
   var totalSolutionatAzi = (em.rezolvate_azi || 0) + (tk.rezolvate_azi || 0) + (ap.azi || 0);
+  // „Deschis" numără doar ce a intrat azi și n-a fost încă închis — nu restanța istorică.
   var totalDeschis = (em.in_lucru || 0) + (tk.in_progress || 0);
   // Ritmul se raportează la VOLUMUL INTRAT azi (intrate_azi), nu la câte au rămas în starea
   // 'new'. Barele „Noi" arată restanța neatinsă; numitorul de aici trebuie să fie tot ce a
@@ -12622,8 +12659,8 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   var ritmCol = ritm == null ? 'var(--t3)' : ritm >= 100 ? C_DONE : ritm >= 70 ? C_WIP : 'var(--rd)';
 
   var summary = [
-    { k: 'Soluționat azi', v: totalSolutionatAzi.toLocaleString('ro-RO'), c: C_DONE },
-    { k: 'Deschis acum',   v: totalDeschis.toLocaleString('ro-RO'),       c: C_WIP }
+    { k: 'Soluționat azi',  v: totalSolutionatAzi.toLocaleString('ro-RO'), c: C_DONE },
+    { k: 'Deschis din azi', v: totalDeschis.toLocaleString('ro-RO'),       c: C_WIP }
   ];
 
   // maxim pe card, minim 1 ca să nu împărțim la zero când totul e 0
@@ -12674,7 +12711,11 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
               borderLeft: '3px solid ' + g.accent
             } }, [
               h('span', { key: 'i', style: { color: g.accent, display: 'flex' } }, h(MonitorIcon, { name: g.icon, size: 15 })),
-              h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 800, color: 'var(--tx)', textTransform: 'uppercase', letterSpacing: '0.06em' } }, g.name)
+              h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 800, color: 'var(--tx)', textTransform: 'uppercase', letterSpacing: '0.06em' } }, g.name),
+              // Marcaj de fereastră, DOAR pe grupurile care sunt integral pe ziua curentă.
+              // Reclamațiile nu îl primesc: acolo „Deschise" rămâne pe tot istoricul, iar un
+              // „AZI" pe secțiune ar eticheta greșit exact cifra care nu e a zilei.
+              g.azi ? h('span', { key: 'w', style: { marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: 'var(--t3)', letterSpacing: '0.08em' } }, 'AZI') : null
             ]),
             h('div', { key: 'r', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
               g.bars.map(function(b){
@@ -12776,25 +12817,9 @@ function ProductivityDashboard({ group, refreshMin }) {
   var cardStyle = { background:'var(--bg2)', border:'1px solid var(--bd)', borderRadius:'var(--r)', overflow:'hidden', display:'flex', flexDirection:'column' };
   var cardHdr   = { padding:'5px 10px', fontSize:10, fontWeight:700, color:'var(--t3)', borderBottom:'1px solid var(--bd)', background:'var(--bg3)', letterSpacing:.5, textTransform:'uppercase', flexShrink:0 };
 
-  var em = (live && live.emailuri)   || {};
-  var tk = (live && live.taskuri)    || {};
-  var ap = (live && live.apeluri)    || {};
-  var dv = (live && live.device_ops) || {};
-  var sz = (live && live.sesizari)   || {};
-  var pem = (prevLive && prevLive.emailuri) || {};
-  var ptk = (prevLive && prevLive.taskuri)  || {};
-  var psz = (prevLive && prevLive.sesizari) || {};
-
-  var hourly = (live && live.hourly) || [];
-  var nowH   = new Date().getHours();
-
-  // total rezolvate azi pe toate canalele = pulsul firmei
-  var totalRes = (em.rezolvate_azi || 0) + (ap.azi || 0) + (tk.rezolvate_azi || 0) + (dv.rezolvate_azi || 0);
-  var prevTotalRes = prevLive
-    ? (pem.rezolvate_azi || 0) + ((prevLive.apeluri || {}).azi || 0) + (ptk.rezolvate_azi || 0) + ((prevLive.device_ops || {}).rezolvate_azi || 0)
-    : null;
-  var totalWork = (em.in_lucru || 0) + (tk.in_progress || 0) + (tk.pending || 0);
-  var prevTotalWork = prevLive ? (pem.in_lucru || 0) + (ptk.in_progress || 0) + (ptk.pending || 0) : null;
+  // Agregatele de grup (live.emailuri / taskuri / apeluri / device_ops / sesizari / hourly) nu
+  // mai sunt citite aici de când rândul de contoare de sus a fost scos — fiecare card de
+  // departament își ia singur cifrele din `live.per_dept`.
 
   var header = h('div', { key:'hdr', style:hdrStyle }, [
     h('div', { key:'l', style:{ display:'flex', alignItems:'center', gap:10 } }, [
@@ -12843,34 +12868,11 @@ function ProductivityDashboard({ group, refreshMin }) {
   });
   if (zileTotalLuna && zileTrecuteLuna > zileTotalLuna) zileTrecuteLuna = zileTotalLuna;
 
-  // ── Rândul 1: contoarele live, toate pe un singur rând ──
-  // Sesizările și reclamațiile sunt acum contoare separate (erau într-un card
-  // propriu, jos) — pe un monitor de perete conteaza sa fie sus, langa restul.
-  var restante = sz.restante || 0;
-  var peste7 = sz.peste_7z || 0;
-  // Apelurile de azi clasificate ca sesizare/reclamație. NU sunt un subset al
-  // sesizărilor rezolvate (acelea vin exclusiv din emailuri) — sunt o sursă
-  // separată, deci se afișează ca atare, nu ca detaliu al altui contor.
-  var apelSes = (sz.apel_sesizari_azi || 0) + (sz.apel_reclamatii_azi || 0);
-
-  var kpiRow = h('div', { key:'r1', style:{ display:'grid', gridTemplateColumns:'repeat(5, minmax(0,1fr))', gap:10, flexShrink:0 } }, [
-    h(MonitorKpi, { key:'res', label:'Rezolvate azi', value: totalRes, prev: prevTotalRes,
-      color:'var(--gn)', icon:'check', hint:'mail + apel + task + device' }),
-    h(MonitorKpi, { key:'wrk', label:'În lucru acum', value: totalWork, prev: prevTotalWork,
-      color:'var(--am)', icon:'clock', hint:'emailuri + task-uri deschise' }),
-    h(MonitorKpi, { key:'sez', label:'Sesizări deschise', value: sz.sesizari_deschise || 0,
-      prev: psz.sesizari_deschise != null ? psz.sesizari_deschise : null,
-      color:'var(--yw)', icon:'alert',
-      hint: restante > 0 ? restante + ' rămase din zile trecute' : 'toate primite azi' }),
-    h(MonitorKpi, { key:'rec', label:'Reclamații deschise', value: sz.reclamatii_deschise || 0,
-      prev: psz.reclamatii_deschise != null ? psz.reclamatii_deschise : null,
-      color:'var(--rd)', icon:'alert',
-      hint: peste7 > 0 ? peste7 + ' de peste 7 zile' : 'niciuna mai veche de 7 zile' }),
-    h(MonitorKpi, { key:'rez', label:'Sesizări rezolvate azi', value: sz.rezolvate_azi || 0,
-      prev: psz.rezolvate_azi != null ? psz.rezolvate_azi : null,
-      color:'var(--gn)', icon:'check',
-      hint: 'din emailuri' + (apelSes > 0 ? ' · separat, ' + apelSes + ' pe telefon' : '') })
-  ]);
+  // Rândul de contoare live de sus (Rezolvate azi / În lucru acum / Sesizări & reclamații
+  // deschise / Sesizări rezolvate azi) a fost ELIMINAT la cererea business owner-ului
+  // (2026-08-13): agregate pe tot grupul, ele dublau cifrele din cardurile per departament
+  // și ocupau prima bandă a monitorului, unde se uită lumea prima dată. `MonitorKpi` rămâne
+  // în fișier — e componenta generică de contor, refolosibilă dacă revine un rând de sus.
 
   // Cardul „Obiectiv lunar" (MonitorGaugeKm × departament) și rândul de canale
   // (MonitorChannelCard: Mail / Apel / Task / Device ops) au fost ELIMINATE în v0.68.1:
@@ -12911,7 +12913,6 @@ function ProductivityDashboard({ group, refreshMin }) {
   return h('div', { style:pageStyle }, [
     header,
     h('div', { key:'body', style:bodyStyle }, [
-      kpiRow,
       deptRow
     ])
   ]);

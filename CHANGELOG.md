@@ -8,6 +8,77 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.9.0 - 2026-08-13
+
+### Productivitate: identificarea rândurilor și contribuția ponderată
+
+**Număr de device pe task-uri și pe operațiuni.** În lista din spatele unui obiectiv
+(clic pe obiectiv → modal) există o coloană „Device". La operațiuni pe echipamente vine
+direct din CTS (`device_serial`, ID-ul CTS al aparatului pe hover). La task-uri **CTS nu
+trimite niciun câmp de device** — feed-ul `/cts/tasks` conține doar `task_name`,
+`description`, `category_name`, `client_id`, `assignee_*` (verificat pe endpoint-ul live) —
+așa că numărul se extrage din titlu și descriere: număr de înmatriculare RO (`B39GIN`,
+`SM11AGM`), cod device (`DGD022`) sau IMEI. Acoperire pe august: 4471 din 6460 task-uri
+Taxe de drum. Unde textul nu conține niciun identificator (ex. „HU-GO: suspended device
+went into HU", a cărui descriere e doar poziția GPS) rămâne „—", iar descrierea completă
+apare la hover, ca task-ul să poată fi totuși identificat. Căutarea din modal caută și
+după device.
+
+**Client reparat la operațiuni pe echipamente.** Coloana era goală pe toate rândurile:
+`device_operations.client_id` e NULL peste tot (view-ul IRIS DV nu-l trimite), deci join-ul
+pe `clients` nu returna niciodată nimic. Se folosește `client_name`, care vine populat din
+DV, cu join-ul păstrat ca prioritate pentru când câmpul se va popula.
+
+**Coloană nouă „Contribuție%" în tabelul de operatori.** Cât din productivitatea echipei
+ține de fiecare om, ponderat cu obiectivele departamentului:
+
+    contributie = Σ_obiectiv ( pondere × volum_op / volum_dept ) / Σ_obiectiv pondere
+
+Spre deosebire de coloanele „Cotiz.%", care numără bucăți și tratează un mail la fel ca o
+operațiune pe echipament. Pe Suport 2 / august răstoarnă clasamentul: Miclau Adrian-David
+are 6.15% din volumul de mailuri, dar 35.12% din productivitatea ponderată a echipei
+(face 217 din 357 de instalări noi). Suma pe echipă dă 100% minus partea rezolvată de
+oameni care nu mai sunt operatori activi ai departamentului în perioada afișată. Apare și
+în exportul PDF.
+
+**Fix consistență multi-lună:** pe 3/6/12 luni `cotiz_task` împărțea la task-uri +
+operațiuni, iar pe o lună doar la task-uri — aceeași persoană avea două procente diferite
+pentru aceeași coloană. Acum ambele împart la volumul de task-uri; operațiunile au propria
+coloană.
+
+### Monitor operațional: contoare pe ziua curentă
+
+**„În lucru" și „Noi" numără doar ce a sosit azi.** Înainte se număra tot ce CTS nu a
+marcat vreodată `solved`, fără limită de vechime — pe Suport 1, 26 de mailuri „noi", din
+care doar 3 sosite în ultimele 7 zile; restul e restanță istorică pe care nu o mai
+lucrează nimeni (notificări automate, tichete abandonate). Un monitor de perete trebuie să
+arate starea zilei, nu arhiva. Aceeași regulă la task-uri (`in progress` / `new` /
+`postponed` create azi). Fiecare secțiune afectată e marcată „AZI" pe card; rezumatul de
+jos devine „Deschis din azi". `noi_vechi` / `pending_vechi` au fost eliminate — în
+interiorul unei singure zile sunt mereu 0.
+
+Secțiunea „Reclamații" **nu** primește marcajul „AZI" și rămâne neschimbată: „Deschise"
+acolo e în continuare pe tot istoricul. Sursa ei e categoria emailului (CTS
+`category_id=1`), nu modulul Quality evaluation din CTS — tabela `quality_evaluation`
+există în replica CTS, dar IRIS Gateway nu o expune (fără endpoint și fără view DV), deci
+alinierea cu CTS rămâne blocată până la un endpoint nou.
+
+**Rândul de contoare de sus a fost eliminat** (Rezolvate azi / În lucru acum / Sesizări și
+reclamații deschise / Sesizări rezolvate azi). Erau agregate pe tot grupul, dublau cifrele
+din cardurile per departament și ocupau prima bandă a ecranului.
+
+### Editare manuală a pontajului (documentare retroactivă a 53dda86)
+
+Clic pe orice celulă din Utilizatori → Pontaj pe departamente deschide un modal de
+corectare: prezent/absent, preset Schimb 1 (08:00–16:30) / Schimb 2 (12:00–20:30) sau ore
+libere. Rândul corectat primește `manual_override=true` și **sync-ul CTS nu îl mai
+suprascrie** (skip la upsert + `WHERE manual_override IS NOT TRUE` ca plasă de siguranță în
+SQL). Buton „Revino la CTS" pentru anulare. Motivul: `/cts/timesheets` trimite uneori
+schimbul greșit (10–14 august 2026, Breahna Andrei și Cuc Mihai apar pe schimb 1 deși sunt
+pe 2). Corecția nu e cosmetică — `employee_attendance` e sursa ferestrei orare pentru SLA,
+deci mută și calculul de productivitate al zilei. Migrare:
+`migrations/20260813_employee_attendance_manual.sql`.
+
 ## v2.8.0 - 2026-08-13
 
 ### Export bază de date pentru dezvoltare locală (zona Setări)
