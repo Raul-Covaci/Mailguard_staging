@@ -8,6 +8,25 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.9.1 - 2026-08-14
+
+### Fix: pagina Utilizatori rămânea albă pentru admini
+
+**Cauza 1 — rutele de angajați erau păzite de modulul greșit.** Endpoint-urile
+`/settings/employees*` alimentează pagina Utilizatori, dar stăteau în `settings.py`,
+router montat cu `require_module("settings")` — modul rezervat developerilor. Un admin
+primea 403 pe propria pagină. Mutate în `app/api/v1/employees.py`, router propriu montat
+cu `require_module("utilizatori")`: admin și developer au acces, operatorul nu. Căile au
+rămas neschimbate, deci UI-ul nu s-a modificat.
+
+**Cauza 2 — `_parseResp` returna erorile JSON ca date valide.** Orice răspuns cu
+`content-type: application/json` era întors direct din `api()`, indiferent de status. La
+403, apelantul făcea `setEmployees({detail: {...}})`, iar la următorul render
+`employees.filter(...)` arunca `TypeError` → React demonta tot arborele → ecran alb. Acum
+răspunsurile non-OK aruncă o eroare cu mesajul din `detail` (pentru `forbidden_module`,
+„Nu ai acces la acest modul"), deci componentele își afișează starea de eroare în loc să
+cadă. Fix global: orice pagină care primea un 4xx/5xx cu body JSON se putea rupe la fel.
+
 ## v2.9.0 - 2026-08-13
 
 ### Productivitate: identificarea rândurilor și contribuția ponderată

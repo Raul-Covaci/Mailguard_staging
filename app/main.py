@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi import Request
 from app.config import get_settings
 from app.api.v1 import health, emails, clients, auth, settings as settings_api, spam, ai, ai_category, ai_department, ai_priority, ai_assignee, ai_autoreply, reports, documents, cts, admin_reset, cts_training
+from app.api.v1 import employees as employees_api
 from app.api.v1 import personal_mailboxes as personal_mailboxes_api
 from app.api.v1 import iris_dv as iris_dv_api
 from app.api.v1 import cts_sync_control as cts_sync_control_api
@@ -67,6 +68,10 @@ app.include_router(emails.router, prefix="/api/v1", tags=["emails"])
 app.include_router(clients.router, prefix="/api/v1", tags=["clients"])
 app.include_router(settings_api.router, prefix="/api/v1", tags=["settings"],
                    dependencies=[Depends(_ac.require_module("settings"))])
+# /settings/employees* alimenteaza pagina Utilizatori, nu zona de Setari — router
+# separat, altfel gate-ul "settings" (developer-only) ar bloca si adminii.
+app.include_router(employees_api.router, prefix="/api/v1", tags=["employees"],
+                   dependencies=[Depends(_ac.require_module("utilizatori"))])
 app.include_router(spam.router, prefix="/api/v1", tags=["spam"])
 app.include_router(ai.router, prefix="/api/v1", tags=["ai"])
 # Paza pe ADMINISTRAREA prompturilor AI (regenerare, statistici, corectii globale,

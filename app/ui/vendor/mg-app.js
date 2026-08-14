@@ -97,7 +97,20 @@ async function _parseResp(r) {
   if (r.status === 401) { clearToken(); location.reload(); return; }
   if (r.status === 204 || r.status === 205) return null;
   const ct = (r.headers.get('content-type') || '');
-  if (ct.indexOf('application/json') !== -1) return r.json();
+  if (ct.indexOf('application/json') !== -1) {
+    const j = await r.json();
+    if (r.ok) return j;
+    // Raspuns de eroare cu body JSON (ex. 403 de la require_module). Inainte era
+    // RETURNAT ca date valide, iar apelantul facea setState(<obiect eroare>) —
+    // urmatorul render dadea "x.filter is not a function" si pagina ramanea alba.
+    const d = j && j.detail;
+    let m = null;
+    if (typeof d === 'string') m = d;
+    else if (d && typeof d === 'object') m = d.error === 'forbidden_module'
+      ? ('Nu ai acces la acest modul (' + (d.module || '?') + ').')
+      : (d.error || d.message || null);
+    throw new Error(m || ('Eroare server (HTTP ' + r.status + ').'));
+  }
   let txt = '';
   try { txt = await r.text(); } catch (e) {}
   if (r.ok) return null;
