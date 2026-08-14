@@ -10,6 +10,15 @@
 
 ## v2.9.1 - 2026-08-14
 
+### Operatorul vede și cele două monitoare de productivitate
+
+`OPERATOR_SUBTABS` pentru `productivity` trece de la `("rapoarte",)` la
+`("rapoarte", "monitor-op", "monitor-fin")`. Cele două sub-taburi de monitor sunt doar
+lansatoare pentru paginile de perete `/productivity/dashboard/{group}`, care sunt oricum
+publice (fără auth, pentru monitoarele de birou) — deci nu expun nimic peste ce vede
+oricine deschide URL-ul. Rămân închise pentru operator: Analiză, Obiective & Ponderi,
+Notificări (păzite pe backend de `require_prod_full` = admin/developer).
+
 ### Fix: pagina Utilizatori rămânea albă pentru admini
 
 **Cauza 1 — rutele de angajați erau păzite de modulul greșit.** Endpoint-urile

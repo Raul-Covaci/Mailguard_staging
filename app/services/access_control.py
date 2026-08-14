@@ -46,7 +46,11 @@ SUPPORT_MODULES_BY_ROLE = {
 }
 
 # Sub-tab-uri permise per modul. Absenta unei chei = toate sub-tab-urile permise.
-OPERATOR_SUBTABS = {"productivity": ("rapoarte",)}
+# Monitoarele (op/fin) sint doar lansatoare pentru paginile de perete
+# /productivity/dashboard/{group}, care sint oricum publice (fara auth) — deci
+# nu expun nimic in plus fata de ce vede oricine deschide URL-ul monitorului.
+# Raman inchise pentru operator: analiza, config (obiective/ponderi), notificari.
+OPERATOR_SUBTABS = {"productivity": ("rapoarte", "monitor-op", "monitor-fin")}
 
 # Prima pagina cu acces, per rol — tinta pentru redirect cand accesul e refuzat.
 LANDING = {

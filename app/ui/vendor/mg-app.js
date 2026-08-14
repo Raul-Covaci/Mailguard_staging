@@ -13096,8 +13096,9 @@ function ProductivityDashboard({ group, refreshMin }) {
 }
 
 function Productivity({ user, setTopbarRight }) {
-  // v10.19.0 — operatorul vede doar "Rapoarte"; restul sub-tab-urilor (inclusiv
-  // Monitorul Operational) sint ascunse aici si respinse cu 403 de backend.
+  // Operatorul vede "Rapoarte" + cele doua monitoare (lansatoare pentru paginile
+  // de perete, oricum publice). Analiza / Obiective & Ponderi / Notificari sint
+  // ascunse aici si respinse cu 403 de backend (require_prod_full).
   var SUBS = [ { k:'rapoarte', l:'Rapoarte' }, { k:'analiza', l:'Analiză' }, { k:'config', l:'Obiective & Ponderi' }, { k:'notificari', l:'Notificări' }, { k:'monitor-op', l:'Monitor Operațional' }, { k:'monitor-fin', l:'Monitor Financiar' } ]
     .filter(function(s){ return canAccessSubtab(user, 'productivity', s.k); });
   var [sub, setSub] = useState('rapoarte');
