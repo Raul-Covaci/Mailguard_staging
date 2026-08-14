@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir
 from app.services import cts_groundtruth_sync as SYNC
 from app.services.department_classifier import DEPT_LABELS
 
@@ -52,6 +53,7 @@ def cts_training_list(
     search_id: str = Query("", description="cauta dupa ID email (gt.id sau e.id)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    dir: str = Query("desc", description="ordonare dupa data: 'asc' | 'desc'"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -122,6 +124,7 @@ def cts_training_list(
             where.append("(%s OR %s)" % (cat_diff, dep_diff))
 
     where_sql = " AND ".join(where)
+    _dir = sort_dir(dir)
     total = db.execute(text(
         "SELECT count(*) FROM cts_ground_truth gt LEFT JOIN emails e ON e.id = gt.email_id "
         "WHERE " + where_sql), params).scalar()
@@ -144,7 +147,9 @@ def cts_training_list(
         # -> pe fetched_at vechile pluteau deasupra si pagina "ingheta" (incident 2026-06-30).
         # received_at (mail primit) -> cts_reply_at (mail trimis) -> changed_at. Randurile fara niciun
         # timp real (GT nematchuit, inactiv) merg jos (NULLS LAST), nu in varf pe fetched_at=now.
-        "WHERE " + where_sql + " ORDER BY COALESCE(e.received_at, gt.cts_reply_at, gt.changed_at) DESC NULLS LAST, gt.id DESC "
+        # Directia e din whitelist (_sort_dir), nu din input brut — interpolarea in SQL
+        # e sigura doar asa; parametrii legati nu pot tine un ORDER BY.
+        "WHERE " + where_sql + f" ORDER BY COALESCE(e.received_at, gt.cts_reply_at, gt.changed_at) {_dir} NULLS LAST, gt.id {_dir} "
         "LIMIT :lim OFFSET :off", ), params).fetchall()
 
     items = []

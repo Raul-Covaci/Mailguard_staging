@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir, sort_expr
 from app.services import device_ops_sync as SYNC
 from app.services import device_ops_suport2_sync as SUPORT2_SYNC
 
@@ -80,6 +81,23 @@ def _ops_filters(status: str, department: str, action_type: str,
     return " AND ".join(where), params
 
 
+# Coloane sortabile din UI -> expresia SQL. 'default' pastreaza ordinea istorica.
+_OPS_SORTS = {
+    "default":     "COALESCE(do_.closed_at, do_.cts_updated_at, do_.last_synced_at)",
+    "operation":   "do_.operation_id",
+    "finished":    "do_.finished_at",
+    "closed":      "do_.closed_at",
+    "created":     "do_.cts_created_at",
+    "client":      "COALESCE(cl.name, do_.client_name)",
+    "type":        "do_.action_type",
+    "department":  "do_.department",
+    "assignee":    "COALESCE(edm.name, do_.assignee_raw)",
+    "status":      "do_.status",
+    "duration":    "resolution_minutes",
+    "device":      "COALESCE(do_.device_serial, do_.device_imei)",
+}
+
+
 @router.get("/device-ops/list")
 def device_ops_list(
     status: str = Query("", description="filtru status (gol = toate)"),
@@ -90,6 +108,8 @@ def device_ops_list(
     assignee: str = Query("", description="filtru assignee (nume exact, gol = toti)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    sort: str = Query("default", description="coloana de sortare (vezi _OPS_SORTS)"),
+    dir: str = Query("desc", description="'asc' | 'desc'"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -123,7 +143,7 @@ def device_ops_list(
         "            THEN EXTRACT(EPOCH FROM (do_.closed_at - do_.finished_at)) / 60.0 "
         "            ELSE NULL END AS suport2_duration_minutes "
         + base + " WHERE " + where_sql +
-        " ORDER BY COALESCE(do_.closed_at, do_.cts_updated_at, do_.last_synced_at) DESC, do_.id DESC "
+        f" ORDER BY {sort_expr(sort, _OPS_SORTS, 'default')} {sort_dir(dir)} NULLS LAST, do_.id {sort_dir(dir)} "
         "LIMIT :lim OFFSET :off"), params).fetchall()
 
     items = []

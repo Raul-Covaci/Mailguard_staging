@@ -1,5 +1,6 @@
 """IRIS Cargo360 — FastAPI entrypoint."""
 import os
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -29,11 +30,46 @@ logging.basicConfig(
 logger = logging.getLogger("mailguard")
 
 
+# Cit de des verificam scadenta. Nu e intervalul de sync — acela vine din settings
+# (client_sync_interval_minutes) si e respectat prin claim-ul din DB.
+CLIENT_SYNC_TICK_SECONDS = 60
+
+
+async def _client_sync_loop():
+    """Sync periodic clienti + vehicule + contracte din IRIS.
+
+    Ticaie des (60s), dar ruleaza doar cind claim-ul din DB spune ca a venit scadenta —
+    asa intervalul e respectat o singura data pe tot clusterul, nu o data per worker.
+    Pull-ul (60-90s, blocant) merge pe thread separat ca sa nu tina event loop-ul ocupat.
+    """
+    from app.services import iris_sync as _iris_sync
+    while True:
+        try:
+            await asyncio.sleep(CLIENT_SYNC_TICK_SECONDS)
+            if _iris_sync.claim_client_sync():
+                res = await asyncio.to_thread(_iris_sync.sync_clients_guarded)
+                logger.info("client sync periodic: %s", str(res)[:200])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Un ciclu esuat nu are voie sa omoare bucla — altfel o eroare trecatoare
+            # de retea ar opri sync-ul pina la urmatorul restart, exact ca inainte.
+            logger.exception("client sync periodic: ciclu esuat")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
     logger.info(f"Starting {s.app_name} v{s.app_version} on port {s.app_port}")
-    yield
+    _client_sync_task = asyncio.create_task(_client_sync_loop())
+    try:
+        yield
+    finally:
+        _client_sync_task.cancel()
+        try:
+            await _client_sync_task
+        except asyncio.CancelledError:
+            pass
     logger.info("Shutting down...")
 
 

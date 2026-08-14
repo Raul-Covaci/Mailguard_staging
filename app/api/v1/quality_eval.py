@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir
 from app.services import quality_eval_sync as SYNC
 
 logger = logging.getLogger("mailguard.quality_eval")
@@ -157,6 +158,7 @@ def quality_eval_list(
     date_to: str = Query("", description="YYYY-MM-DD, inclusiv"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    dir: str = Query("desc", description="ordonare dupa data inregistrarii: 'asc' | 'desc'"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -177,7 +179,7 @@ def quality_eval_list(
                pr.name AS procesat_de
         {_JOINS}
         WHERE {where_sql}
-        ORDER BY qe.created_at DESC, qe.id DESC
+        ORDER BY qe.created_at {sort_dir(dir)} NULLS LAST, qe.id {sort_dir(dir)}
         LIMIT :lim OFFSET :off
     """), params).fetchall()
 

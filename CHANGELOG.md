@@ -8,6 +8,57 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.10.0 - 2026-08-14
+
+### Sortare pe coloane în tabelele mari
+
+Toate cele șapte liste paginate — Emailuri, Mail-uri CTS, Task-uri, Device Operations,
+Apeluri, Apeluri CTS, Reclamații — au acum antet de dată sortabil ASC/DESC. Task-uri și
+Device Operations sortează pe **orice** coloană (ID, client, tip, departament, asignat,
+status, durată, echipament), nu doar pe dată.
+
+Sortarea se face **pe server**, nu în UI: tabelele sunt paginate cu LIMIT/OFFSET, deci o
+inversare locală ar reordona doar cele 50 de rânduri afișate — „cel mai vechi" ar însemna
+de fapt „cel mai vechi din pagina 1". Direcția și coloana nu pot fi legate ca parametri
+(`ORDER BY` nu acceptă bind params), deci trec prin whitelist-ul din `api/v1/sorting.py`;
+o valoare necunoscută cade pe ordinea implicită, nu pe eroare și nu pe SQL brut. Fără
+parametru, fiecare listă păstrează ordinea de dinainte, byte-for-byte.
+
+### Task-uri: coloana Client/Device
+
+Task-urile fără client sunt legate de un echipament. Coloana „Client" devine
+„Client/Device" și afișează numărul de device când clientul lipsește — extras din
+titlu/descriere cu același `_extract_device` folosit de Productivitate, ca cele două
+pagini să nu arate identificatori diferiți pentru același task (CTS nu trimite câmp de
+device în `/cts/tasks`). Acoperire pe eșantionul curent: 82 din 110 task-uri fără client.
+În tabelul din Productivitate antetul devine la fel „Client/Device", iar rândurile fără
+client spun „pe echipament" în loc de „—", cu numărul în coloana Device alăturată.
+
+### Clienți: apeluri in/out în listă
+
+Lista de clienți arăta doar mailurile primite/trimise. S-a adăugat o coloană „Apeluri
+(↓ primite · ↑ date)" — un client care sună mult și scrie puțin apărea inactiv.
+
+### Fix: vehiculele și contractele clienților erau înghețate din 29.07.2026
+
+Datele erau în DB (43k vehicule, 32k contracte) și endpoint-urile răspundeau corect —
+doar că **nimic nu rula sync-ul periodic**. `POST /api/v1/clients/sync-now` se declanșa
+exclusiv la apăsarea butonului din UI: nu există cron, timer sau task în aplicație care
+să-l cheme. Cheia `client_sync_interval_minutes = 5` din `settings` nu e citită de nimeni.
+Sync-ul rulează acum periodic **din aplicație** (`_client_sync_loop`, pornit de `lifespan`),
+la 60 min — nu are nevoie de cron sau timer systemd, deci intră în funcțiune la primul
+restart al serviciului.
+
+API-ul rulează cu 4 workeri gunicorn, deci fiecare proces are propria buclă. `_CLIENT_SYNC_LOCK`
+e un lock de threading și nu poate coordona procese separate, așa că scadența se ia atomic din
+DB (`claim_client_sync()`, cheia `client_assets.next_sync_at`): un `INSERT ... ON CONFLICT DO
+UPDATE ... WHERE scadent` întoarce rând exact unui singur worker. Un „citește, compară, scrie"
+ar fi lăsat toți patru să pornească simultan același pull de 16k clienți. Scadența persistă în
+DB, deci un deploy nu repornește numărătoarea de la zero.
+
+Intervalul se schimbă din `settings.client_sync_interval_minutes` fără redeploy (podea 5 min,
+fiindcă un pull durează 60-90s). O eroare de rețea într-un ciclu nu oprește bucla.
+
 ## v2.9.1 - 2026-08-14
 
 ### Operatorul vede și cele două monitoare de productivitate

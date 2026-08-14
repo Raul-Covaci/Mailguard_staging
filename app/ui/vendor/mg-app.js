@@ -264,6 +264,44 @@ function catBadge(cat, extra) {
   return h('span', { className: 'badge', style: Object.assign({ background: hexA(col, 0.14), color: col, borderColor: hexA(col, 0.34), textTransform: 'none' }, extra || {}) }, cat);
 }
 
+// ── Antete de tabel sortabile ────────────────────────────────────────────────
+// Sortarea se face pe SERVER (ORDER BY + LIMIT/OFFSET). Una locală ar reordona doar
+// cele 50 de rânduri din pagina curentă, deci „cel mai vechi" ar însemna de fapt „cel
+// mai vechi din pagina 1" — greșit pe orice listă cu mai multe pagini.
+//
+// `sortState` = { sort: <cheie coloană>, dir: 'asc'|'desc' }. Tabelele cu o singură
+// coloană sortabilă (dată) folosesc o cheie fixă și trimit doar `dir`.
+//
+// `cols` mapează eticheta afișată -> cheia trimisă la backend. Etichetele care nu
+// apar în hartă rămân antete simple, nesortabile.
+function sortableHead(labels, cols, st, setSt) {
+  return h('tr', null, labels.map(function (label, i) {
+    var key = cols[label];
+    if (!key) return h('th', { key: i }, label);
+    var active = st.sort === key;
+    // Prima apăsare pe o coloană nouă => desc (cel mai recent / cel mai mare întâi),
+    // aceeași convenție ca ordinea implicită a listelor.
+    var next = active ? (st.dir === 'desc' ? 'asc' : 'desc') : 'desc';
+    return h('th', {
+      key: i,
+      onClick: function () { setSt({ sort: key, dir: next }); },
+      title: 'Sortează după „' + label + '" — ' + (next === 'asc' ? 'crescător' : 'descrescător'),
+      style: { cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }
+    }, label, h('span', {
+      key: 'arr',
+      style: { marginLeft: 5, fontSize: 9, opacity: active ? 0.95 : 0.28 }
+    }, active ? (st.dir === 'desc' ? '▼' : '▲') : '↕'));
+  }));
+}
+
+// Query string pentru sortare. `sortKey` lipsă (tabelele cu sortare doar pe dată)
+// => trimitem numai `dir`, ca backendul să-și păstreze ORDER BY-ul implicit.
+function sortQs(st, withSortKey) {
+  var out = ['dir=' + (st.dir === 'asc' ? 'asc' : 'desc')];
+  if (withSortKey) out.push('sort=' + encodeURIComponent(st.sort));
+  return out;
+}
+
 // Celulă dată compactă: ora sus, data dedesubt (ocupă mai puțină lățime decât string-ul inline).
 function dateCell(iso) {
   if (!iso) return '';
@@ -619,6 +657,7 @@ function CtsTrainingPanel() {
   const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 50 });
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  const [sortSt, setSortSt] = useState({ sort: 'date', dir: 'desc' });
   const [onlyMismatch, setOnlyMismatch] = useState(false);
   const [deptF, setDeptF] = useState('');
   const [deptFrom, setDeptFrom] = useState('');
@@ -666,13 +705,14 @@ function CtsTrainingPanel() {
     if (searchId.trim()) qs.push('search_id=' + encodeURIComponent(searchId.trim()));
     if (assigneeF) qs.push('assignee=' + encodeURIComponent(assigneeF));
     if (statusF) qs.push('status=' + encodeURIComponent(statusF));
+    qs = qs.concat(sortQs(sortSt, false));
     api('/cts-training/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   useEffect(function(){ loadStats(); loadCfg(); }, []);
   useEffect(function(){ api('/cts-training/assignees').then(function(d){ setAssigneeList(d.assignees || []); }).catch(function(){}); }, []);
-  useEffect(function(){ setPage(1); }, [onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF]);
-  useEffect(function(){ loadList(); loadStats(); }, [page, onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF]);
+  useEffect(function(){ setPage(1); }, [onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF, sortSt]);
+  useEffect(function(){ loadList(); loadStats(); }, [page, onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF, sortSt]);
 
   function doSync() {
     setSyncing(true);
@@ -808,7 +848,9 @@ function CtsTrainingPanel() {
     }));
 
   var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
-    h('thead', { key: 'th' }, h('tr', null, ['ID', 'Recepționat', 'Subiect', 'From', 'Categorie (MG → CTS)', 'Departament (MG → CTS)', 'Asignat (MG → CTS)', 'Direcție'].map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('thead', { key: 'th' }, sortableHead(
+      ['ID', 'Recepționat', 'Subiect', 'From', 'Categorie (MG → CTS)', 'Departament (MG → CTS)', 'Asignat (MG → CTS)', 'Direcție'],
+      { 'Recepționat': 'date' }, sortSt, setSortSt)),
     h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it){
       var clickable = !!it.email_id || it.is_sent;
       return h('tr', { key: it.id, className: clickable ? 'clickable' : '', title: it.email_id ? 'Deschide emailul' : (it.is_sent ? 'Vezi emailul trimis (corp + atașamente)' : 'Doar în CTS — nu există în Cargo360'), onClick: it.email_id ? function(){ setSelectedId(it.email_id); } : (it.is_sent ? function(){ setSentDetail(it); } : null) }, [
@@ -879,6 +921,7 @@ function CtsCallsTrainingPanel() {
   const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 50 });
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  const [sortSt, setSortSt] = useState({ sort: 'date', dir: 'desc' });
   const [onlyMismatch, setOnlyMismatch] = useState(false);
   const [axis, setAxis] = useState('category');
   const [searchId, setSearchId] = useState('');
@@ -912,13 +955,14 @@ function CtsCallsTrainingPanel() {
     var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
     if (onlyMismatch) { qs.push('only_mismatch=1'); qs.push('axis=' + encodeURIComponent(axis)); }
     if (searchId.trim()) qs.push('search_id=' + encodeURIComponent(searchId.trim()));
+    qs = qs.concat(sortQs(sortSt, false));
     api('/cts-calls-training/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   useEffect(function(){ loadCfg(); }, []);
   useEffect(function(){ api('/cts-calls-training/assignees').then(function(d){ setAssigneeList(d.assignees || []); }).catch(function(){}); }, []);
-  useEffect(function(){ setPage(1); }, [onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF]);
-  useEffect(function(){ loadList(); }, [page, onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF]);
+  useEffect(function(){ setPage(1); }, [onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF, sortSt]);
+  useEffect(function(){ loadList(); }, [page, onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF, sortSt]);
   useEffect(function(){ loadStats(); }, [dateFrom, dateTo, deptF, assigneeF, statusF]);
 
   // Scurtaturi de interval — cazurile uzuale ("apelurile de azi/ieri") fara sa tastezi doua date.
@@ -1048,7 +1092,9 @@ function CtsCallsTrainingPanel() {
   ]);
 
   var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
-    h('thead', { key: 'th' }, h('tr', null, ['ID', 'Data apel', 'Telefon', 'Client', 'Categorie (MG → CTS)', 'Stil', 'Asignat (MG → CTS)', 'Timp răspuns', 'Status'].map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('thead', { key: 'th' }, sortableHead(
+      ['ID', 'Data apel', 'Telefon', 'Client', 'Categorie (MG → CTS)', 'Stil', 'Asignat (MG → CTS)', 'Timp răspuns', 'Status'],
+      { 'Data apel': 'date' }, sortSt, setSortSt)),
     h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it){
       var clickable = !!it.call_id;
       return h('tr', { key: it.id, className: clickable ? 'clickable' : '', title: clickable ? 'Deschide apelul' : 'Doar în CTS — apelul nu a fost încă ingerat din While1', onClick: clickable ? function(){ setSelectedId(it.call_id); } : null }, [
@@ -3040,6 +3086,7 @@ function Dashboard({ user }) {
 // EmailsListail
 function EmailsList({ setTopbarRight, lockStatus }) {
   const [data, setData] = useState(null);
+  const [sortSt, setSortSt] = useState({ sort: 'date', dir: 'desc' });
   const [status, setStatus] = useState(lockStatus || '');
   const [clientId, setClientId] = useState('');
   const [clientOpts, setClientOpts] = useState([]);
@@ -3090,8 +3137,9 @@ function EmailsList({ setTopbarRight, lockStatus }) {
     if (qApplied) qs.push('q=' + encodeURIComponent(qApplied));
     if (range.from) qs.push('date_from=' + encodeURIComponent(range.from));
     if (range.to) qs.push('date_to=' + encodeURIComponent(range.to));
+    qs.push.apply(qs, sortQs(sortSt, false));
     api('/emails?' + qs.join('&')).then(setData);
-  }, [status, clientId, aiCat, fcFilter, qApplied, page, tick, range.from, range.to]);
+  }, [status, clientId, aiCat, fcFilter, qApplied, page, tick, range.from, range.to, sortSt]);
   useEffect(function() {
     if (!setTopbarRight) return;
     var opts = clientOpts || [];
@@ -3133,7 +3181,9 @@ function EmailsList({ setTopbarRight, lockStatus }) {
   return h('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 } }, [
     h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', flex: 1, minHeight: 0, marginBottom: 0 } }, [
       h('table', { key: 't', className: 'list-table-full' }, [
-        h('thead', { key: 'th' }, h('tr', null, ['ID', 'Receptionat', 'Subject', 'From', 'To', 'Status', 'Status CTS', 'Categorie', 'Departament', 'Prioritate', 'Asignat', 'Atașamente'].map(c => h('th', { key: c }, c)))),
+        h('thead', { key: 'th' }, sortableHead(
+          ['ID', 'Receptionat', 'Subject', 'From', 'To', 'Status', 'Status CTS', 'Categorie', 'Departament', 'Prioritate', 'Asignat', 'Atașamente'],
+          { 'Receptionat': 'date' }, sortSt, setSortSt)),
         h('tbody', { key: 'tb' }, (data.items || []).map(e => h('tr', { key: e.id, className: 'clickable', onClick: () => setSelectedId(e.id) }, [
           h('td', { key: 'id' }, h(IdCell, { id: e.id })),
           h('td', { key: 3, style: { whiteSpace: 'nowrap' } }, dateCell(e.received_at)),
@@ -4349,7 +4399,7 @@ function Clients({ setTopbarRight, initialDeepNav, onBack }) {
     h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', flex: 1, minHeight: 0, marginBottom: 0 } },
       h('table', { key: 't', className: 'list-table-full' }, [
         h('thead', { key: 'th' }, h('tr', null,
-          ['IRIS ID', 'Nume', 'Email', 'Telefon', 'Conversație (↓ primite · ↑ trimise)', 'Vehicule · Contracte', 'Satisfacție', 'Ultima sincronizare'].map(function(c) {
+          ['IRIS ID', 'Nume', 'Email', 'Telefon', 'Mailuri (↓ primite · ↑ trimise)', 'Apeluri (↓ primite · ↑ date)', 'Vehicule · Contracte', 'Satisfacție', 'Ultima sincronizare'].map(function(c) {
             return h('th', { key: c }, c);
           })
         )),
@@ -4366,6 +4416,14 @@ function Clients({ setTopbarRight, initialDeepNav, onBack }) {
               h('span', { key: 'r', title: 'Primite de la client', style: { fontWeight: 600, color: '#185FA5' } }, '↓ ' + (c.email_count || 0)),
               h('span', { key: 'sep', style: { color: 'var(--t3)', margin: '0 7px' } }, '·'),
               h('span', { key: 's', title: 'Trimise de noi', style: { fontWeight: 600, color: '#1a7f37' } }, '↑ ' + (c.sent_count || 0))
+            ]),
+            // Apelurile completeaza imaginea conversatiei: un client poate suna mult si scrie
+            // putin, caz in care coloana de mailuri singura il arata inactiv.
+            h('td', { key: 'ca', style: { fontSize: 12, textAlign: 'center', whiteSpace: 'nowrap' },
+                title: 'Apeluri: ' + (c.call_in_count || 0) + ' primite de la client · ' + (c.call_out_count || 0) + ' date de noi' }, [
+              h('span', { key: 'r', title: 'Apeluri primite', style: { fontWeight: 600, color: (c.call_in_count ? '#185FA5' : 'var(--t3)') } }, '↓ ' + (c.call_in_count || 0)),
+              h('span', { key: 'sep', style: { color: 'var(--t3)', margin: '0 7px' } }, '·'),
+              h('span', { key: 's', title: 'Apeluri date', style: { fontWeight: 600, color: (c.call_out_count ? '#1a7f37' : 'var(--t3)') } }, '↑ ' + (c.call_out_count || 0))
             ]),
             h('td', { key: 'vc', style: { fontSize: 12, textAlign: 'center', whiteSpace: 'nowrap' },
                 title: (c.vehicle_count || 0) + ' vehicule · ' + (c.contract_count || 0) + ' contracte (sincronizate din CTS)' }, [
@@ -10755,7 +10813,10 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
               }, label + arrow);
             }
             return [
-              sortTh('client', 'Client'),
+              // La task-uri/operațiuni rândul poate fi legat de un echipament, nu de un client
+              // (CTS nu asignează client pe toate) — antetul o spune, iar numărul de device stă
+              // în coloana următoare.
+              sortTh('client', (tip === 'task' || tip === 'device_ops') ? 'Client/Device' : 'Client'),
               // Numărul de device: la operațiuni vine direct din CTS (device_serial), la task-uri
               // e extras din titlu/descriere (CTS nu trimite câmpul) — vezi _extract_device.
               (tip === 'task' || tip === 'device_ops')
@@ -10780,7 +10841,11 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
             var st = PROD_BD_STATUS[it.status] || PROD_BD_STATUS.nemasurat;
             return h('tr', { key:(it.id || i) }, [
               h('td', { key:'a', style:Object.assign({}, td, { fontWeight:600, maxWidth:200 }) },
-                it.client || '—'),
+                it.client
+                  ? it.client
+                  : h('span', { style:{ color:'var(--t3)', fontWeight:400 },
+                      title: it.device ? 'Fără client asignat — vezi device-ul alăturat' : null },
+                      (tip === 'task' || tip === 'device_ops') && it.device ? 'pe echipament' : '—')),
               (tip === 'task' || tip === 'device_ops')
                 ? h('td', { key:'dev', style:Object.assign({}, td, { whiteSpace:'nowrap',
                       fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize:12.5 }),
@@ -13248,11 +13313,20 @@ function taskDurationLabel(mins) {
   return d + 'z ' + remh + 'h';
 }
 
+// Coloanele sortabile: eticheta din antet -> cheia acceptata de backend (_TASK_SORTS).
+// 'default' = ordinea istorica (ultima modificare CTS), pastrata la prima incarcare.
+var TASK_SORT_COLS = {
+  'Task ID': 'task_id', 'Data creare': 'created', 'Client/Device': 'client', 'Titlu': 'title',
+  'Tip': 'type', 'Departament': 'department', 'Asignat': 'assignee', 'Status': 'status',
+  'Preluare · Rezolvare': 'resolve'
+};
+
 function TaskuriPage() {
   const [stats, setStats] = useState(null);
   const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 50 });
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  const [sortSt, setSortSt] = useState({ sort: 'default', dir: 'desc' });
   const [filterStatus, setFilterStatus] = useState('');
   const [filterDepartment, setFilterDepartment] = useState('');
   const [filterType, setFilterType] = useState('');
@@ -13283,13 +13357,13 @@ function TaskuriPage() {
   function loadCfg() { api('/cts-tasks-training/sync-config').then(setCfg).catch(function(){}); }
   function loadList() {
     setLoading(true);
-    var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
+    var qs = ['page=' + page, 'page_size=50'].concat(filterQS()).concat(sortQs(sortSt, true));
     api('/cts-tasks-training/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   useEffect(function(){ loadCfg(); }, []);
-  useEffect(function(){ setPage(1); }, [filterStatus, filterDepartment, filterType, filterAssignee, range.from, range.to]);
-  useEffect(function(){ loadList(); }, [page, filterStatus, filterDepartment, filterType, filterAssignee, range.from, range.to]);
+  useEffect(function(){ setPage(1); }, [filterStatus, filterDepartment, filterType, filterAssignee, range.from, range.to, sortSt]);
+  useEffect(function(){ loadList(); }, [page, filterStatus, filterDepartment, filterType, filterAssignee, range.from, range.to, sortSt]);
   useEffect(function(){ loadStats(); }, [filterStatus, filterDepartment, filterType, filterAssignee, range.from, range.to]);
 
   function doSync() {
@@ -13368,12 +13442,22 @@ function TaskuriPage() {
   ]);
 
   var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
-    h('thead', { key: 'th' }, h('tr', null, ['Task ID', 'Data creare', 'Client', 'Titlu', 'Tip', 'Departament', 'Asignat', 'Status', 'Preluare · Rezolvare', 'Legătură'].map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('thead', { key: 'th' }, sortableHead(
+      ['Task ID', 'Data creare', 'Client/Device', 'Titlu', 'Tip', 'Departament', 'Asignat', 'Status', 'Preluare · Rezolvare', 'Legătură'],
+      TASK_SORT_COLS, sortSt, setSortSt)),
     h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it, i){
       return h('tr', { key: it.id, className: 'clickable', title: 'Vezi detaliile task-ului', onClick: function(){ setSelectedIdx(i); } }, [
         h('td', { key: 'tid', style: { fontSize: 12 } }, it.task_id),
         h('td', { key: 'dt', style: { whiteSpace: 'nowrap' } }, it.created_at ? dateCell(it.created_at) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
-        h('td', { key: 'cl', style: { fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.client_name || h('span', { style: { color: 'var(--t3)' } }, '—')),
+        // Nu orice task e pe un client — cele de echipament au doar numarul de device
+        // (extras din titlu/descriere, vezi _extract_device pe backend). Aratam clientul
+        // cand exista, altfel device-ul, ca randul sa fie identificabil in ambele cazuri.
+        h('td', { key: 'cl', title: it.client_name || it.device || '', style: { fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+          it.client_name
+            ? it.client_name
+            : (it.device
+                ? h('span', { title: 'Task pe echipament (fără client asignat)', style: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, color: 'var(--tx)', background: 'var(--bg3)', border: '1px solid var(--bd)', borderRadius: 4, padding: '1px 6px' } }, it.device)
+                : h('span', { style: { color: 'var(--t3)' } }, '—'))),
         h('td', { key: 'ti', title: it.title || '', style: { fontSize: 12, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.title || h('span', { style: { color: 'var(--t3)' } }, '—')),
         h('td', { key: 'ty', title: it.task_type || '', style: { fontSize: 12, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: it.type_family ? 'var(--tx)' : 'var(--t3)' } }, it.type_label || h('span', { style: { color: 'var(--t3)' } }, '—')),
         h('td', { key: 'dp' }, taskDeptBadge(it.department)),
@@ -13417,11 +13501,19 @@ function TaskuriPage() {
 // actiuni NU apar in feed-ul de task-uri existent). Endpoint-ul IRIS (/cts/device-operations) e
 // cerut lui Razvan (vezi docs/device_operations_endpoint_request.md) -- pana la raspuns, sync-ul
 // e gracios (404 -> mesaj clar in loc de eroare), exact ca la Task-uri inainte sa fie live /cts/tasks.
+// Eticheta din antet -> cheia acceptata de backend (_OPS_SORTS).
+var OPS_SORT_COLS = {
+  'Operație': 'operation', 'Finalizat montator': 'finished', 'Închis Suport 2': 'closed',
+  'Client': 'client', 'Tip': 'type', 'Departament': 'department', 'Asignat': 'assignee',
+  'Status': 'status', 'Durată / limită': 'duration', 'Echipament': 'device'
+};
+
 function DeviceOpsPage() {
   const [stats, setStats] = useState(null);
   const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 50 });
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
+  const [sortSt, setSortSt] = useState({ sort: 'default', dir: 'desc' });
   const [filterStatus, setFilterStatus] = useState('');
   const [filterDepartment, setFilterDepartment] = useState('');
   const [filterActionType, setFilterActionType] = useState('');
@@ -13450,13 +13542,13 @@ function DeviceOpsPage() {
   function loadCfg() { api('/device-ops/sync-config').then(setCfg).catch(function(){}); }
   function loadList() {
     setLoading(true);
-    var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
+    var qs = ['page=' + page, 'page_size=50'].concat(filterQS()).concat(sortQs(sortSt, true));
     api('/device-ops/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   useEffect(function(){ loadCfg(); }, []);
-  useEffect(function(){ setPage(1); }, [filterStatus, filterDepartment, filterActionType, filterAssignee, range.from, range.to]);
-  useEffect(function(){ loadList(); }, [page, filterStatus, filterDepartment, filterActionType, filterAssignee, range.from, range.to]);
+  useEffect(function(){ setPage(1); }, [filterStatus, filterDepartment, filterActionType, filterAssignee, range.from, range.to, sortSt]);
+  useEffect(function(){ loadList(); }, [page, filterStatus, filterDepartment, filterActionType, filterAssignee, range.from, range.to, sortSt]);
   useEffect(function(){ loadStats(); }, [filterStatus, filterDepartment, filterActionType, filterAssignee, range.from, range.to]);
 
   function doSync() {
@@ -13520,7 +13612,9 @@ function DeviceOpsPage() {
   ]);
 
   var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
-    h('thead', { key: 'th' }, h('tr', null, ['Operație', 'Finalizat montator', 'Închis Suport 2', 'Client', 'Tip', 'Departament', 'Asignat', 'Status', 'Durată / limită', 'Echipament', 'Descriere'].map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('thead', { key: 'th' }, sortableHead(
+      ['Operație', 'Finalizat montator', 'Închis Suport 2', 'Client', 'Tip', 'Departament', 'Asignat', 'Status', 'Durată / limită', 'Echipament', 'Descriere'],
+      OPS_SORT_COLS, sortSt, setSortSt)),
     h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it){
       var durCol = 'var(--t3)';
       var durText = '—';
@@ -13692,6 +13786,7 @@ function QualityEvalPage() {
   const [range, setRange] = useState({ from: null, to: null });
   const [syncing, setSyncing] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState(null);   // randul deschis in modal
+  const [sortSt, setSortSt] = useState({ sort: 'date', dir: 'desc' });
 
   useEffect(function(){ api('/quality-eval/filters').then(setOpts).catch(function(){}); }, []);
 
@@ -13714,13 +13809,13 @@ function QualityEvalPage() {
   }
   function loadList() {
     setLoading(true);
-    var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
+    var qs = ['page=' + page, 'page_size=50'].concat(filterQS()).concat(sortQs(sortSt, false));
     api('/quality-eval/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   var deps = [filterStatus, filterDepartment, filterAssignee, filterEntity, filterFondata, range.from, range.to];
-  useEffect(function(){ setPage(1); }, deps);
-  useEffect(function(){ loadList(); }, [page].concat(deps));
+  useEffect(function(){ setPage(1); }, deps.concat([sortSt]));
+  useEffect(function(){ loadList(); }, [page, sortSt].concat(deps));
   useEffect(function(){ loadStats(); }, deps);
 
   function doSync() {
@@ -13788,9 +13883,9 @@ function QualityEvalPage() {
   }
 
   var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
-    h('thead', { key: 'th' }, h('tr', null,
-      ['ID', 'Înregistrată', 'Client', 'Responsabil', 'Departament', 'Tip', 'Verdict', 'Status', 'Preluată', 'Soluționată', 'Procesată de', 'Observații']
-        .map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('thead', { key: 'th' }, sortableHead(
+      ['ID', 'Înregistrată', 'Client', 'Responsabil', 'Departament', 'Tip', 'Verdict', 'Status', 'Preluată', 'Soluționată', 'Procesată de', 'Observații'],
+      { 'Înregistrată': 'date' }, sortSt, setSortSt)),
     h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it, idx){
       return h('tr', { key: it.id, className: 'clickable', title: 'Vezi detaliile reclamației',
         onClick: function(){ setSelectedIdx(idx); } }, [
@@ -14890,6 +14985,7 @@ function CallDetail({ callId, onClose, allIds, currentIndex, onNext, onPrev }) {
 
 function ApelPage({ setTopbarRight }) {
   const [data, setData] = useState(null);
+  const [sortSt, setSortSt] = useState({ sort: 'date', dir: 'desc' });
   const [agents, setAgents] = useState([]);
   const [dirTab, setDirTab] = useState('inbound');
   const [aiCat, setAiCat] = useState('');
@@ -14913,7 +15009,7 @@ function ApelPage({ setTopbarRight }) {
     return function() { clearTimeout(t); };
   }, [search]);
 
-  useEffect(function() { setPage(1); }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to]);
+  useEffect(function() { setPage(1); }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to, sortSt]);
 
   useEffect(function() {
     const qs = ['page=' + page, 'direction=' + dirTab];
@@ -14924,8 +15020,9 @@ function ApelPage({ setTopbarRight }) {
     if (range.from) qs.push('date_from=' + encodeURIComponent(range.from));
     if (range.to) qs.push('date_to=' + encodeURIComponent(range.to));
     if (qApplied) qs.push('q=' + encodeURIComponent(qApplied));
+    qs.push.apply(qs, sortQs(sortSt, false));
     api('/calls?' + qs.join('&')).then(setData);
-  }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to, qApplied, page, tick]);
+  }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to, qApplied, page, tick, sortSt]);
 
   useEffect(function() {
     if (!setTopbarRight) return;
@@ -14980,7 +15077,9 @@ function ApelPage({ setTopbarRight }) {
     dirTabs,
     h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', flex: 1, minHeight: 0, marginBottom: 0 } }, [
       h('table', { key: 't', className: 'list-table-full' }, [
-        h('thead', { key: 'th' }, h('tr', null, ['ID', 'Data apel', 'Direcție', 'Telefon', 'Client', 'Agent', 'Departament', 'Durată', 'Categorie', 'Status'].map(function(c) { return h('th', { key: c }, c); }))),
+        h('thead', { key: 'th' }, sortableHead(
+          ['ID', 'Data apel', 'Direcție', 'Telefon', 'Client', 'Agent', 'Departament', 'Durată', 'Categorie', 'Status'],
+          { 'Data apel': 'date' }, sortSt, setSortSt)),
         h('tbody', { key: 'tb' }, items.map(function(c) { return h('tr', { key: c.id, className: 'clickable', onClick: function() { setSelectedId(c.id); } }, [
           h('td', { key: 'id' }, h(IdCell, { id: c.id })),
           h('td', { key: 'd', style: { whiteSpace: 'nowrap' } }, dateCell(c.started_at)),

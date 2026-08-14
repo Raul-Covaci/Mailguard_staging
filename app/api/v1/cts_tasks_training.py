@@ -18,6 +18,8 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir, sort_expr
+from app.services.productivity import _extract_device
 from app.services import cts_tasks_sync as SYNC
 
 logger = logging.getLogger("mailguard.cts_tasks_training")
@@ -80,6 +82,25 @@ def _task_filters_with_assignee(status, department, task_type, date_from, date_t
     return where_sql, params
 
 
+# Coloane sortabile din UI -> expresia SQL. 'default' pastreaza ordinea istorica
+# (ultima modificare CTS), ca lista sa arate identic cand nu se cere nimic explicit.
+# resolution/claim sint alias-uri de SELECT — Postgres accepta alias in ORDER BY.
+_TASK_SORTS = {
+    "default":    "COALESCE(gt.cts_updated_at, gt.last_synced_at)",
+    "task_id":    "gt.iris_task_id",
+    "created":    "gt.cts_created_at",
+    "updated":    "gt.cts_updated_at",
+    "client":     "COALESCE(cl.name, gt.client_name)",
+    "title":      "gt.title",
+    "type":       "gt.task_type",
+    "department": "gt.department",
+    "assignee":   "COALESCE(edm.name, gt.assignee_raw)",
+    "status":     "gt.status",
+    "claim":      "time_to_claim_minutes",
+    "resolve":    "time_to_solve_minutes",
+}
+
+
 @router.get("/cts-tasks-training/list")
 def cts_tasks_training_list(
     status: str = Query("", description="filtru status (gol = toate)"),
@@ -90,6 +111,8 @@ def cts_tasks_training_list(
     assignee: str = Query("", description="filtru assignee (email exact, gol = toti)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    sort: str = Query("default", description="coloana de sortare (vezi _TASK_SORTS)"),
+    dir: str = Query("desc", description="'asc' | 'desc'"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -124,7 +147,7 @@ def cts_tasks_training_list(
         "            ELSE NULL END AS time_to_solve_minutes "
         + base +
         " WHERE " + where_sql +
-        " ORDER BY COALESCE(gt.cts_updated_at, gt.last_synced_at) DESC, gt.id DESC "
+        f" ORDER BY {sort_expr(sort, _TASK_SORTS, 'default')} {sort_dir(dir)} NULLS LAST, gt.id {sort_dir(dir)} "
         "LIMIT :lim OFFSET :off"), params).fetchall()
 
     items = []
@@ -140,6 +163,11 @@ def cts_tasks_training_list(
             "status": m["status"],
             "priority": m["priority"],
             "client_name": m["client_name"],
+            # Task-urile fara client sint legate de un echipament. CTS nu trimite niciun camp
+            # de device in /cts/tasks (verificat pe raw_payload), deci numarul se extrage din
+            # titlu/descriere — acelasi extractor ca in Productivitate, ca cele doua pagini sa
+            # nu arate identificatori diferiti pentru acelasi task.
+            "device": _extract_device(m["title"], m["description"]),
             "department": m["department"],
             "title": m["title"],
             "description": m["description"],

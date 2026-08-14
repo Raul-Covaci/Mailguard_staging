@@ -156,6 +156,61 @@ def discover_client_emails() -> int:
     return updated
 
 
+# ── Sync periodic de clienti (vehicule + contracte) ──────────────────────────
+# Pina la 2026-08-14 sync-ul rula DOAR la apasarea butonului din UI: nu exista cron,
+# timer sau task care sa-l cheme, iar vehiculele/contractele au ramas inghetate din
+# 29.07. Cheia `client_sync_interval_minutes` exista in settings, dar nu o citea nimeni.
+CLIENT_SYNC_DEFAULT_MINUTES = 60
+CLIENT_SYNC_MIN_MINUTES = 5          # un pull complet (~16k clienti) dureaza 60-90s
+_NEXT_SYNC_KEY = "client_assets.next_sync_at"
+
+
+def client_sync_interval_minutes() -> int:
+    """Intervalul configurat in settings, cu podea de siguranta."""
+    try:
+        with _conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = 'client_sync_interval_minutes'")
+            row = cur.fetchone()
+        val = int(str(row[0]).strip('"')) if row and row[0] is not None else CLIENT_SYNC_DEFAULT_MINUTES
+    except Exception:
+        return CLIENT_SYNC_DEFAULT_MINUTES
+    return max(CLIENT_SYNC_MIN_MINUTES, val)
+
+
+def claim_client_sync() -> bool:
+    """True daca ACEST proces a cistigat dreptul sa ruleze sync-ul acum.
+
+    API-ul ruleaza cu 4 workeri gunicorn = 4 procese separate, deci `_CLIENT_SYNC_LOCK`
+    (lock de threading, per-proces) NU ii poate coordona intre ei. Claim-ul se face
+    atomic in DB: `ON CONFLICT ... DO UPDATE ... WHERE scadent` muta scadenta si
+    intoarce rind exact unui singur worker. Un "citeste, compara, scrie" ar lasa toti
+    patru sa porneasca simultan acelasi pull de 16k clienti.
+
+    Scadenta persista in DB, deci un restart/deploy nu reporneste numaratoarea de la zero.
+    """
+    minutes = client_sync_interval_minutes()
+    try:
+        with _conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO settings (key, value, description, updated_at)
+                VALUES (%s, to_jsonb((NOW() + make_interval(mins => %s))::text),
+                        'Cind ruleaza urmatorul sync de clienti (claim intre workeri)', NOW())
+                ON CONFLICT (key) DO UPDATE
+                   SET value = to_jsonb((NOW() + make_interval(mins => %s))::text),
+                       updated_at = NOW()
+                 WHERE (settings.value #>> '{}')::timestamptz <= NOW()
+                RETURNING 1
+            """, (_NEXT_SYNC_KEY, minutes, minutes))
+            won = cur.fetchone() is not None
+            conn.commit()
+        return won
+    except Exception:
+        logger.exception("claim_client_sync failed")
+        return False
+
+
 def sync_clients_guarded():
     """Wrapper cu lock anti-suprapunere pt rularea in fundal (daemon thread)."""
     if not _CLIENT_SYNC_LOCK.acquire(blocking=False):

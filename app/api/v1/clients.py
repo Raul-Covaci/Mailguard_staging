@@ -115,6 +115,13 @@ def list_clients(db: Session = Depends(get_db), page: int = 1, q: str = "",
                     AND c.iris_client_id IS NOT NULL
                     AND g.raw->'extra'->>'client_id' = c.iris_client_id::text
                ) AS sent_count,
+               -- Apeluri: aceeasi imagine ca la mailuri (primite / date), ca lista sa arate
+               -- toata conversatia cu clientul, nu doar canalul de email. `direction` e
+               -- 'inbound'/'outbound' in tabela calls.
+               (SELECT COUNT(*) FROM calls ca
+                  WHERE ca.client_id = c.id AND ca.direction = 'inbound') AS call_in_count,
+               (SELECT COUNT(*) FROM calls ca
+                  WHERE ca.client_id = c.id AND ca.direction = 'outbound') AS call_out_count,
                (SELECT COUNT(*) FROM client_vehicles v WHERE v.client_id = c.id) AS vehicle_count,
                (SELECT COUNT(*) FROM client_contracts ct WHERE ct.client_id = c.id) AS contract_count
         FROM clients c

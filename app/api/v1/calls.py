@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir
 from app.services import call_audio
 # Atribuirea apel -> angajat (3 trepte: mapare invatata din CTS, potrivire pe nume, assignee CTS)
 # e definita o singura data, in modulul de productivitate. O reimplementare aici ar diverge de
@@ -57,6 +58,7 @@ def list_calls(
     q: Optional[str] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    dir: str = Query("desc", description="ordonare dupa started_at: 'asc' | 'desc'"),
     db: Session = Depends(get_db),
 ):
     where = ["1=1"]
@@ -112,7 +114,7 @@ def list_calls(
         {_APEL_AGENT_JOIN_LEFT}
         LEFT JOIN clients cl ON cl.id = c.client_id
         WHERE {where_sql}
-        ORDER BY c.started_at DESC
+        ORDER BY c.started_at {sort_dir(dir)} NULLS LAST, c.id {sort_dir(dir)}
         LIMIT :limit OFFSET :offset
     """
     params["limit"] = limit

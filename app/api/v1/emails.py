@@ -11,6 +11,7 @@ from app.services import parser_email_op_reader, process_email
 from app.services import email_translator
 from app.services import cts_auto_solved
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir
 import logging as _logging
 logger = _logging.getLogger("mailguard.emails")
 from pydantic import BaseModel
@@ -102,6 +103,7 @@ def list_emails(
     date_to: Optional[str] = Query(None, description="perioada: data pana la, inclusiv (YYYY-MM-DD)"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    dir: str = Query("desc", description="ordonare dupa received_at: 'asc' | 'desc'"),
     db: Session = Depends(get_db)
 ):
     where = ["1=1"]
@@ -203,7 +205,7 @@ def list_emails(
                ({_SPAM_PREDICATE} AND status NOT IN :spam_exc) AS is_spam
                {_queue_select}
         FROM emails WHERE {where_sql}
-        ORDER BY received_at DESC
+        ORDER BY received_at {sort_dir(dir)} NULLS LAST, id {sort_dir(dir)}
         LIMIT :limit OFFSET :offset
     """
     params["limit"] = limit

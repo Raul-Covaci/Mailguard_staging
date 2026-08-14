@@ -143,10 +143,41 @@ TimeoutStartSec=300
 EOF
 
 sudo systemctl daemon-reload && sudo systemctl enable --now mailguard-api
+sudo systemctl enable --now mailguard-personal-poll.timer
 ```
 
 Fara drop-in, migrarile **nu se aplica** la restart si aplicatia porneste pe o
 schema veche.
+
+### Sync-ul de clienti (vehicule + contracte)
+
+Ruleaza in aplicatie (`_client_sync_loop` din `app/main.py`), pornit de `lifespan` —
+nu are nevoie de cron sau timer systemd. Pana la 2026-08-14 nu exista nimic periodic:
+`POST /api/v1/clients/sync-now` se declansa doar la apasarea butonului din UI, iar
+vehiculele si contractele au ramas inghetate din 29.07 (datele erau in DB — 43k
+vehicule, 32k contracte — si endpoint-urile raspundeau corect).
+
+Intervalul se schimba din DB, fara redeploy:
+
+```sql
+UPDATE settings SET value = to_jsonb(30), updated_at = NOW()
+WHERE key = 'client_sync_interval_minutes';       -- minute; podea 5
+```
+
+API-ul ruleaza cu 4 workeri gunicorn, deci fiecare proces are propria bucla. Ca sa nu
+porneasca patru pull-uri deodata, scadenta se ia atomic din DB
+(`iris_sync.claim_client_sync()`, cheia `client_assets.next_sync_at`): cistiga exact
+un worker per interval. Scadenta persista, deci un restart nu reporneste numaratoarea.
+
+Verificare:
+
+```bash
+# prospetimea reala a datelor
+psql -c "SELECT max(last_synced_at) FROM clients;"
+# starea ultimei rulari + urmatoarea scadenta
+psql -c "SELECT key, value FROM settings WHERE key LIKE 'client_assets%';"
+journalctl -u mailguard-api | grep 'client sync periodic'
+```
 
 ---
 

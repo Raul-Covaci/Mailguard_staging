@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+from app.api.v1.sorting import sort_dir
 from app.services import cts_calls_sync as SYNC
 
 logger = logging.getLogger("mailguard.cts_calls_training")
@@ -84,6 +85,7 @@ def cts_calls_training_list(
     status: str = Query("", description="status CTS ('new'|'in progress'|'solved')"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    dir: str = Query("desc", description="ordonare dupa data apelului: 'asc' | 'desc'"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -135,7 +137,7 @@ def cts_calls_training_list(
         + base + " LEFT JOIN clients cl ON cl.id = c.client_id "
         " LEFT JOIN clients ccts ON ccts.iris_client_id = gt.cts_client_id "
         "WHERE " + where_sql +
-        " ORDER BY COALESCE(c.started_at, gt.cts_started_at, gt.fetched_at) DESC NULLS LAST, gt.id DESC "
+        f" ORDER BY COALESCE(c.started_at, gt.cts_started_at, gt.fetched_at) {sort_dir(dir)} NULLS LAST, gt.id {sort_dir(dir)} "
         "LIMIT :lim OFFSET :off"), params).fetchall()
 
     items = []
