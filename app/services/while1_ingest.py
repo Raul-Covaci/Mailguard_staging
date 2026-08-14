@@ -213,10 +213,17 @@ def _insert_call(db, rec: dict) -> Optional[int]:
     client_id = _match_client_phone(db, client_phone)
     row = db.execute(text("""
         INSERT INTO calls(call_id, while1_uniqueid, direction, caller_number, callee_number,
-            agent_extension, call_status, started_at, duration_seconds, recording_ref, audio_status, client_id)
-        VALUES(:cid, :uid, :dir, :caller, :callee, :agent, :cstatus, :started, :dur, :ref, :astatus, :clid)
+            agent_extension, call_status, started_at, duration_seconds, ring_seconds,
+            recording_ref, audio_status, client_id)
+        VALUES(:cid, :uid, :dir, :caller, :callee, :agent, :cstatus, :started, :dur, :ring,
+            :ref, :astatus, :clid)
         ON CONFLICT (call_id) DO UPDATE SET
-            client_id = COALESCE(calls.client_id, EXCLUDED.client_id)
+            client_id = COALESCE(calls.client_id, EXCLUDED.client_id),
+            -- `ring_seconds` a fost adaugat dupa ce ingestul rula deja (20260813c), deci randurile
+            -- vechi il au NULL. COALESCE il completeaza la o re-interogare a aceleiasi perioade,
+            -- fara sa suprascrie o valoare deja cunoscuta -- restul campurilor raman neatinse,
+            -- ca pana acum (un CDR nu se rescrie retroactiv).
+            ring_seconds = COALESCE(calls.ring_seconds, EXCLUDED.ring_seconds)
         RETURNING id
     """), {
         "cid": call_id,
@@ -228,6 +235,10 @@ def _insert_call(db, rec: dict) -> Optional[int]:
         "cstatus": call_status,
         "started": rec.get("time"),
         "dur": _parse_duration(rec.get("bill_duration") or rec.get("duration")),
+        # Timpul pana la raspuns = SLA-ul de apel din productivitate. While1 il trimite ca
+        # `ring_time`; formatul nu e documentat explicit, dar `_parse_duration` accepta si
+        # 'HH:MM:SS' si secunde brute, deci acopera ambele variante.
+        "ring": _parse_duration(rec.get("ring_time") or rec.get("ring_seconds")),
         "ref": ref,
         "astatus": audio_status,
         "clid": client_id,
@@ -290,4 +301,60 @@ def sync_run(limit: int = 200) -> dict:
     out = {"ok": True, "fetched": fetched, "inserted": inserted, "pages": page,
            "ms": int((time.time() - t0) * 1000)}
     logger.info("while1 sync: %s", out)
+    return out
+
+
+def backfill_ring_seconds(date_from: str, date_to: str, max_pages: int = 400) -> dict:
+    """Completeaza `calls.ring_seconds` pe un interval deja ingerat, re-interogand While1.
+
+    De ce e nevoie: coloana a aparut in migrarea 20260813c, dupa ce ingestul rula de luni de zile,
+    iar cursorul obisnuit (`filters.from_id`) merge doar inainte -- randurile vechi nu mai sint
+    atinse niciodata. Fara timpul de raspuns, canalul "Apeluri" din productivitate ramane
+    nemasurabil: pe august 2026, 2139 de apeluri PRIMITE si raspunse aveau ring_seconds NULL.
+
+    Se refoloseste `_insert_call`, deci se aplica exact acelasi ON CONFLICT ca la ingestul normal:
+    completeaza `ring_seconds` doar unde e NULL si nu rescrie restul campurilor. Rularea e
+    idempotenta si se poate relua oricand.
+
+    NU atinge cursorul incremental (`while1_last_id`) -- un backfill pe iunie nu trebuie sa faca
+    sync-ul curent sa reia totul de acolo.
+
+    date_from / date_to: 'YYYY-MM-DD HH:MM:SS' (formatul cerut de filters.date_between).
+    """
+    c = _cfg()
+    if not is_configured():
+        return {"ok": False, "skipped": "while1_not_configured"}
+
+    t0 = time.time()
+    fetched = touched = page = 0
+    db = SessionLocal()
+    try:
+        page = 1
+        while page <= max_pages:
+            try:
+                results, pagination = _fetch_cdr_page(c, page, date_from=date_from, date_to=date_to)
+            except Exception as e:
+                logger.warning("while1 backfill fetch fail (page %s): %s", page, str(e)[:200])
+                break
+            if not results:
+                break
+            fetched += len(results)
+            for rec in results:
+                try:
+                    if _insert_call(db, rec):
+                        touched += 1
+                        db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.warning("while1 backfill one fail: %s", str(e)[:200])
+            max_page = pagination.get("max_page") or 1
+            if (pagination.get("current_page") or page) >= max_page:
+                break
+            page += 1
+    finally:
+        db.close()
+
+    out = {"ok": True, "from": date_from, "to": date_to, "fetched": fetched,
+           "touched": touched, "pages": page, "ms": int((time.time() - t0) * 1000)}
+    logger.info("while1 backfill ring_seconds: %s", out)
     return out

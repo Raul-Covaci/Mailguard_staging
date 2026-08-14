@@ -310,7 +310,7 @@ def get_analytics(from_: Optional[str] = Query(None, alias="from"),
 
 
 @router.get("/productivity/breakdown")
-def get_breakdown(tip: str = Query(..., description="'email' | 'task' | 'apel' | 'device_ops'"),
+def get_breakdown(tip: str = Query(..., description="'email' | 'task' | 'apel' | 'device_ops' | 'reclamatie'"),
                   department: str = Query(...),
                   month: Optional[str] = Query(None, description="YYYY-MM; implicit luna curenta"),
                   categorie: Optional[str] = Query(None, description="categoria obiectivului; '' = general"),
@@ -334,8 +334,9 @@ def get_breakdown(tip: str = Query(..., description="'email' | 'task' | 'apel' |
       - `nemasurat`= durata 0/None (interval integral in afara programului, sau capat lipsa)
     """
     tip = (tip or "").strip().lower()
-    if tip not in ("email", "task", "apel", "device_ops"):
-        raise HTTPException(status_code=400, detail="tip invalid (email|task|apel|device_ops).")
+    if tip not in ("email", "task", "apel", "device_ops", "reclamatie"):
+        raise HTTPException(status_code=400,
+                            detail="tip invalid (email|task|apel|device_ops|reclamatie).")
     dept = (department or "").strip().lower()
     if not dept:
         raise HTTPException(status_code=400, detail="department obligatoriu.")
@@ -1112,25 +1113,42 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         # "0 primite / 1 rezolvată" e corectă, deși pare imposibilă (caz real Suport 2, 03.08:
         # email 66619023, primit 01.08 21:33, rezolvat 03.08 06:30). `deschise` e ancora care dă
         # sens celor două: câte sunt deschise ACUM, indiferent de ziua sosirii.
+        # RECLAMATII: sursa e modulul Quality Evaluation din CTS (`cts_quality_evaluation`,
+        # sincronizat din IRIS DV), NU categoria emailului ca pana la v2.10.0. Categoria de email
+        # marca alt lucru -- un mail incadrat 'reclamatie' de operator -- si nu se potrivea cu ce
+        # se vede in CTS (constatat 2026-08-13: Suport 1 arata 1 rezolvata azi desi in CTS nu era
+        # niciuna). Aici un rand = o reclamatie reala, cu propriul ciclu new -> in progress -> solved.
+        #
+        # Departamentul afisat e al persoanei EVALUATE (`department_id` din CTS, tradus prin
+        # departamentul angajatilor nostri). Pentru PRODUCTIVITATE aceleasi reclamatii merg
+        # integral la Suport 3, echipa care le proceseaza -- vezi _fetch_reclamatie_rows.
         d_recl = _by_dept(f"""
             SELECT dept,
-                   COUNT(*) FILTER (WHERE primit_azi)              AS primite_azi,
-                   COUNT(*) FILTER (WHERE rezolvat AND solved_azi) AS rezolvate_azi,
-                   COUNT(*) FILTER (WHERE NOT rezolvat)            AS deschise
+                   COUNT(*) FILTER (WHERE primit_azi)   AS primite_azi,
+                   COUNT(*) FILTER (WHERE rezolvat_azi) AS rezolvate_azi,
+                   COUNT(*) FILTER (WHERE deschisa)     AS deschise
             FROM (
-                SELECT COALESCE(g.cts_department, edm.department) AS dept,
-                       (g.cts_status IN ('solved','closed'))                       AS rezolvat,
-                       (DATE(g.cts_solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS solved_azi,
-                       (DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)               AS primit_azi
-                FROM cts_ground_truth g
-                LEFT JOIN employee_department_mapping edm
-                  ON lower(g.cts_assignee_email) = lower(edm.email)
-                LEFT JOIN emails e ON e.id = g.email_id
-                LEFT JOIN clients pex ON pex.id = e.client_id
-                WHERE g.cts_deleted_at IS NULL
-                  AND COALESCE(g.cts_department, edm.department) = ANY(:depts)
-                  AND {_EMAIL_EXCLUDE_SQL}
-                  AND lower(coalesce(g.cts_category, e.ai_category)) = 'reclamatie'
+                SELECT dep.department AS dept,
+                       (DATE(qe.created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS primit_azi,
+                       (qe.status = 3
+                        AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
+                       (qe.status IS DISTINCT FROM 3)                               AS deschisa
+                FROM cts_quality_evaluation qe
+                -- department_id (CTS) -> slug-ul nostru, dedus din angajatii mapati. LATERAL +
+                -- LIMIT 1: `cts_dv_employee` are randuri multiple per persoana.
+                JOIN LATERAL (
+                    SELECT e.department
+                    FROM cts_dv_employee dv
+                    JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+                    -- `cts_dv_employee.department_id` e TEXT (oglinda bruta a DV-ului), iar in
+                    -- reclamatie e INT: fara cast, join-ul crapa si contoarele ies 0.
+                    WHERE dv.department_id = qe.department_id::text AND e.enabled = true
+                    GROUP BY e.department
+                    ORDER BY count(*) DESC, e.department
+                    LIMIT 1
+                ) dep ON true
+                WHERE qe.deleted_at IS NULL
+                  AND dep.department = ANY(:depts)
             ) s
             GROUP BY 1
         """, 3)

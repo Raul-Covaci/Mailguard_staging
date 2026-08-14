@@ -1058,6 +1058,13 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
         res["device_ops_dv_sync"] = device_ops_suport2_sync.run_recent_if_due()
     except Exception:
         logger.exception("device_ops_dv rolling sync failed")
+    # RECLAMATII (Quality Evaluation, IRIS Data Views). Throttle intern 50s, deci prospetimea e
+    # data de cadenta cronului, nu de sync -- cerinta e "la 1 minut" (v2.10.0).
+    try:
+        from app.services import quality_eval_sync
+        res["quality_eval_sync"] = quality_eval_sync.run_recent_if_due()
+    except Exception:
+        logger.exception("quality_eval rolling sync failed")
     # STEP 2: proceseaza atasamentele noi (clasificare + extragere documente), fire-and-forget.
     # Daemon thread, best-effort — NU blocheaza si NU afecteaza procesarea emailurilor.
     try:

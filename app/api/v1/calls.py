@@ -11,9 +11,27 @@ from sqlalchemy import text
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
 from app.services import call_audio
+# Atribuirea apel -> angajat (3 trepte: mapare invatata din CTS, potrivire pe nume, assignee CTS)
+# e definita o singura data, in modulul de productivitate. O reimplementare aici ar diverge de
+# cifrele din Productivitate exact pe cazurile grele (nume scrise altfel de While1).
+from app.services.productivity import _APEL_AGENT_CTE, _APEL_AGENT_JOIN_LEFT
 
 logger = logging.getLogger("mailguard.calls")
 router = APIRouter()
+
+# Statusurile de procesare, exact cum le calculeaza UI-ul in callStatusLabel() — filtrul din
+# tabel trebuie sa se potriveasca pe coloana afisata, altfel "Status: Procesat" ar da alt set.
+_STATUS_SQL = {
+    "procesat": "c.audio_status = 'downloaded' AND c.transcript_status = 'success' AND c.ai_category IS NOT NULL",
+    "neclasificat": "c.ai_category IS NULL",
+    "fara_inregistrare": "c.audio_status = 'no_recording'",
+    "in_asteptare": "c.audio_status = 'pending' OR c.transcript_status = 'pending'",
+    "eroare": "c.audio_status = 'error' OR c.transcript_status = 'error'",
+    # call_status vine din While1: ANSWERED / NO ANSWER / BUSY / FAILED. Apelurile fara raspuns
+    # sint apeluri reale primite (intra in volum), de-aia merita filtru propriu.
+    "raspuns": "c.call_status = 'ANSWERED'",
+    "fara_raspuns": "c.call_status IN ('NO ANSWER', 'BUSY', 'FAILED')",
+}
 
 
 @router.get("/calls/agents")
@@ -32,6 +50,8 @@ def list_calls(
     ai_category: Optional[str] = None,
     client_id: Optional[int] = None,
     agent: Optional[str] = None,
+    department: Optional[str] = None,
+    status: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     q: Optional[str] = None,
@@ -42,16 +62,24 @@ def list_calls(
     where = ["1=1"]
     params = {}
     if direction:
-        where.append("direction = :dir"); params["dir"] = direction
+        where.append("c.direction = :dir"); params["dir"] = direction
     if ai_category:
         if ai_category == "__none__":
-            where.append("ai_category IS NULL")
+            where.append("c.ai_category IS NULL")
         else:
-            where.append("ai_category = :cat"); params["cat"] = ai_category
+            where.append("c.ai_category = :cat"); params["cat"] = ai_category
     if client_id:
-        where.append("client_id = :cid"); params["cid"] = client_id
+        where.append("c.client_id = :cid"); params["cid"] = client_id
     if agent and agent.strip():
         where.append("c.agent_extension = :agent"); params["agent"] = agent.strip()
+    if department and department.strip():
+        # Departamentul operatorului care a raspuns, prin aceeasi atribuire ca Productivitatea.
+        where.append("edm.department = :department"); params["department"] = department.strip()
+    if status and status.strip():
+        cond = _STATUS_SQL.get(status.strip().lower())
+        if cond is None:
+            raise HTTPException(400, "status invalid: " + ", ".join(sorted(_STATUS_SQL)))
+        where.append("(" + cond + ")")
     if date_from and date_from.strip():
         where.append("c.started_at >= CAST(:date_from AS date)"); params["date_from"] = date_from.strip()
     if date_to and date_to.strip():
@@ -59,20 +87,29 @@ def list_calls(
     if q and q.strip():
         qs = q.strip()
         params["q"] = "%" + qs + "%"
-        clauses = ["caller_number ILIKE :q", "callee_number ILIKE :q",
-                   "client_id IN (SELECT id FROM clients WHERE name ILIKE :q)"]
+        # Coloanele se califica pe `c`: de cind lista are si JOIN-ul de atribuire pe operator,
+        # `id` singur ar fi ambiguu (calls / clients / employee_department_mapping).
+        clauses = ["c.caller_number ILIKE :q", "c.callee_number ILIKE :q",
+                   "c.client_id IN (SELECT id FROM clients WHERE name ILIKE :q)"]
         qid = qs.lstrip("#").strip()
         if qid.isdigit():
-            clauses.append("id = :qid"); params["qid"] = int(qid)
+            clauses.append("c.id = :qid"); params["qid"] = int(qid)
         where.append("(" + " OR ".join(clauses) + ")")
     where_sql = " AND ".join(where)
 
+    # Atribuirea pe operator intra in TOATE interogarile, nu doar cind se filtreaza pe departament:
+    # asa lista arata cine a raspuns (numele nostru, nu cum il scrie While1) fara a doua cerere.
+    # Cost masurat local: 0.16s pe 24k apeluri, cu numaratoare cu tot.
     sql = f"""
+        {_APEL_AGENT_CTE}
         SELECT c.id, c.call_id, c.direction, c.caller_number, c.callee_number,
                c.started_at, c.duration_seconds, c.audio_status, c.transcript_status,
                c.ai_category, c.ai_result, c.ai_priority, c.ai_assignee,
-               c.client_id, cl.name AS client_name, c.queue_status
+               c.client_id, cl.name AS client_name, c.queue_status, c.call_status,
+               c.ring_seconds, c.agent_extension,
+               edm.name AS operator_name, edm.department AS operator_department
         FROM calls c
+        {_APEL_AGENT_JOIN_LEFT}
         LEFT JOIN clients cl ON cl.id = c.client_id
         WHERE {where_sql}
         ORDER BY c.started_at DESC
@@ -81,8 +118,10 @@ def list_calls(
     params["limit"] = limit
     params["offset"] = (page - 1) * limit
     rows = db.execute(text(sql), params).fetchall()
-    total = db.execute(text(f"SELECT COUNT(*) FROM calls c WHERE {where_sql}"),
-                       {k: v for k, v in params.items() if k not in ("limit", "offset")}).scalar()
+    total = db.execute(text(f"""
+        {_APEL_AGENT_CTE}
+        SELECT COUNT(*) FROM calls c {_APEL_AGENT_JOIN_LEFT} WHERE {where_sql}
+    """), {k: v for k, v in params.items() if k not in ("limit", "offset")}).scalar()
     items = [dict(r._mapping) for r in rows]
     return {"page": page, "limit": limit, "total": total, "items": items}
 

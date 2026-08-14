@@ -33,6 +33,45 @@ def _conf(result) -> float:
     return None
 
 
+def _call_filters(date_from: str, date_to: str, department: str, assignee: str, status: str):
+    """Filtrele comune listei si statisticilor (perioada / departament / utilizator / status).
+
+    Perioada se aplica pe DATA APELULUI, pe ora Europe/Bucharest: `calls.started_at` (While1,
+    ora locala) intai, `cts_started_at` (UTC) doar ca fallback pentru apelurile fara corespondent
+    While1. Fara conversie, apelurile de dupa 21:00 ar cadea in ziua urmatoare (decalaj 3h vara).
+
+    Utilizator / departament = cine a preluat apelul in CTS. Departamentul nu exista pe rand: se
+    deduce din angajatul nostru cu acelasi email (`employee_department_mapping`, email unic).
+    """
+    where = ["1=1"]
+    params = {}
+
+    _day_expr = ("COALESCE(c.started_at::date, "
+                 "(gt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date)")
+    for _raw, _op, _key in ((date_from, ">=", "date_from"), (date_to, "<=", "date_to")):
+        _v = (_raw or "").strip()
+        if not _v:
+            continue
+        try:
+            _dt.date.fromisoformat(_v)
+        except ValueError:
+            raise HTTPException(400, "Data '%s' nu e in format YYYY-MM-DD." % _v)
+        where.append("%s %s :%s" % (_day_expr, _op, _key))
+        params[_key] = _v
+
+    if (assignee or "").strip():
+        where.append("lower(gt.cts_assignee_email) = lower(:assignee)")
+        params["assignee"] = assignee.strip()
+    if (department or "").strip():
+        where.append("edm.department = :department")
+        params["department"] = department.strip()
+    if (status or "").strip():
+        where.append("lower(gt.cts_status) = lower(:status)")
+        params["status"] = status.strip()
+
+    return where, params
+
+
 @router.get("/cts-calls-training/list")
 def cts_calls_training_list(
     only_mismatch: int = Query(0),
@@ -40,6 +79,9 @@ def cts_calls_training_list(
     search_id: str = Query("", description="cauta dupa ID apel (gt.id sau c.id)"),
     date_from: str = Query("", description="YYYY-MM-DD, inclusiv, ora Europe/Bucharest"),
     date_to: str = Query("", description="YYYY-MM-DD, inclusiv, ora Europe/Bucharest"),
+    department: str = Query("", description="slug departament al assignee-ului CTS"),
+    assignee: str = Query("", description="email assignee CTS (gol = toti)"),
+    status: str = Query("", description="status CTS ('new'|'in progress'|'solved')"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -56,26 +98,11 @@ def cts_calls_training_list(
     e sursa cu ora exactă a apelului. `cts_started_at` (timestamptz, UTC) e doar fallback pentru
     apelurile care există în CTS dar nu au corespondent While1.
     """
-    where = ["1=1"]
-    params = {}
+    where, params = _call_filters(date_from, date_to, department, assignee, status)
 
     if search_id.strip().isdigit():
         where.append("(gt.call_local_id = :search_id OR gt.id = :search_id)")
         params["search_id"] = int(search_id.strip())
-
-    # COALESCE pe ziua locală: While1 (timestamp local) întâi, apoi CTS (timestamptz UTC).
-    _day_expr = ("COALESCE(c.started_at::date, "
-                 "(gt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date)")
-    for _raw, _op, _key in ((date_from, ">=", "date_from"), (date_to, "<=", "date_to")):
-        _v = (_raw or "").strip()
-        if not _v:
-            continue
-        try:
-            _dt.date.fromisoformat(_v)
-        except ValueError:
-            raise HTTPException(400, "Data '%s' nu e in format YYYY-MM-DD." % _v)
-        where.append("%s %s :%s" % (_day_expr, _op, _key))
-        params[_key] = _v
 
     cat_diff = "(gt.cts_category IS NOT NULL AND c.ai_category IS NOT NULL AND gt.cts_category <> c.ai_category)"
     asg_diff = ("(gt.cts_assignee_email IS NOT NULL AND c.ai_assignee IS NOT NULL "
@@ -87,7 +114,12 @@ def cts_calls_training_list(
             where.append(cat_diff)
 
     where_sql = " AND ".join(where)
-    base = "FROM cts_calls_ground_truth gt LEFT JOIN calls c ON c.id = gt.call_local_id"
+    # edm intra in JOIN-ul de baza (nu doar cand se filtreaza) ca departamentul sa fie si in
+    # randurile returnate. `employee_department_mapping.email` e unic (57/57 verificat), deci
+    # LEFT JOIN-ul simplu nu dubleaza randuri — spre deosebire de cts_dv_employee.
+    base = ("FROM cts_calls_ground_truth gt LEFT JOIN calls c ON c.id = gt.call_local_id "
+            "LEFT JOIN employee_department_mapping edm "
+            "       ON lower(edm.email) = lower(gt.cts_assignee_email)")
     total = db.execute(text("SELECT count(*) " + base + " WHERE " + where_sql), params).scalar()
 
     params["lim"] = page_size
@@ -98,7 +130,8 @@ def cts_calls_training_list(
         "       gt.cts_started_at, gt.cts_duration_seconds, gt.changed_at, "
         "       c.caller_number, c.callee_number, c.client_id, c.started_at, c.duration_seconds, "
         "       c.ai_category, c.ai_tone, c.ai_result, c.ai_assignee, cl.name AS client_name, "
-        "       gt.cts_client_id, ccts.id AS cts_client_local_id, ccts.name AS cts_client_name "
+        "       gt.cts_client_id, ccts.id AS cts_client_local_id, ccts.name AS cts_client_name, "
+        "       edm.department AS assignee_department, edm.name AS assignee_edm_name "
         + base + " LEFT JOIN clients cl ON cl.id = c.client_id "
         " LEFT JOIN clients ccts ON ccts.iris_client_id = gt.cts_client_id "
         "WHERE " + where_sql +
@@ -139,7 +172,8 @@ def cts_calls_training_list(
             "cat_match": cat_match,
             "ai_assignee": ai_asg,
             "cts_assignee": cts_asg,
-            "cts_assignee_name": m["cts_assignee_name"],
+            "cts_assignee_name": m["cts_assignee_name"] or m["assignee_edm_name"],
+            "assignee_department": m["assignee_department"],
             "asg_match": asg_match,
             "cts_status": m["cts_status"],
             "cts_response_seconds": m["cts_response_seconds"],
@@ -149,24 +183,43 @@ def cts_calls_training_list(
 
 
 @router.get("/cts-calls-training/stats")
-def cts_calls_training_stats(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
-    """Rate de potrivire MG vs CTS pentru apeluri."""
-    base = "FROM cts_calls_ground_truth gt LEFT JOIN calls c ON c.id = gt.call_local_id"
-    total = db.execute(text("SELECT count(*) " + base)).scalar() or 0
-    only_in_cts = db.execute(text("SELECT count(*) " + base + " WHERE gt.call_local_id IS NULL")).scalar() or 0
+def cts_calls_training_stats(
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    department: str = Query(""),
+    assignee: str = Query(""),
+    status: str = Query(""),
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Rate de potrivire MG vs CTS pentru apeluri, pe ACELEASI filtre ca lista.
+
+    Fara filtrele astea cardurile de sus ar arata mereu tot istoricul, in timp ce tabelul de
+    dedesubt ar arata subsetul — exact confuzia evitata deja pe Mail-uri CTS / Task-uri.
+    """
+    where, params = _call_filters(date_from, date_to, department, assignee, status)
+    where_sql = " AND ".join(where)
+    base = ("FROM cts_calls_ground_truth gt LEFT JOIN calls c ON c.id = gt.call_local_id "
+            "LEFT JOIN employee_department_mapping edm "
+            "       ON lower(edm.email) = lower(gt.cts_assignee_email)")
+    total = db.execute(text("SELECT count(*) " + base + " WHERE " + where_sql), params).scalar() or 0
+    only_in_cts = db.execute(text("SELECT count(*) " + base + " WHERE " + where_sql +
+                                  " AND gt.call_local_id IS NULL"), params).scalar() or 0
 
     cat = db.execute(text(
         "SELECT count(*) FILTER (WHERE gt.cts_category IS NOT NULL AND c.ai_category IS NOT NULL) AS comparable, "
         "       count(*) FILTER (WHERE gt.cts_category IS NOT NULL AND c.ai_category IS NOT NULL "
-        "                        AND gt.cts_category = c.ai_category) AS matched " + base)).fetchone()
+        "                        AND gt.cts_category = c.ai_category) AS matched " + base +
+        " WHERE " + where_sql), params).fetchone()
     asg = db.execute(text(
         "SELECT count(*) FILTER (WHERE gt.cts_assignee_email IS NOT NULL AND c.ai_assignee IS NOT NULL) AS comparable, "
         "       count(*) FILTER (WHERE gt.cts_assignee_email IS NOT NULL AND c.ai_assignee IS NOT NULL "
         "                        AND lower(gt.cts_assignee_email) = lower(c.ai_assignee)) AS matched, "
         "       count(*) FILTER (WHERE gt.cts_assignee_email IS NOT NULL AND c.ai_assignee IS NULL) AS missed_unassigned "
-        + base)).fetchone()
+        + base + " WHERE " + where_sql), params).fetchone()
     avg_resp = db.execute(text(
-        "SELECT avg(cts_response_seconds) FROM cts_calls_ground_truth WHERE cts_response_seconds IS NOT NULL")).scalar()
+        "SELECT avg(gt.cts_response_seconds) " + base + " WHERE " + where_sql +
+        " AND gt.cts_response_seconds IS NOT NULL"), params).scalar()
     changed_24h = db.execute(text(
         "SELECT count(*) FROM cts_calls_ground_truth WHERE changed_at >= now() - interval '24 hours'")).scalar() or 0
     pending_unclassified = db.execute(text(
@@ -294,6 +347,24 @@ def cts_calls_training_sync_recent(hours: int = Query(24, ge=1, le=168),
     _th.Thread(target=SYNC.sync_recent_guarded, kwargs={"hours": hours}, daemon=True).start()
     return {"ok": True, "started": True, "async": True, "window_hours": hours,
             "message": "Sync pornit in fundal. Lista se actualizeaza in cateva momente."}
+
+
+@router.get("/cts-calls-training/assignees")
+def cts_calls_training_assignees(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Utilizatorii care apar ca assignee CTS pe apeluri + departamentul lor — pentru filtre."""
+    rows = db.execute(text("""
+        SELECT lower(gt.cts_assignee_email) AS email,
+               COALESCE(max(gt.cts_assignee_name), max(edm.name)) AS name,
+               max(edm.department) AS department,
+               count(*) AS n
+        FROM cts_calls_ground_truth gt
+        LEFT JOIN employee_department_mapping edm ON lower(edm.email) = lower(gt.cts_assignee_email)
+        WHERE gt.cts_assignee_email IS NOT NULL AND gt.cts_assignee_email <> ''
+        GROUP BY 1
+        ORDER BY 2
+    """)).fetchall()
+    return {"assignees": [{"email": r[0], "name": r[1] or r[0], "department": r[2],
+                           "count": int(r[3])} for r in rows]}
 
 
 @router.get("/cts-calls-training/sync-config")

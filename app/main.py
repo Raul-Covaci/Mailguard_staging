@@ -355,6 +355,15 @@ app.include_router(_device_ops_api.router, prefix="/api/v1", tags=["device_ops"]
                    dependencies=[Depends(_ac.require_module("device-ops"))])
 
 # ═══════════════════════════════════════════════════════════════════════
+# Modul Reclamatii / Quality Evaluation — 2026-08-14
+# Lista peste `cts_quality_evaluation` (oglinda view-ului IRIS DV, vezi quality_eval_sync).
+# Aceleasi randuri alimenteaza Monitorul si productivitatea Suport 3.
+# ═══════════════════════════════════════════════════════════════════════
+from app.api.v1 import quality_eval as _quality_eval_api
+app.include_router(_quality_eval_api.router, prefix="/api/v1", tags=["quality_eval"],
+                   dependencies=[Depends(_ac.require_module("quality-eval"))])
+
+# ═══════════════════════════════════════════════════════════════════════
 # Program departamente (SLA in program de lucru, nu 24/7) — 2026-07-02
 # Inregistrare separata (append) ca sa nu interfereze cu restul router-elor.
 # ═══════════════════════════════════════════════════════════════════════

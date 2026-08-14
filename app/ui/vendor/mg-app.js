@@ -73,7 +73,9 @@ const ICONS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
   back: '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
-  close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>'
+  close: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  // Reclamații (Quality Evaluation) — triunghi de avertizare.
+  alert: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>'
 };
 function Icon({ id, size }) {
   return h('svg', {
@@ -612,6 +614,9 @@ function CtsTrainingPanel() {
   const [dateTo, setDateTo] = useState('');
   const [axis, setAxis] = useState('');
   const [searchId, setSearchId] = useState('');
+  const [assigneeF, setAssigneeF] = useState('');       // utilizator = assignee-ul CTS (adevar de teren)
+  const [statusF, setStatusF] = useState('');           // status CTS: new / in progress / solved
+  const [assigneeList, setAssigneeList] = useState([]);
   const [syncing, setSyncing] = useState(false);
   const [cfg, setCfg] = useState(null);
   const [selectedId, setSelectedId] = useState(null);   // email_id deschis în modalul de email (ca pe pagina Emailuri)
@@ -630,6 +635,8 @@ function CtsTrainingPanel() {
     if (_dTo) qs.push('dept_to=' + encodeURIComponent(_dTo));
     if (_df) qs.push('date_from=' + encodeURIComponent(_df));
     if (_dt) qs.push('date_to=' + encodeURIComponent(_dt));
+    if (assigneeF) qs.push('assignee=' + encodeURIComponent(assigneeF));
+    if (statusF) qs.push('status=' + encodeURIComponent(statusF));
     api('/cts-training/stats' + (qs.length ? '?' + qs.join('&') : '')).then(setStats).catch(function(){});
   }
   function loadCfg() { api('/cts-training/sync-config').then(setCfg).catch(function(){}); }
@@ -644,12 +651,15 @@ function CtsTrainingPanel() {
     if (dateTo) qs.push('date_to=' + encodeURIComponent(dateTo));
     if (axis) qs.push('axis=' + encodeURIComponent(axis));
     if (searchId.trim()) qs.push('search_id=' + encodeURIComponent(searchId.trim()));
+    if (assigneeF) qs.push('assignee=' + encodeURIComponent(assigneeF));
+    if (statusF) qs.push('status=' + encodeURIComponent(statusF));
     api('/cts-training/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
   useEffect(function(){ loadStats(); loadCfg(); }, []);
-  useEffect(function(){ setPage(1); }, [onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId]);
-  useEffect(function(){ loadList(); loadStats(); }, [page, onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId]);
+  useEffect(function(){ api('/cts-training/assignees').then(function(d){ setAssigneeList(d.assignees || []); }).catch(function(){}); }, []);
+  useEffect(function(){ setPage(1); }, [onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF]);
+  useEffect(function(){ loadList(); loadStats(); }, [page, onlyMismatch, deptF, deptFrom, deptTo, dateFrom, dateTo, axis, dirTab, searchId, assigneeF, statusF]);
 
   function doSync() {
     setSyncing(true);
@@ -752,11 +762,20 @@ function CtsTrainingPanel() {
     h('select', { key: 'dfrom', className: 'btn secondary', style: { padding: '6px 10px' }, value: deptFrom, onChange: function(e){ setDeptFrom(e.target.value); } }, deptOpts),
     h('span', { key: 'lbl-to', style: { fontSize: 12, color: 'var(--t3)', whiteSpace: 'nowrap' } }, 'Spre categoria:'),
     h('select', { key: 'dto', className: 'btn secondary', style: { padding: '6px 10px' }, value: deptTo, onChange: function(e){ setDeptTo(e.target.value); } }, deptOpts),
+    h('span', { key: 'sep15', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
+    // Utilizator = assignee-ul din CTS (cine a lucrat mailul), nu sugestia AI.
+    h('select', { key: 'asg', className: 'btn secondary', style: { padding: '6px 10px', maxWidth: 200 }, value: assigneeF,
+      title: 'Utilizatorul care a preluat mailul în CTS', onChange: function(e){ setAssigneeF(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toți utilizatorii')].concat(assigneeList.map(function(a){
+        return h('option', { key: a.email, value: a.email }, (a.name || a.email) + ' (' + a.count + ')'); }))),
+    h('select', { key: 'stf', className: 'btn secondary', style: { padding: '6px 10px' }, value: statusF, onChange: function(e){ setStatusF(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate statusurile')].concat(
+        ['new', 'in progress', 'solved', 'deleted'].map(function(s){ return h('option', { key: s, value: s }, s); }))),
     h('span', { key: 'sep2', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
     h('input', { key: 'dtefrom', type: 'date', className: 'btn secondary', style: { padding: '5px 8px', fontFamily: 'inherit', fontSize: 13, cursor: 'pointer', minWidth: 130 }, value: dateFrom, title: 'De la data', onChange: function(e){ setDateFrom(e.target.value); } }),
     h('span', { key: 'lbl-dash', style: { fontSize: 13, color: 'var(--t3)' } }, '—'),
     h('input', { key: 'dteto', type: 'date', className: 'btn secondary', style: { padding: '5px 8px', fontFamily: 'inherit', fontSize: 13, cursor: 'pointer', minWidth: 130 }, value: dateTo, title: 'Pana la data', onChange: function(e){ setDateTo(e.target.value); } }),
-    (dateFrom || dateTo || deptFrom || deptTo || searchId) ? h('button', { key: 'clr', className: 'btn secondary', style: { fontSize: 12, padding: '5px 10px', color: 'var(--rd)' }, onClick: function(){ setDateFrom(''); setDateTo(''); setDeptFrom(''); setDeptTo(''); setSearchId(''); } }, 'Reset filtre') : null,
+    (dateFrom || dateTo || deptFrom || deptTo || searchId || assigneeF || statusF) ? h('button', { key: 'clr', className: 'btn secondary', style: { fontSize: 12, padding: '5px 10px', color: 'var(--rd)' }, onClick: function(){ setDateFrom(''); setDateTo(''); setDeptFrom(''); setDeptTo(''); setSearchId(''); setAssigneeF(''); setStatusF(''); } }, 'Reset filtre') : null,
     h('span', { key: 'cnt', title: 'Numar total de mailuri care corespund filtrelor aplicate', style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color: 'var(--t2)', border: '1px solid var(--bd)', borderRadius: 999, padding: '4px 11px', fontVariantNumeric: 'tabular-nums' } }, [(data.total != null ? data.total.toLocaleString('ro-RO') : '0'), h('span', { key: 'l', style: { fontWeight: 400, color: 'var(--t3)' } }, 'mailuri')]),
     h('div', { key: 'sp', style: { flex: 1 } }),
     h('span', { key: 'sn', style: { fontSize: 11, color: 'var(--t3)' } }, syncNote),
@@ -852,25 +871,42 @@ function CtsCallsTrainingPanel() {
   const [searchId, setSearchId] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const [deptF, setDeptF] = useState('');       // departamentul assignee-ului CTS
+  const [assigneeF, setAssigneeF] = useState('');
+  const [statusF, setStatusF] = useState('');
+  const [assigneeList, setAssigneeList] = useState([]);
   const [syncing, setSyncing] = useState(false);
   const [cfg, setCfg] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
 
-  function loadStats() { api('/cts-calls-training/stats').then(setStats).catch(function(){}); }
+  // Aceleasi filtre pe lista SI pe carduri — altfel sumarul de sus ar arata tot istoricul.
+  function filterQS() {
+    var qs = [];
+    if (dateFrom) qs.push('date_from=' + encodeURIComponent(dateFrom));
+    if (dateTo) qs.push('date_to=' + encodeURIComponent(dateTo));
+    if (deptF) qs.push('department=' + encodeURIComponent(deptF));
+    if (assigneeF) qs.push('assignee=' + encodeURIComponent(assigneeF));
+    if (statusF) qs.push('status=' + encodeURIComponent(statusF));
+    return qs;
+  }
+  function loadStats() {
+    var q = filterQS();
+    api('/cts-calls-training/stats' + (q.length ? ('?' + q.join('&')) : '')).then(setStats).catch(function(){});
+  }
   function loadCfg() { api('/cts-calls-training/sync-config').then(setCfg).catch(function(){}); }
   function loadList() {
     setLoading(true);
-    var qs = ['page=' + page, 'page_size=50'];
+    var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
     if (onlyMismatch) { qs.push('only_mismatch=1'); qs.push('axis=' + encodeURIComponent(axis)); }
     if (searchId.trim()) qs.push('search_id=' + encodeURIComponent(searchId.trim()));
-    if (dateFrom) qs.push('date_from=' + encodeURIComponent(dateFrom));
-    if (dateTo) qs.push('date_to=' + encodeURIComponent(dateTo));
     api('/cts-calls-training/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
       .catch(function(){ setLoading(false); });
   }
-  useEffect(function(){ loadStats(); loadCfg(); }, []);
-  useEffect(function(){ setPage(1); }, [onlyMismatch, axis, searchId, dateFrom, dateTo]);
-  useEffect(function(){ loadList(); }, [page, onlyMismatch, axis, searchId, dateFrom, dateTo]);
+  useEffect(function(){ loadCfg(); }, []);
+  useEffect(function(){ api('/cts-calls-training/assignees').then(function(d){ setAssigneeList(d.assignees || []); }).catch(function(){}); }, []);
+  useEffect(function(){ setPage(1); }, [onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF]);
+  useEffect(function(){ loadList(); }, [page, onlyMismatch, axis, searchId, dateFrom, dateTo, deptF, assigneeF, statusF]);
+  useEffect(function(){ loadStats(); }, [dateFrom, dateTo, deptF, assigneeF, statusF]);
 
   // Scurtaturi de interval — cazurile uzuale ("apelurile de azi/ieri") fara sa tastezi doua date.
   function ymd(d) {
@@ -972,6 +1008,20 @@ function CtsCallsTrainingPanel() {
     (dateFrom || dateTo) ? h('button', { key: 'dclr', className: 'btn secondary',
       style: { fontSize: 12, padding: '5px 9px', color: 'var(--rd)' },
       onClick: function(){ setDateFrom(''); setDateTo(''); } }, 'Șterge datele') : null,
+    h('span', { key: 'sepf', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
+    // Departament = al assignee-ului CTS (apelul nu are departament propriu în CTS).
+    h('select', { key: 'dep', className: 'btn secondary', style: { padding: '6px 10px' }, value: deptF,
+      title: 'Departamentul utilizatorului care a preluat apelul în CTS', onChange: function(e){ setDeptF(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate departamentele')].concat(DEPT_SLUGS.map(function(s){
+        return h('option', { key: s, value: s }, DEPT_LABELS[s]); }))),
+    h('select', { key: 'asg', className: 'btn secondary', style: { padding: '6px 10px', maxWidth: 200 }, value: assigneeF,
+      onChange: function(e){ setAssigneeF(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toți utilizatorii')].concat(assigneeList.map(function(a){
+        return h('option', { key: a.email, value: a.email }, (a.name || a.email) + ' (' + a.count + ')'); }))),
+    h('select', { key: 'stf', className: 'btn secondary', style: { padding: '6px 10px' }, value: statusF,
+      onChange: function(e){ setStatusF(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate statusurile')].concat(
+        ['new', 'in progress', 'solved'].map(function(s){ return h('option', { key: s, value: s }, s); }))),
     h('span', { key: 'sep1', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
     h('input', { key: 'sid', type: 'text', inputMode: 'numeric', placeholder: 'Caută ID apel…', value: searchId,
       className: 'btn secondary', style: { padding: '6px 10px', width: 140, fontFamily: 'inherit', fontSize: 13 },
@@ -10697,8 +10747,16 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
               // e extras din titlu/descriere (CTS nu trimite câmpul) — vezi _extract_device.
               (tip === 'task' || tip === 'device_ops')
                 ? h('th', { key:'device', style:th }, 'Device') : null,
-              h('th', { key:'subiect', style:th }, tip === 'apel' ? 'Telefon' : 'Subiect'),
-              sortTh('created_at', 'Creat'),
+              // Reclamații: cine a fost evaluat (CTS îl ia din lucrarea reclamată) și dacă
+              // reclamația a ieșit fondată. Nu e cine o rezolvă — aceea e echipa scorată.
+              tip === 'reclamatie' ? h('th', { key:'ev', style:th }, 'Evaluat') : null,
+              tip === 'reclamatie' ? h('th', { key:'fond', style:th }, 'Verdict') : null,
+              h('th', { key:'subiect', style:th },
+                tip === 'apel' ? 'Telefon' : tip === 'reclamatie' ? 'Observații' : 'Subiect'),
+              sortTh('created_at', tip === 'reclamatie' ? 'Înregistrată' : 'Creat'),
+              // Reclamații: se văd ambele praguri, fiecare cu minutele de PROGRAM scurse DIN
+              // MOMENTUL ÎNREGISTRĂRII (contactul e inclus în timpul de soluționare).
+              tip === 'reclamatie' ? h('th', { key:'ct', style:th }, 'Contactat') : null,
               sortTh('solved_at', 'Soluționat'),
               h('th', { key:'e', style:th },  'Rezolvat de'),
               h('th', { key:'f', style:thN }, 'Timp'),
@@ -10719,17 +10777,77 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
                       : h('span', { style:{ color:'var(--t3)' },
                           title:'CTS nu trimite numărul de device pe task-uri; aici nu apare nici în text.' }, '—'))
                 : null,
+              tip === 'reclamatie'
+                ? h('td', { key:'ev', style:td },
+                    it.evaluat
+                      ? h('span', {}, [
+                          h('div', { key:'n' }, it.evaluat),
+                          it.dept_evaluat ? h('div', { key:'d', style:{ fontSize:11, color:'var(--t3)' } },
+                            prodDeptLabel(it.dept_evaluat)) : null
+                        ])
+                      : h('span', { style:{ color:'var(--t3)' } }, '—'))
+                : null,
+              tip === 'reclamatie'
+                ? h('td', { key:'fond', style:td },
+                    h('span', { style:{ display:'inline-block', padding:'2px 8px', borderRadius:99,
+                        fontSize:11, fontWeight:700, whiteSpace:'nowrap',
+                        background: it.fondata ? 'color-mix(in srgb, var(--rd) 14%, transparent)'
+                                               : 'color-mix(in srgb, var(--gn) 14%, transparent)',
+                        color: it.fondata ? 'var(--rd)' : 'var(--gn)',
+                        border: '1px solid color-mix(in srgb, ' + (it.fondata ? 'var(--rd)' : 'var(--gn)') + ' 32%, transparent)' },
+                      title: it.fondata
+                        ? 'Nu s-a respectat procedura (is_according_to_the_procedure = 0)'
+                        : 'S-a respectat procedura (is_according_to_the_procedure = 1)' },
+                      it.fondata ? 'fondată' : 'nefondată'))
+                : null,
               h('td', { key:'b', style:Object.assign({}, td, { maxWidth:340, color:'var(--t2)' }),
                   // Descrierea completă a task-ului, pentru cazurile în care titlul e generic
                   // („carGObox: device discrepancy") și nu identifică singur task-ul.
                   title: it.descriere || null },
-                tip === 'apel'
-                  ? (it.telefon || '—')
+                tip === 'reclamatie'
+                  ? (it.subiect || h('span', { style:{ color:'var(--t3)' } }, '—'))
+                  : tip === 'apel'
+                  ? h('span', {}, [
+                      h('span', { key:'t' }, it.telefon || '—'),
+                      // Starea din centrală: un apel primit la care nu s-a răspuns intră în volum
+                      // dar nu are timp de răspuns, deci apare „nemăsurat". Fără eticheta asta
+                      // pare o eroare de calcul.
+                      (it.call_status && it.call_status !== 'ANSWERED')
+                        ? h('span', { key:'s', style:{ marginLeft:8, fontSize:10.5, fontWeight:700,
+                            padding:'1px 6px', borderRadius:99, whiteSpace:'nowrap',
+                            background:'color-mix(in srgb, var(--yw) 14%, transparent)',
+                            color:'var(--yw)',
+                            border:'1px solid color-mix(in srgb, var(--yw) 32%, transparent)' } },
+                            it.call_status === 'NO ANSWER' ? 'fără răspuns' : String(it.call_status).toLowerCase())
+                        : null
+                    ])
                   : (it.subiect || (it.descriere ? String(it.descriere).slice(0, 120) : '[fără subiect]'))),
               h('td', { key:'c', style:Object.assign({}, tdN, { textAlign:'left' }) },
                 prodBdDT(it.created_at)),
+              // Momentul + minutele de program de la înregistrare. Coloana „Timp" de mai jos
+              // rămâne cea care dă statusul (durata categoriei scorate).
+              tip === 'reclamatie'
+                ? h('td', { key:'ct', style:Object.assign({}, tdN, { textAlign:'left' }) },
+                    it.contact_at
+                      ? h('span', {}, [
+                          h('div', { key:'t' }, prodBdDT(it.contact_at)),
+                          h('div', { key:'m', style:{ fontSize:11, color:'var(--t3)' },
+                            title:'Din înregistrare până la preluare, doar minute din programul echipei' },
+                            prodBdDur(it.durata_contact, unitate))
+                        ])
+                      : h('span', { style:{ color:'var(--t3)' }, title:'CTS a trecut-o direct în „solved", fără pas de preluare' }, '—'))
+                : null,
               h('td', { key:'d', style:Object.assign({}, tdN, { textAlign:'left' }) },
-                prodBdDT(it.solved_at)),
+                tip === 'reclamatie'
+                  ? (it.solutionat_at
+                      ? h('span', {}, [
+                          h('div', { key:'t' }, prodBdDT(it.solutionat_at)),
+                          h('div', { key:'m', style:{ fontSize:11, color:'var(--t3)' },
+                            title:'Din înregistrare până la soluționare, doar minute din programul echipei' },
+                            prodBdDur(it.durata_solutionare, unitate))
+                        ])
+                      : h('span', { style:{ color:'var(--t3)' } }, 'nesoluționată'))
+                  : prodBdDT(it.solved_at)),
               h('td', { key:'e', style:td }, it.solved_by || '—'),
               h('td', { key:'f', style:tdN }, prodBdDur(it.durata, unitate)),
               h('td', { key:'g', style:td }, [
@@ -10930,8 +11048,8 @@ function ProdDeptCard({ d, isForecast }) {
   var td = { padding:'7px 10px', borderBottom:'1px solid var(--bd)', fontSize:13 };
   var tdNum = Object.assign({}, td, { textAlign:'right', fontVariantNumeric:'tabular-nums' });
   function sortArrow(k){ return sortKey === k ? (sortDir === 'desc' ? ' ↓' : ' ↑') : ''; }
-  var OBJ_ICONS = { email:'✉', apel:'☎', task:'✓', device_ops:'⚙' };
-  var OBJ_ACCENTS = { email:'var(--bl)', apel:'var(--am)', task:'var(--gn)', device_ops:'var(--yw)' };
+  var OBJ_ICONS = { email:'✉', apel:'☎', task:'✓', device_ops:'⚙', reclamatie:'!' };
+  var OBJ_ACCENTS = { email:'var(--bl)', apel:'var(--am)', task:'var(--gn)', device_ops:'var(--yw)', reclamatie:'var(--rd)' };
   var objRows = (d.obiective || []).map(function(o, i){
     var label = prodTipLabel(o.tip) + (o.categorie ? (' — ' + prodCategorieLabel(o.categorie)) : '');
     var suffix = o.unitate === 'secunde' ? 'sec' : 'min';
@@ -11041,8 +11159,31 @@ function ProdDeptCard({ d, isForecast }) {
       var hasTask = !!hasTips['task'];
       var hasApel = !!hasTips['apel'];
       var hasDeviceOps = !!hasTips['device_ops'];
+      // Reclamațiile au DOUĂ obiective pe același tip (contact + soluționare) și aceeași
+      // reclamație intră în amândouă — o coloană „Reclamații" cumulată ar arăta volum dublu.
+      // Pe o lună avem `obiective` per operator (defalcat pe categorie); pe interval agregat nu,
+      // și atunci se cade pe o singură coloană cumulată, marcată ca atare în tooltip.
+      var reclObjs = (d.obiective || []).filter(function(o){ return o.tip === 'reclamatie'; });
+      var hasRecl = reclObjs.length > 0;
+      var reclPerCat = hasRecl && ops.length > 0 && Array.isArray(ops[0].obiective);
+      var reclCols = reclPerCat ? reclObjs : (hasRecl ? [null] : []);
+      function reclLabel(o) {
+        return o ? ('Recl. ' + (o.categorie === 'contact' ? 'contact' : o.categorie === 'solutionare' ? 'soluț.' : (o.categorie || 'general')))
+                 : 'Reclamații';
+      }
+      function reclVol(op, o) {
+        if (!o) return op.vol_reclamatie;
+        var s = (op.obiective || []).filter(function(x){ return x.tip === 'reclamatie' && (x.categorie || '') === (o.categorie || ''); })[0];
+        return s ? s.total : 0;
+      }
+      function reclCotiz(op, o) {
+        if (!o) return op.cotiz_reclamatie;
+        var s = (op.obiective || []).filter(function(x){ return x.tip === 'reclamatie' && (x.categorie || '') === (o.categorie || ''); })[0];
+        return s ? s.cotiz : null;
+      }
       // +1 pentru coloana „Contribuție", +1 pentru „Performanță"
-      var colSpan = 1 + (hasEmail ? 2 : 0) + (hasTask ? 2 : 0) + (hasApel ? 2 : 0) + (hasDeviceOps ? 2 : 0) + 2;
+      var colSpan = 1 + (hasEmail ? 2 : 0) + (hasTask ? 2 : 0) + (hasApel ? 2 : 0) + (hasDeviceOps ? 2 : 0)
+                      + reclCols.length * 2 + 2;
       var thS = Object.assign({}, th,  { borderBottom:'1px solid var(--bd)', paddingTop:10, paddingBottom:10 });
       var thNS = Object.assign({}, thNum, { borderBottom:'1px solid var(--bd)', paddingTop:10, paddingBottom:10 });
       return h('div', { key:'ops', style:{ overflowX:'auto', marginTop:14, borderRadius:10, border:'1px solid var(--bd)' } }, h('table', { style:{ width:'100%', minWidth:720, borderCollapse:'collapse' } }, [
@@ -11056,6 +11197,15 @@ function ProdDeptCard({ d, isForecast }) {
           hasApel  ? h('th', { key:'ca', style:thNS, onClick:function(){ sortBy('cotiz_apel'); } }, 'Cotiz. apel%'  + sortArrow('cotiz_apel'))  : null,
           hasDeviceOps ? h('th', { key:'dv', style:thNS, onClick:function(){ sortBy('vol_device_ops'); } }, 'Operațiuni' + sortArrow('vol_device_ops')) : null,
           hasDeviceOps ? h('th', { key:'dc', style:thNS, onClick:function(){ sortBy('cotiz_device_ops'); } }, 'Cotiz. oper.%' + sortArrow('cotiz_device_ops')) : null,
+          reclCols.length ? reclCols.map(function(o, ri){
+            return [
+              h('th', { key:'rv' + ri, style:thNS,
+                title: o ? ('Reclamații — ' + (o.categorie === 'contact' ? 'preluare' : 'soluționare') + ', în luna afișată')
+                         : 'Reclamații, contact + soluționare cumulate (pe interval nu există defalcarea pe categorie)' },
+                reclLabel(o)),
+              h('th', { key:'rc' + ri, style:thNS }, 'Cotiz.%')
+            ];
+          }) : null,
           // Contribuție = cât din productivitatea echipei ține de acest om, cu ponderea fiecărui
           // obiectiv al departamentului (un mail nu cântărește cât o operațiune pe echipament).
           // Coloanele „Cotiz." de mai sus numără bucăți, fără pondere.
@@ -11152,6 +11302,15 @@ function ProdDeptCard({ d, isForecast }) {
               hasApel  ? h('td', { key:'ca', style:Object.assign({}, td, { minWidth:110 }) }, o.cotiz_apel  == null ? h('span', { style:{ color:'var(--t3)' } }, '—') : miniBar(o.cotiz_apel,  maxApel,  colColorApel(o.cotiz_apel))) : null,
               hasDeviceOps ? h('td', { key:'dv', style:tdNum }, prodNum(o.vol_device_ops)) : null,
               hasDeviceOps ? h('td', { key:'dc', style:Object.assign({}, td, { minWidth:110 }) }, o.cotiz_device_ops == null ? h('span', { style:{ color:'var(--t3)' } }, '—') : miniBar(o.cotiz_device_ops, maxDeviceOps, colColorDeviceOps(o.cotiz_device_ops))) : null,
+              reclCols.length ? reclCols.map(function(rc, ri){
+                var v = reclVol(o, rc), c = reclCotiz(o, rc);
+                var maxR = Math.max.apply(null, ops.map(function(x){ return reclCotiz(x, rc) || 0; }).concat([0]));
+                return [
+                  h('td', { key:'rv' + ri, style:tdNum }, prodNum(v)),
+                  h('td', { key:'rc' + ri, style:Object.assign({}, td, { minWidth:110 }) },
+                    c == null ? h('span', { style:{ color:'var(--t3)' } }, '—') : miniBar(c, maxR, 'var(--bl)'))
+                ];
+              }) : null,
               h('td', { key:'cb', style:Object.assign({}, td, { minWidth:110 }) },
                 o.contributie == null ? h('span', { style:{ color:'var(--t3)' } }, '—')
                   : miniBar(o.contributie, maxContrib, colColorContrib(o.contributie))),
@@ -11328,6 +11487,9 @@ function prodExportPdf(opts) {
       if (hasTips['task'])       cols.push({ v:'vol_task', c:'cotiz_task', l:'Task-uri', cl:'Cotiz. task' });
       if (hasTips['apel'])       cols.push({ v:'vol_apel', c:'cotiz_apel', l:'Apeluri', cl:'Cotiz. apel' });
       if (hasTips['device_ops']) cols.push({ v:'vol_device_ops', c:'cotiz_device_ops', l:'Operațiuni', cl:'Cotiz. oper.' });
+      // Reclamațiile: în PDF merg cumulat (contact + soluționare), ca să nu explodeze lățimea
+      // tabelului. Defalcarea pe cele două praguri e în tabul Rapoarte.
+      if (hasTips['reclamatie']) cols.push({ v:'vol_reclamatie', c:'cotiz_reclamatie', l:'Reclamații', cl:'Cotiz. recl.' });
       parts.push('<h3>Ponderi per operator</h3><table><thead><tr><th>Operator</th>');
       cols.forEach(function(c){ parts.push('<th class="n">' + esc(c.l) + '</th><th class="n">' + esc(c.cl) + '%</th>'); });
       parts.push('<th class="n">Contribuție%</th><th class="n">Performanță</th></tr></thead><tbody>');
@@ -11480,10 +11642,12 @@ function ProductivityReports({ month, dept, rangeMode }) {
 var PROD_DEPT_ACCENT = { suport_1:'var(--bl)', suport_2:'var(--am)', taxe_drum:'var(--yw)', suport_3:'var(--gn)', contabilitate:'var(--rd)', mobilitate:'var(--am)' };
 function prodDeptAccent(s){ return PROD_DEPT_ACCENT[s] || 'var(--am)'; }
 
-var PROD_TIP_LABELS = { email:'Emailuri', task:'Task-uri', apel:'Apeluri', device_ops:'Operațiuni' };
-var PROD_TIP_OPTIONS = ['email', 'task', 'apel', 'device_ops'];
+var PROD_TIP_LABELS = { email:'Emailuri', task:'Task-uri', apel:'Apeluri', device_ops:'Operațiuni', reclamatie:'Reclamații' };
+var PROD_TIP_OPTIONS = ['email', 'task', 'apel', 'device_ops', 'reclamatie'];
 function prodTipLabel(t) { return PROD_TIP_LABELS[t] || (t ? (t.charAt(0).toUpperCase() + t.slice(1)) : 'Obiectiv'); }
-var PROD_CATEGORIE_LABELS = { cargobox:'CargoBox', calibrare:'Calibrare', demontare:'Demontare', inlocuire:'Înlocuire', instalare_noua:'Instalare nouă', interventie:'Intervenție', mutare:'Mutare', periferice:'Periferice' };
+var PROD_CATEGORIE_LABELS = { cargobox:'CargoBox', calibrare:'Calibrare', demontare:'Demontare', inlocuire:'Înlocuire', instalare_noua:'Instalare nouă', interventie:'Intervenție', mutare:'Mutare', periferice:'Periferice',
+  // Reclamații: cele două praguri de timp, măsurate din momentul înregistrării reclamației.
+  contact:'Contact (preluare)', solutionare:'Soluționare' };
 function prodCategorieLabel(c) { return PROD_CATEGORIE_LABELS[c] || (c ? (c.charAt(0).toUpperCase() + c.slice(1)) : ''); }
 
 function ProdDeptConfigCard({ cfg }) {
@@ -13379,6 +13543,276 @@ function DeviceOpsPage() {
   ]);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Modul "Reclamații" (Quality Evaluation) — 2026-08-14
+// Oglinda view-ului IRIS DV `quality_evaluation` (tabela cts_quality_evaluation). Aceleasi
+// randuri alimenteaza Monitorul Operational si productivitatea Suport 3; aici sint doar
+// vizibile, filtrabile pe data / departament / utilizator / status.
+//
+// DE RETINUT (semantica CTS, confirmata in sursa):
+//   is_according_to_the_procedure = 1 -> procedura respectata -> reclamatie NEFONDATA
+//   responsible_id = cine a fost EVALUAT (nu cine rezolva). updated_by = cine a procesat-o.
+// Departamentul afisat e al persoanei evaluate — la fel ca pe Monitor. In productivitate,
+// reclamatiile merg integral la Suport 3, echipa care le proceseaza.
+// ════════════════════════════════════════════════════════════════════════════
+// Tipul lucrarii reclamate — icon + culoare, ca sa se distinga dintr-o privire in tabel.
+var QE_ENTITY_META = {
+  client_contact_email_log: { label: 'Email', icon: 'mail',  col: '#3b82f6' },
+  task:                     { label: 'Task',  icon: 'task',  col: '#f59e0b' },
+  client_call_log:          { label: 'Apel',  icon: 'phone', col: '#14b8a6' }
+};
+function qeEntityBadge(entity, label) {
+  var m = QE_ENTITY_META[entity] || { label: label || entity || '—', icon: null, col: '#6b7280' };
+  return h('span', { className: 'badge', title: entity || '',
+    style: { display: 'inline-flex', alignItems: 'center', gap: 5, background: hexA(m.col, 0.12),
+             color: m.col, border: '1px solid ' + hexA(m.col, 0.35), textTransform: 'none', whiteSpace: 'nowrap' } }, [
+    m.icon ? h(Icon, { key: 'i', id: m.icon, size: 12 }) : null,
+    h('span', { key: 'l' }, m.label)
+  ]);
+}
+
+// Durata calendaristica intre doua momente. ATENTIE: NU e durata din Productivitate — acolo se
+// numara doar minutele din programul departamentului (business_minutes). Aici e timpul real scurs,
+// util ca sa vezi „cand a intrat / cand s-a raspuns", nu ca sa verifici SLA-ul.
+function qeElapsed(fromIso, toIso) {
+  if (!fromIso || !toIso) return null;
+  var a = new Date(fromIso).getTime(), b = new Date(toIso).getTime();
+  if (isNaN(a) || isNaN(b)) return null;
+  var min = Math.round((b - a) / 60000);
+  if (min < 60) return min + ' min';
+  var h_ = Math.floor(min / 60), m_ = min % 60;
+  if (h_ < 24) return h_ + 'h ' + String(m_).padStart(2, '0') + 'm';
+  return Math.floor(h_ / 24) + 'z ' + (h_ % 24) + 'h';
+}
+
+// Modal minimal de vizualizare — datele sunt deja complete in randul din lista, fara alt fetch
+// (acelasi tipar ca TaskDetail).
+function QualityEvalModal({ item, index, total, onClose, onPrev, onNext }) {
+  var it = item || {};
+  var canPrev = index > 0;
+  var canNext = index < total - 1;
+
+  useEffect(function() {
+    var onKey = function(e) {
+      if (e.key === 'Escape') onClose();
+      else if (e.key === 'ArrowRight' && canNext) onNext();
+      else if (e.key === 'ArrowLeft' && canPrev) onPrev();
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKey);
+    return function() {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = '';
+    };
+  }, [it.id, canPrev, canNext]);
+
+  function row(k, v) {
+    return h('div', { key: k, style: { display: 'flex', gap: 10, fontSize: 13, lineHeight: 1.6, padding: '5px 0', borderBottom: '1px solid var(--bd)' } }, [
+      h('span', { key: 'k', style: { color: 'var(--t3)', minWidth: 130, flexShrink: 0 } }, k),
+      h('span', { key: 'v', style: { color: 'var(--tx)', wordBreak: 'break-word' } }, v == null || v === '' ? '—' : v)
+    ]);
+  }
+  function ts(iso, since) {
+    if (!iso) return h('span', { style: { color: 'var(--t3)' } }, '—');
+    var el = since ? qeElapsed(since, iso) : null;
+    return h('span', {}, [
+      h('span', { key: 't' }, new Date(iso).toLocaleString('ro-RO')),
+      el ? h('span', { key: 'e', style: { color: 'var(--t3)', marginLeft: 8, fontSize: 12 } }, '(+' + el + ')') : null
+    ]);
+  }
+
+  return h('div', { className: 'modal-bg', onMouseDown: function(e){ if (e.target === e.currentTarget) onClose(); } },
+    h('div', { className: 'em2', style: { maxWidth: 720 }, onClick: function(e){ e.stopPropagation(); } }, [
+      h('div', { key: 'head', style: { display: 'flex', alignItems: 'flex-start', gap: 14, padding: '14px 18px', borderBottom: '0.5px solid rgba(0,0,0,0.12)' } }, [
+        h('div', { key: 'ti', style: { flex: 1, minWidth: 0 } }, [
+          h('div', { key: 's', style: { fontSize: 16, fontWeight: 600, color: 'var(--tx)', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+            h('span', { key: 'id' }, 'Reclamație #' + it.id),
+            qeEntityBadge(it.entity, it.entity_label),
+            ctsStatusBadge(it.status_label, 'st')
+          ]),
+          h('div', { key: 'sub', style: { fontSize: 12, color: 'var(--t3)', marginTop: 3 } },
+            (it.client_name || 'Client necunoscut') + (it.created_at ? (' · înregistrată ' + new Date(it.created_at).toLocaleString('ro-RO')) : ''))
+        ]),
+        h('div', { key: 'nav', style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } }, [
+          h('button', { key: 'p', disabled: !canPrev, onClick: canPrev ? onPrev : null, title: 'Anterioară (←)', style: { width: 30, height: 30, borderRadius: 8, border: '1px solid var(--bd)', background: 'var(--bg2)', color: 'var(--t2)', fontSize: 15, cursor: canPrev ? 'pointer' : 'default', opacity: canPrev ? 1 : 0.35, padding: 0 } }, '←'),
+          h('button', { key: 'nx', disabled: !canNext, onClick: canNext ? onNext : null, title: 'Următoarea (→)', style: { width: 30, height: 30, borderRadius: 8, border: '1px solid var(--bd)', background: 'var(--bg2)', color: 'var(--t2)', fontSize: 15, cursor: canNext ? 'pointer' : 'default', opacity: canNext ? 1 : 0.35, padding: 0 } }, '→'),
+          h('button', { key: 'x', 'aria-label': 'Închide', title: 'Închide (ESC)', onClick: onClose, style: { width: 30, height: 30, borderRadius: 8, border: '1px solid var(--bd)', background: 'var(--bg2)', color: 'var(--t2)', fontSize: 16, lineHeight: 1, padding: 0, cursor: 'pointer' } }, '×')
+        ])
+      ]),
+      h('div', { key: 'body', style: { padding: '14px 18px', overflow: 'auto' } }, [
+        row('Client', it.client_name),
+        row('Responsabil', it.evaluat ? (it.evaluat + (it.evaluat_email ? (' · ' + it.evaluat_email) : '')) : null),
+        row('Departament', it.department ? (DEPT_LABELS[it.department] || it.department.replace(/_/g, ' ')) : null),
+        row('Tip lucrare', h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 8 } }, [
+          qeEntityBadge(it.entity, it.entity_label),
+          it.entity_id ? h('span', { key: 'eid', style: { color: 'var(--t3)', fontSize: 12 } }, '#' + it.entity_id) : null
+        ])),
+        row('Verdict', it.fondata == null ? null : (it.fondata ? 'fondată (procedura NU a fost respectată)' : 'nefondată (procedura a fost respectată)')),
+        row('Înregistrată', ts(it.created_at)),
+        row('Preluată (contact)', ts(it.in_progress_at, it.created_at)),
+        row('Soluționată', ts(it.solved_at, it.created_at)),
+        row('Procesată de', it.procesat_de),
+        row('Scor', it.score),
+        h('div', { key: 'obs', style: { marginTop: 12 } }, [
+          h('div', { key: 'l', style: { fontSize: 11, color: 'var(--t3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5 } }, 'Observații'),
+          h('div', { key: 'v', style: { fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap', color: 'var(--tx)' } },
+            it.observations || h('span', { style: { color: 'var(--t3)' } }, '—'))
+        ]),
+        h('div', { key: 'note', style: { marginTop: 14, fontSize: 11, color: 'var(--t3)', lineHeight: 1.5 } },
+          'Timpii din paranteze sunt calendaristici (de la înregistrare). În Productivitate se numără doar minutele din programul Suport 3, deci valorile de acolo sunt mai mici.')
+      ])
+    ]));
+}
+
+function QualityEvalPage() {
+  const [stats, setStats] = useState(null);
+  const [data, setData] = useState({ items: [], total: 0, page: 1, page_size: 50 });
+  const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [filterStatus, setFilterStatus] = useState('');
+  const [filterDepartment, setFilterDepartment] = useState('');
+  const [filterAssignee, setFilterAssignee] = useState('');
+  const [filterEntity, setFilterEntity] = useState('');
+  const [filterFondata, setFilterFondata] = useState('');
+  const [opts, setOpts] = useState({ assignees: [], departments: [], entities: [] });
+  const [range, setRange] = useState({ from: null, to: null });
+  const [syncing, setSyncing] = useState(false);
+  const [selectedIdx, setSelectedIdx] = useState(null);   // randul deschis in modal
+
+  useEffect(function(){ api('/quality-eval/filters').then(setOpts).catch(function(){}); }, []);
+
+  // Filtrele se aplica IDENTIC pe lista si pe carduri — altfel sumarul de sus ar contrazice
+  // tabelul de dedesubt.
+  function filterQS() {
+    var qs = [];
+    if (filterStatus) qs.push('status=' + encodeURIComponent(filterStatus));
+    if (filterDepartment) qs.push('department=' + encodeURIComponent(filterDepartment));
+    if (filterAssignee) qs.push('assignee=' + encodeURIComponent(filterAssignee));
+    if (filterEntity) qs.push('entity=' + encodeURIComponent(filterEntity));
+    if (filterFondata) qs.push('fondata=' + encodeURIComponent(filterFondata));
+    if (range.from) qs.push('date_from=' + encodeURIComponent(range.from));
+    if (range.to) qs.push('date_to=' + encodeURIComponent(range.to));
+    return qs;
+  }
+  function loadStats() {
+    var q = filterQS();
+    api('/quality-eval/stats' + (q.length ? ('?' + q.join('&')) : '')).then(setStats).catch(function(){});
+  }
+  function loadList() {
+    setLoading(true);
+    var qs = ['page=' + page, 'page_size=50'].concat(filterQS());
+    api('/quality-eval/list?' + qs.join('&')).then(function(d){ setData(d); setLoading(false); })
+      .catch(function(){ setLoading(false); });
+  }
+  var deps = [filterStatus, filterDepartment, filterAssignee, filterEntity, filterFondata, range.from, range.to];
+  useEffect(function(){ setPage(1); }, deps);
+  useEffect(function(){ loadList(); }, [page].concat(deps));
+  useEffect(function(){ loadStats(); }, deps);
+
+  function doSync() {
+    setSyncing(true);
+    api('/quality-eval/sync', { method: 'POST' }).then(function(r){
+      setSyncing(false);
+      if (r && r.ok) { mgToast('success', 'Sincronizat: ' + (r.upserted || 0) + ' reclamații'); loadStats(); loadList(); }
+      else { mgToast('info', (r && (r.skipped || r.error)) || 'Sync indisponibil'); }
+    }).catch(function(){ setSyncing(false); mgToast('error', 'Eroare la sincronizare'); });
+  }
+
+  var st = stats || {};
+  var totalPages = Math.max(1, Math.ceil((data.total || 0) / (data.page_size || 50)));
+  var evaluate = (st.fondate || 0) + (st.nefondate || 0);
+  var pctFondate = evaluate ? Math.round(1000 * st.fondate / evaluate) / 10 : null;
+
+  function deptLbl(d) { return DEPT_LABELS[d] || (d || '').replace(/_/g, ' '); }
+
+  var headerCards = h('div', { key: 'cards', style: { display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 } }, [
+    h(ProdMetric, { key: 'tot', label: 'Total reclamații', value: prodNum(st.total),
+      sub: (range.from || range.to) ? ((range.from || '…') + ' → ' + (range.to || '…')) : ('din ' + (st.since || '—')), col: 'var(--bl)' }),
+    h(ProdMetric, { key: 'noi', label: 'Noi', value: prodNum(st.noi), sub: 'nepreluate', col: 'var(--bl)' }),
+    h(ProdMetric, { key: 'lucru', label: 'În lucru', value: prodNum(st.in_lucru), sub: 'preluate, nefinalizate', col: 'var(--yw)' }),
+    h(ProdMetric, { key: 'sol', label: 'Soluționate', value: prodNum(st.solutionate), col: 'var(--gn)' }),
+    // Fondată = procedura NU a fost respectată (is_according_to_the_procedure = 0).
+    h(ProdMetric, { key: 'fond', label: 'Fondate', value: pctFondate == null ? '—' : (pctFondate + '%'),
+      sub: (st.fondate || 0) + ' din ' + evaluate + ' evaluate', col: 'var(--rd)' }),
+    h(ProdMetric, { key: 'syn', label: 'Ultima sincronizare', value: st.last_synced_at ? dateCell(st.last_synced_at) : '—', col: 'var(--t3)' })
+  ]);
+
+  var filters = h('div', { key: 'flt', style: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 } }, [
+    h('select', { key: 's', className: 'btn secondary', style: { padding: '6px 10px' }, value: filterStatus, onChange: function(e){ setFilterStatus(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate statusurile')].concat(
+        [['new', 'new'], ['in progress', 'in progress'], ['solved', 'solved']].map(function(s){
+          return h('option', { key: s[0], value: s[0] }, s[1]); }))),
+    h('select', { key: 'd', className: 'btn secondary', style: { padding: '6px 10px' }, value: filterDepartment, onChange: function(e){ setFilterDepartment(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate departamentele')].concat(
+        (opts.departments || []).map(function(d){ return h('option', { key: d, value: d }, deptLbl(d)); }))),
+    h('select', { key: 'asg', className: 'btn secondary', style: { padding: '6px 10px' }, value: filterAssignee, onChange: function(e){ setFilterAssignee(e.target.value); },
+      title: 'Persoana EVALUATĂ (cea reclamată), nu cine procesează reclamația' },
+      [h('option', { key: '', value: '' }, 'Toți utilizatorii')].concat(
+        (opts.assignees || []).map(function(a){ return h('option', { key: a.email, value: a.email }, a.name || a.email); }))),
+    h('select', { key: 'e', className: 'btn secondary', style: { padding: '6px 10px' }, value: filterEntity, onChange: function(e){ setFilterEntity(e.target.value); } },
+      [h('option', { key: '', value: '' }, 'Toate lucrările')].concat(
+        (opts.entities || []).map(function(x){ return h('option', { key: x.value, value: x.value }, x.label); }))),
+    h('select', { key: 'f', className: 'btn secondary', style: { padding: '6px 10px' }, value: filterFondata, onChange: function(e){ setFilterFondata(e.target.value); } }, [
+      h('option', { key: '', value: '' }, 'Fondate + nefondate'),
+      h('option', { key: '1', value: '1' }, 'Doar fondate'),
+      h('option', { key: '0', value: '0' }, 'Doar nefondate')
+    ]),
+    h(DateRangeFilter, { key: 'dr', from: range.from, to: range.to, label: 'Înregistrată', compact: true, onChange: setRange }),
+    h('span', { key: 'cnt', title: 'Reclamații care corespund filtrelor', style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color: 'var(--t2)', border: '1px solid var(--bd)', borderRadius: 999, padding: '4px 11px', fontVariantNumeric: 'tabular-nums' } },
+      [(data.total != null ? data.total.toLocaleString('ro-RO') : '0'), h('span', { key: 'l', style: { fontWeight: 400, color: 'var(--t3)' } }, 'reclamații')]),
+    h('div', { key: 'sp', style: { flex: 1 } }),
+    h('span', { key: 'au', title: 'Sync rulează automat din cron — butonul e doar pentru declanșare manuală', style: { display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--gn, #2ea043)', border: '1px solid ' + hexA('#2ea043', 0.3), background: hexA('#2ea043', 0.08), borderRadius: 999, padding: '2px 8px' } }, '⟳ auto'),
+    h('button', { key: 'sy', className: 'btn secondary', disabled: syncing, onClick: doSync, title: 'Trage acum reclamațiile din IRIS DV' }, syncing ? 'Se sincronizează…' : 'Sync acum')
+  ]);
+
+  function verdictBadge(fondata) {
+    if (fondata == null) return h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—');
+    var col = fondata ? '#ef4444' : '#2ea043';
+    return h('span', { className: 'badge', title: fondata ? 'Procedura NU a fost respectată' : 'Procedura a fost respectată',
+      style: { background: hexA(col, 0.12), color: col, border: '1px solid ' + hexA(col, 0.35), textTransform: 'none', whiteSpace: 'nowrap' } },
+      fondata ? 'fondată' : 'nefondată');
+  }
+
+  var table = h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', marginBottom: 0 } }, h('table', { className: 'list-table-full' }, [
+    h('thead', { key: 'th' }, h('tr', null,
+      ['ID', 'Înregistrată', 'Client', 'Responsabil', 'Departament', 'Tip', 'Verdict', 'Status', 'Preluată', 'Soluționată', 'Procesată de', 'Observații']
+        .map(function(c, i){ return h('th', { key: i }, c); }))),
+    h('tbody', { key: 'tb' }, (data.items || []).length ? data.items.map(function(it, idx){
+      return h('tr', { key: it.id, className: 'clickable', title: 'Vezi detaliile reclamației',
+        onClick: function(){ setSelectedIdx(idx); } }, [
+        h('td', { key: 'id', style: { fontSize: 12 } }, it.id),
+        h('td', { key: 'cr', style: { whiteSpace: 'nowrap' } }, it.created_at ? dateCell(it.created_at) : '—'),
+        h('td', { key: 'cl', title: it.client_name || '', style: { fontSize: 12, maxWidth: 170, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.client_name || h('span', { style: { color: 'var(--t3)' } }, '—')),
+        h('td', { key: 'ev', style: { fontSize: 12, whiteSpace: 'nowrap' }, title: it.evaluat_email || '' }, it.evaluat || h('span', { style: { color: 'var(--t3)' } }, '—')),
+        h('td', { key: 'dp' }, it.department ? (deptBadge(it.department) || h('span', { className: 'badge', style: { textTransform: 'none' } }, deptLbl(it.department))) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
+        h('td', { key: 'en', title: (it.entity || '') + ' #' + (it.entity_id || '') }, qeEntityBadge(it.entity, it.entity_label)),
+        h('td', { key: 'vd' }, verdictBadge(it.fondata)),
+        h('td', { key: 'st' }, ctsStatusBadge(it.status_label, 'qs')),
+        h('td', { key: 'ip', style: { whiteSpace: 'nowrap' } }, it.in_progress_at ? dateCell(it.in_progress_at) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
+        h('td', { key: 'sv', style: { whiteSpace: 'nowrap' } }, it.solved_at ? dateCell(it.solved_at) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
+        h('td', { key: 'pr', style: { fontSize: 12, whiteSpace: 'nowrap' } }, it.procesat_de || h('span', { style: { color: 'var(--t3)' } }, '—')),
+        h('td', { key: 'ob', title: it.observations || '', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.observations || h('span', { style: { color: 'var(--t3)' } }, '—'))
+      ]);
+    }) : h('tr', { key: 'empty' }, h('td', { colSpan: 12, style: { textAlign: 'center', padding: 30, color: 'var(--t3)' } },
+      'Nicio reclamație pentru filtrele curente.')))
+  ]));
+
+  return h('div', { className: 'page' }, [
+    h('div', { key: 'intro', style: { fontSize: 13, color: 'var(--t2)', marginBottom: 12 } },
+      'Reclamațiile înregistrate în CTS (modulul Quality Evaluation), sincronizate din IRIS DV. „Evaluat" e persoana reclamată, iar departamentul e al ei — în productivitate, reclamațiile intră integral la Suport 3, echipa care le procesează. Sursa e read-only.'),
+    headerCards,
+    filters,
+    loading ? h('div', { key: 'ld', style: { padding: 30, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…') : table,
+    h('div', { key: 'pg' }, pager(page, totalPages, setPage)),
+    selectedIdx != null && (data.items || [])[selectedIdx]
+      ? h(QualityEvalModal, { key: 'mod', item: data.items[selectedIdx], index: selectedIdx, total: (data.items || []).length,
+          onClose: function(){ setSelectedIdx(null); },
+          onPrev: function(){ setSelectedIdx(function(i){ return i > 0 ? i - 1 : i; }); },
+          onNext: function(){ setSelectedIdx(function(i){ return i < data.items.length - 1 ? i + 1 : i; }); } })
+      : null
+  ]);
+}
+
 // Modal de detaliu task — mirror pe CallDetail/CtsSentModal (fara fetch separat, datele sunt
 // deja complete in randul din lista). Descrierea afisata e text simplu (deja curatat de HTML
 // la sincronizare, in cts_tasks_sync.py — fara dangerouslySetInnerHTML pe date externe).
@@ -14446,6 +14880,8 @@ function ApelPage({ setTopbarRight }) {
   const [dirTab, setDirTab] = useState('inbound');
   const [aiCat, setAiCat] = useState('');
   const [filterAgent, setFilterAgent] = useState('');
+  const [filterDept, setFilterDept] = useState('');     // departamentul operatorului care a răspuns
+  const [filterStatus, setFilterStatus] = useState(''); // status procesare / răspuns (vezi _STATUS_SQL)
   const [range, setRange] = useState({ from: null, to: null });
   const [search, setSearch] = useState('');
   const [qApplied, setQApplied] = useState('');
@@ -14463,17 +14899,19 @@ function ApelPage({ setTopbarRight }) {
     return function() { clearTimeout(t); };
   }, [search]);
 
-  useEffect(function() { setPage(1); }, [dirTab, aiCat, filterAgent, range.from, range.to]);
+  useEffect(function() { setPage(1); }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to]);
 
   useEffect(function() {
     const qs = ['page=' + page, 'direction=' + dirTab];
     if (aiCat) qs.push('ai_category=' + encodeURIComponent(aiCat));
     if (filterAgent) qs.push('agent=' + encodeURIComponent(filterAgent));
+    if (filterDept) qs.push('department=' + encodeURIComponent(filterDept));
+    if (filterStatus) qs.push('status=' + encodeURIComponent(filterStatus));
     if (range.from) qs.push('date_from=' + encodeURIComponent(range.from));
     if (range.to) qs.push('date_to=' + encodeURIComponent(range.to));
     if (qApplied) qs.push('q=' + encodeURIComponent(qApplied));
     api('/calls?' + qs.join('&')).then(setData);
-  }, [dirTab, aiCat, filterAgent, range.from, range.to, qApplied, page, tick]);
+  }, [dirTab, aiCat, filterAgent, filterDept, filterStatus, range.from, range.to, qApplied, page, tick]);
 
   useEffect(function() {
     if (!setTopbarRight) return;
@@ -14490,10 +14928,26 @@ function ApelPage({ setTopbarRight }) {
       h('select', { key: 'ag', value: filterAgent, onChange: function(e) { setFilterAgent(e.target.value); }, className: 'btn secondary', style: { padding: '6px 10px' } },
         [h('option', { key: '', value: '' }, 'Toți agenții')].concat(agents.map(function(a){ return h('option', { key: a, value: a }, a); }))
       ),
+      // Departamentul operatorului care a răspuns — atribuire identică cu Productivitatea
+      // (mapare învățată din CTS → potrivire pe nume → assignee CTS).
+      h('select', { key: 'dep', value: filterDept, onChange: function(e) { setFilterDept(e.target.value); }, className: 'btn secondary', style: { padding: '6px 10px' },
+        title: 'Departamentul operatorului care a răspuns' },
+        [h('option', { key: '', value: '' }, 'Toate departamentele')].concat(DEPT_SLUGS.map(function(s){ return h('option', { key: s, value: s }, DEPT_LABELS[s]); }))
+      ),
+      h('select', { key: 'st', value: filterStatus, onChange: function(e) { setFilterStatus(e.target.value); }, className: 'btn secondary', style: { padding: '6px 10px' } }, [
+        h('option', { key: '', value: '' }, 'Toate statusurile'),
+        h('option', { key: 'raspuns', value: 'raspuns' }, 'Cu răspuns'),
+        h('option', { key: 'fara_raspuns', value: 'fara_raspuns' }, 'Fără răspuns'),
+        h('option', { key: 'procesat', value: 'procesat' }, 'Procesat'),
+        h('option', { key: 'neclasificat', value: 'neclasificat' }, 'Neclasificat'),
+        h('option', { key: 'fara_inregistrare', value: 'fara_inregistrare' }, 'Fără înregistrare'),
+        h('option', { key: 'in_asteptare', value: 'in_asteptare' }, 'În așteptare'),
+        h('option', { key: 'eroare', value: 'eroare' }, 'Eroare')
+      ]),
       h(DateRangeFilter, { key: 'dr', from: range.from, to: range.to, label: 'Perioadă', compact: true, onChange: setRange }),
       data ? h('span', { key: 'total', style: { color: 'var(--t2)', fontSize: 12, whiteSpace: 'nowrap' } }, data.total + ' total · pagina ' + data.page) : null
     ]));
-  }, [aiCat, filterAgent, range, search, page, data, agents]);
+  }, [aiCat, filterAgent, filterDept, filterStatus, range, search, page, data, agents]);
 
   var dirTabs = h('div', { key: 'dtabs', style: { display: 'flex', gap: 2, marginBottom: 12, borderBottom: '1px solid var(--bd)' } },
     [['inbound', '↓ INTRARE', '#185FA5'], ['outbound', '↑ IEȘIRE', '#1a7f37']].map(function(t){
@@ -14512,14 +14966,18 @@ function ApelPage({ setTopbarRight }) {
     dirTabs,
     h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto', flex: 1, minHeight: 0, marginBottom: 0 } }, [
       h('table', { key: 't', className: 'list-table-full' }, [
-        h('thead', { key: 'th' }, h('tr', null, ['ID', 'Data apel', 'Direcție', 'Telefon', 'Client', 'Agent', 'Durată', 'Categorie', 'Status'].map(function(c) { return h('th', { key: c }, c); }))),
+        h('thead', { key: 'th' }, h('tr', null, ['ID', 'Data apel', 'Direcție', 'Telefon', 'Client', 'Agent', 'Departament', 'Durată', 'Categorie', 'Status'].map(function(c) { return h('th', { key: c }, c); }))),
         h('tbody', { key: 'tb' }, items.map(function(c) { return h('tr', { key: c.id, className: 'clickable', onClick: function() { setSelectedId(c.id); } }, [
           h('td', { key: 'id' }, h(IdCell, { id: c.id })),
           h('td', { key: 'd', style: { whiteSpace: 'nowrap' } }, dateCell(c.started_at)),
           h('td', { key: 'dir' }, directionBadge(c.direction)),
           h('td', { key: 'ph', style: { fontSize: 12, color: 'var(--t2)' } }, c.direction === 'outbound' ? (c.callee_number || '—') : (c.caller_number || '—')),
           h('td', { key: 'cl', style: { fontSize: 12, color: 'var(--t2)' } }, c.client_name || h('span', { style: { color: 'var(--t3)' } }, '—')),
-          h('td', { key: 'ag', style: { fontSize: 12 } }, assigneeCell(c.ai_assignee, null)),
+          // Operatorul REAL (atribuire While1 → angajat, ca în Productivitate); sugestia AI e
+          // doar fallback pentru apelurile neatribuibile.
+          h('td', { key: 'ag', style: { fontSize: 12, whiteSpace: 'nowrap' }, title: c.operator_name ? ('While1: ' + (c.agent_extension || '—')) : '' },
+            c.operator_name || assigneeCell(c.ai_assignee, null)),
+          h('td', { key: 'dep' }, c.operator_department ? deptBadge(c.operator_department) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
           h('td', { key: 'dur', style: { fontSize: 12, color: 'var(--t2)' } }, durationLabel(c.duration_seconds)),
           h('td', { key: 'cat', style: { fontSize: 12, whiteSpace: 'nowrap' } }, catCell(c.ai_category, null, c.ai_result)),
           h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, callStatusBadge(c))
@@ -14940,7 +15398,7 @@ function landingTab(user) {
 function App() {
   const [user, setUser] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const VALID_TABS = ['dashboard','clients','utilizatori','ai-analiza','reports-stats','satisfactie','productivity','emails','documents','cts-training','reports','taskuri','device-ops','apeluri','cts-calls-training','calls-analitice','personal-mailboxes','feedback-config','feedback-campaigns','feedback-dashboard','settings','prompturi-ai','surse-date'];
+  const VALID_TABS = ['dashboard','clients','utilizatori','ai-analiza','reports-stats','satisfactie','productivity','emails','documents','cts-training','reports','taskuri','device-ops','apeluri','cts-calls-training','calls-analitice','quality-eval','personal-mailboxes','feedback-config','feedback-campaigns','feedback-dashboard','settings','prompturi-ai','surse-date'];
   const [tab, setTab] = useState(function(){
     var h = (window.location.hash || '').replace('#','').trim();
     return (h && VALID_TABS.indexOf(h) !== -1) ? h : 'dashboard';
@@ -15001,6 +15459,7 @@ function App() {
     { key: 'apeluri',      label: 'Apeluri',               icon: 'phone',     section: 'Apeluri'  },
     { key: 'cts-calls-training', label: 'Apeluri CTS',    icon: 'cts'         },
     { key: 'calls-analitice',     label: 'Analitice',             icon: 'target'      },
+    { key: 'quality-eval', label: 'Reclamații',            icon: 'alert',     section: 'Reclamații' },
     { key: 'personal-mailboxes', label: 'Căsuțe personale', icon: 'mail',      section: 'Căsuțe personale' },
     { key: 'feedback-config', label: 'Configurare KPI', icon: 'checklist', section: 'Feedback clienți' },
     { key: 'feedback-campaigns', label: 'Segmente & campanii', icon: 'target' },
@@ -15030,7 +15489,7 @@ function App() {
     setTab(origin || 'clients');
   }
   var clientsKey = 'clients' + (clientsDeepNav ? '-' + clientsDeepNav.ts : '');
-  const tabComp = { dashboard: h(Dashboard, { user }), emails: h(EmailsPage, { setTopbarRight }), documents: h(Documents, { setTopbarRight }), clients: h(Clients, { key: clientsKey, setTopbarRight, initialDeepNav: clientsDeepNav, onBack: backFromClient }), 'ai-analiza': h(AnalizaAI), 'cts-training': h(CtsTrainingPanel), reports: h(Reports), 'reports-stats': h(ReportsStatsShell, { setTopbarRight }), productivity: h(Productivity, { user, setTopbarRight }), satisfactie: h(SatisfactieDashboard, { onNavigateClient: navigateToClient }), settings: h(Settings, { user }), taskuri: h(TaskuriPage), 'device-ops': h(DeviceOpsPage), apeluri: h(ApelPage, { setTopbarRight }), 'cts-calls-training': h(CtsCallsTrainingPanel), 'calls-analitice': h(CallsAnalitice, { setTopbarRight }), utilizatori: h(UtilizatoriPage, { user }), 'prompturi-ai': h(PrompturiAIPage), 'personal-mailboxes': h(PersonalMailboxesPage, { setTopbarRight }), 'feedback-config': h(FeedbackConfigPage), 'feedback-campaigns': h(FeedbackCampaignsPage), 'feedback-dashboard': h(FeedbackDashboardPage), 'surse-date': h(SurseDatePage) }[tab];
+  const tabComp = { dashboard: h(Dashboard, { user }), emails: h(EmailsPage, { setTopbarRight }), documents: h(Documents, { setTopbarRight }), clients: h(Clients, { key: clientsKey, setTopbarRight, initialDeepNav: clientsDeepNav, onBack: backFromClient }), 'ai-analiza': h(AnalizaAI), 'cts-training': h(CtsTrainingPanel), reports: h(Reports), 'reports-stats': h(ReportsStatsShell, { setTopbarRight }), productivity: h(Productivity, { user, setTopbarRight }), satisfactie: h(SatisfactieDashboard, { onNavigateClient: navigateToClient }), settings: h(Settings, { user }), taskuri: h(TaskuriPage), 'device-ops': h(DeviceOpsPage), apeluri: h(ApelPage, { setTopbarRight }), 'cts-calls-training': h(CtsCallsTrainingPanel), 'calls-analitice': h(CallsAnalitice, { setTopbarRight }), 'quality-eval': h(QualityEvalPage), utilizatori: h(UtilizatoriPage, { user }), 'prompturi-ai': h(PrompturiAIPage), 'personal-mailboxes': h(PersonalMailboxesPage, { setTopbarRight }), 'feedback-config': h(FeedbackConfigPage), 'feedback-campaigns': h(FeedbackCampaignsPage), 'feedback-dashboard': h(FeedbackDashboardPage), 'surse-date': h(SurseDatePage) }[tab];
   const tabTitle = (TABS.find(t => t.key === tab) || {}).label || tab;
 
   return h('div', { className: 'app' }, [

@@ -801,55 +801,146 @@ def _fetch_device_ops_rows(db: Session, department: str, first: _dt.date, catego
             for op_id, p_start, p_end in raw]
 
 
-# ---------------------------------------------------------------- directia apelului
+# ---------------------------------------------------------------- canalul APEL (sursa While1)
 #
-# Feed-ul CTS `/cts/calls` NU trimite directia apelului -- payload-ul complet e status / priority /
-# client_id / started_at / ring_seconds / duration_seconds / assignee_* / calltrack_id /
-# ctk_uniqueid (verificat pe raw). Singura sursa e ingestul local While1 (`calls.direction`,
-# valori 'inbound' / 'outbound'), legat prin `cts_calls_ground_truth.call_local_id`.
+# SURSA. Apelurile se iau din ingestul While1 (`calls`), NU din `cts_calls_ground_truth`.
+# Motivul (decizie business owner, 2026-08-13): CTS logheaza doar apelurile devenite tichet,
+# adica circa 15% din cele primite -- pe 12.08, While1 are 470 de apeluri primite la nivel de
+# firma fata de 272 in total in CTS; pentru Oana Lasca, 16 primite pe 10.08 in While1 fata de 2
+# in CTS. Raportul de productivitate arata astfel volumul real, acelasi cu pagina Apeluri.
 #
-# Se scoreaza DOAR apelurile PRIMITE (decizie business owner, 2026-08-13): un apel dat de operator
-# nu are timp de asteptare al clientului, deci `cts_response_seconds` (= ring, timpul pana la
-# raspuns) nu masoara nimic acolo. Distorsiunea era mare: pe contabilitate/august intrau in scor
-# 78 de apeluri iesite fata de 18 primite.
+# DIRECTIE. Se numara DOAR apelurile PRIMITE ('inbound'). Un apel dat de operator nu are timp de
+# asteptare al clientului, deci SLA-ul nu masoara nimic acolo. Pe sursa veche distorsiunea era
+# mare: contabilitate/august avea 78 de apeluri iesite in scor fata de 18 primite.
 #
-# Acoperirea joinului: 2425 din 2446 de randuri pe august (99.1%). Cele 21 nepotrivite au TOATE
-# `cts_response_seconds` NULL, deci erau deja in afara scorului -- filtrul strict pe 'inbound'
-# nu pierde niciun rand masurabil.
-_APEL_INBOUND_JOIN = "LEFT JOIN calls cdir ON cdir.id = cgt.call_local_id"
-_APEL_INBOUND_WHERE = "cdir.direction = 'inbound'"
+# ATRIBUIRE. `calls.agent_extension` contine NUMELE agentului (`user_fullname` din While1,
+# ex. "Oana Lasca"). Nu exista email in CDR, deci legatura cu angajatul se face in doua trepte:
+#
+#   1. INVATATA din suprapunerea cu CTS (`agent_map` mai jos): pentru apelurile care au si rand
+#      in `cts_calls_ground_truth` stim `cts_assignee_email`, deci si angajatul. Pastram, per
+#      nume de agent, angajatul dominant. E singura metoda care rezista schimbarilor de nume:
+#      angajatul 25 are `name` = "Buse Angelica-Adriana" dar `email` = adriana.brasovean@..., iar
+#      While1 il raporteaza ca "Adriana Brasovean" -- fara treapta asta, tot volumul de apeluri
+#      al departamentului taxe_drum (35 primite pe august) ramanea neatribuit.
+#   2. FALLBACK pe potrivirea de nume, pentru agentii care nu au inca niciun apel in CTS:
+#      numele din While1 trebuie sa fie inclus, ca set de tokenuri, in numele nostru
+#      ("Oana Lasca" ⊆ "Lasca Oana-Maria"). Verificat pe cei 32 de agenti distincti: 30 potriviti
+#      unic, 0 coliziuni.
+#
+# Maparea se recalculeaza la fiecare interogare, deci un agent nou intra automat imediat ce unul
+# din apelurile lui ajunge si in CTS -- nu exista tabel de intretinut manual.
+_APEL_AGENT_CTE = """
+    WITH agent_map AS (
+        SELECT agent_extension, employee_id FROM (
+            SELECT c2.agent_extension, e2.id AS employee_id,
+                   ROW_NUMBER() OVER (PARTITION BY c2.agent_extension
+                                      ORDER BY COUNT(*) DESC, e2.id) AS rn
+            FROM calls c2
+            JOIN cts_calls_ground_truth g2 ON g2.call_local_id = c2.id
+            JOIN employee_department_mapping e2
+              ON lower(e2.email) = lower(g2.cts_assignee_email)
+            WHERE c2.agent_extension IS NOT NULL AND e2.enabled = true
+            GROUP BY 1, 2
+        ) t WHERE rn = 1
+    )
+"""
+#
+# MASURABIL. SLA-ul de apel = timpul pana la raspuns. `calls.ring_seconds` exista din migrarea
+# 20260813c, dar e NULL pe randurile ingerate inainte; pentru acelea se cade pe
+# `cts_response_seconds` din suprapunerea cu CTS. Un apel PRIMIT fara niciuna din valori (tipic
+# 'NO ANSWER' -- pe 10.08 Oana avea 10 din 16 asa) intra in VOLUM, dar nu in procentul "in timp":
+# un apel la care nu s-a raspuns nu are timp de raspuns. Exact regula generala a motorului
+# (`total` vs `measurable`).
+# _APEL_AGENT_JOIN aduce si randul CTS al apelului (`g`), folosit atat pentru timpul de raspuns
+# (vezi _APEL_MINS_SQL) cat si ca ultima treapta de atribuire.
+_APEL_AGENT_JOIN = r"""
+    -- LATERAL + LIMIT 1: 10 apeluri au DOUA randuri in cts_calls_ground_truth, iar un LEFT JOIN
+    -- simplu le-ar numara de doua ori. Se prefera randul care are timp de raspuns.
+    LEFT JOIN LATERAL (
+        SELECT g2.cts_assignee_email, g2.cts_response_seconds, g2.cts_category, g2.raw
+        FROM cts_calls_ground_truth g2
+        WHERE g2.call_local_id = c.id
+        ORDER BY (g2.cts_response_seconds IS NULL), g2.id
+        LIMIT 1
+    ) g ON true
+    LEFT JOIN agent_map am ON am.agent_extension = c.agent_extension
+    -- Potrivire pe nume, tolerantă la ordine, la prenume compuse si la o litera gresita:
+    -- fiecare cuvant din numele While1 trebuie sa aiba, in numele nostru, un cuvant cu ACELASI
+    -- PREFIX de 4 litere. "Oana Lasca" -> "Lasca Oana-Maria"; "Bulmai Anamaria" ->
+    -- "Bulmau Anamaria-Iuliana" (While1 scrie gresit ultima litera a numelui de familie).
+    -- Verificat pe toti cei 32 de agenti distincti: 32 potriviri unice, 0 coliziuni.
+    --
+    -- Agregatul cu CASE returneaza EXACT un rand: id-ul potrivirii cand e singura, altfel NULL.
+    -- Fara el, doi angajati cu acelasi prefix (ex. "Popa Andrei" si "Popa Andreea") ar produce
+    -- doua randuri pentru acelasi apel, deci volum dublat. Ambiguitatea se rezolva mai departe
+    -- prin assignee-ul CTS, nu ghicind.
+    LEFT JOIN LATERAL (
+        SELECT CASE WHEN count(*) = 1 THEN min(e3.id) END AS id
+        FROM employee_department_mapping e3
+        WHERE e3.enabled = true
+          AND c.agent_extension IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest(regexp_split_to_array(lower(trim(c.agent_extension)), '\s+')) tok
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM unnest(
+                      regexp_split_to_array(lower(regexp_replace(e3.name, '-', ' ', 'g')), '\s+')
+                  ) etok
+                  WHERE left(etok, 4) = left(tok, 4)
+              )
+          )
+    ) edm_n ON true
+    -- Ultima treapta: assignee-ul din CTS. Se foloseste DOAR cand While1 nu a inregistrat numele
+    -- agentului (`agent_extension` NULL) -- 788 de apeluri primite pe august. Ordinea conteaza:
+    -- pentru "cine a raspuns", centrala telefonica e sursa de adevar, nu cine a preluat tichetul.
+    LEFT JOIN employee_department_mapping edm_c
+      ON edm_c.enabled = true
+     AND lower(edm_c.email) = lower(g.cts_assignee_email)
+    JOIN employee_department_mapping edm
+      ON edm.id = COALESCE(am.employee_id, edm_n.id, edm_c.id)
+     AND edm.enabled = true
+"""
+_APEL_MINS_SQL = "COALESCE(c.ring_seconds, g.cts_response_seconds)"
+
+# Varianta cu LEFT JOIN pe angajat, pentru LISTE (pagina Apeluri), nu pentru calcul: acolo un apel
+# neatribuibil trebuie sa ramina vizibil, cu operator gol, nu sa dispara din tabel. Derivata din
+# aceeasi constanta ca sa nu existe doua reguli de atribuire care pot diverge in timp.
+_APEL_AGENT_JOIN_LEFT = _APEL_AGENT_JOIN.replace(
+    "    JOIN employee_department_mapping edm\n      ON edm.id = COALESCE",
+    "    LEFT JOIN employee_department_mapping edm\n      ON edm.id = COALESCE")
+# Daca forma JOIN-ului se schimba, replace-ul devine no-op si lista ar taceti apelurile
+# neatribuite. Preferam sa crape la import decit sa minta in UI.
+assert _APEL_AGENT_JOIN_LEFT != _APEL_AGENT_JOIN, \
+    "_APEL_AGENT_JOIN si-a schimbat forma — actualizeaza _APEL_AGENT_JOIN_LEFT"
 
 
 def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
-    """Apeluri PRIMITE raspunse de operatorii dept-ului -- (op_id, mins), unde `mins` e de fapt
-    SECUNDE (cts_response_seconds = ring_seconds = timp pana la raspuns, confirmat in
-    cts_calls_sync.py).
+    """Apeluri PRIMITE ale operatorilor dept-ului -- (op_id, mins), unde `mins` e de fapt SECUNDE
+    (timpul pana la raspuns).
 
-    Masurabil = cts_response_seconds IS NOT NULL si departamentul era activ in ziua apelului.
-    Filtru hibrid: pontaj (department_attendance) > program (department_schedule) > backward compat.
-    Daca departamentul nu are niciun program configurat (department_schedule gol): includem tot.
-    Apelurile de IESIRE sint excluse -- vezi _APEL_INBOUND_WHERE."""
+    Sursa e `calls` (While1); vezi nota de mai sus pentru directie, atribuire si masurabilitate.
+    Ziua trebuie sa fie una in care departamentul era activ -- filtru hibrid:
+    pontaj (department_attendance) > program (department_schedule) > backward compat.
+    Daca departamentul nu are niciun program configurat (department_schedule gol): includem tot."""
     return db.execute(
         text(f"""
-            SELECT edm.id AS op_id, cgt.cts_response_seconds AS mins
-            FROM cts_calls_ground_truth cgt
-            JOIN employee_department_mapping edm ON lower(cgt.cts_assignee_email) = lower(edm.email)
-            {_APEL_INBOUND_JOIN}
+            {_APEL_AGENT_CTE}
+            SELECT edm.id AS op_id, {_APEL_MINS_SQL} AS mins
+            FROM calls c
+            {_APEL_AGENT_JOIN}
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
-                AND da.work_date = (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date
+                AND da.work_date = (c.started_at AT TIME ZONE 'Europe/Bucharest')::date
             LEFT JOIN department_schedule ds
                 ON ds.department = edm.department
-                AND ds.weekday = EXTRACT(ISODOW FROM (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest'))::int
+                AND ds.weekday = EXTRACT(ISODOW FROM (c.started_at AT TIME ZONE 'Europe/Bucharest'))::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
                 FROM department_schedule WHERE active = true
             ) dsc ON dsc.department = edm.department
-            WHERE edm.department=:d AND edm.enabled=true
-              AND cgt.cts_response_seconds IS NOT NULL
-              AND {_APEL_INBOUND_WHERE}
-              AND date_trunc('month', cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+            WHERE edm.department=:d
+              AND c.direction = 'inbound'
+              AND date_trunc('month', c.started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
               AND (
                 CASE
                   WHEN da.work_date IS NOT NULL THEN da.present = true
@@ -861,6 +952,78 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
         """),
         {"d": department, "first": first},
     ).fetchall()
+
+
+# ---------------------------------------------------------------- reclamatii (Quality Evaluation)
+#
+# SURSA: `cts_quality_evaluation`, oglinda view-ului IRIS DV (vezi quality_eval_sync.py).
+#
+# ATRIBUIRE (decizie business owner, 2026-08-13): TOATE reclamatiile intra la Suport 3, indiferent
+# de departamentul persoanei evaluate. `department_id` din CTS ramane folosit doar pentru AFISARE
+# (Monitorul Operational le arata per departament); productivitatea le pune integral pe Suport 3,
+# care e echipa ce le proceseaza.
+#
+# CELE DOUA SLA-URI, ambele pornind din momentul inregistrarii reclamatiei:
+#   contact      created_at -> in_progress_at   (preluarea)
+#   solutionare  created_at -> solved_at        (inchiderea)
+# O reclamatie neajunsa inca in starea respectiva nu e masurabila: intra in volum, nu in procent.
+# Nu exista `in_progress_at` daca CTS a trecut-o direct in 'solved' (17 din 123 pe 01.07-13.08).
+#
+# Durata se masoara in minute de PROGRAM, ca la mailuri si task-uri (business_minutes), ca sa nu
+# curga noaptea si in weekend.
+_RECLAMATIE_CATEGORII = {
+    "contact":     "in_progress_at",
+    "solutionare": "solved_at",
+}
+
+
+def _fetch_reclamatie_rows(db: Session, department: str, first: _dt.date, categorie: Optional[str],
+                            holidays: Optional[list] = None, biz: Optional["_BizCache"] = None):
+    """Reclamatii CTS -- (op_id, mins). Vezi nota de mai sus pentru atribuire si SLA.
+
+    `op_id` = operatorul Suport 3 caruia i se atribuie. Cand departamentul are un singur angajat
+    activ (cazul de azi: Tyepak Zoltan), toate randurile merg la el. Daca sint mai multi, se
+    incearca intai persoana care a schimbat efectiv statusul (`updated_by`, tradus prin
+    cts_dv_employee.admin_id -> email), si abia apoi se cade pe primul operator al echipei.
+    """
+    end_col = _RECLAMATIE_CATEGORII.get((categorie or "").strip().lower())
+    if end_col is None:
+        return []
+
+    rows = db.execute(
+        text(f"""
+            SELECT COALESCE(edm_u.id, edm_any.id) AS op_id,
+                   qe.created_at AS p_start,
+                   qe.{end_col}  AS p_end
+            FROM cts_quality_evaluation qe
+            -- Persoana care a miscat reclamatia, daca e din departamentul scorat.
+            -- LATERAL + LIMIT 1 e obligatoriu: `cts_dv_employee` e oglinda bruta a DV-ului si are
+            -- acelasi `admin_id` pe mai multe randuri (contracte succesive ale aceleiasi persoane
+            -- -- ex. admin_id 176, 209, 14, 88), deci un JOIN simplu ar numara reclamatia de mai
+            -- multe ori.
+            LEFT JOIN LATERAL (
+                SELECT e1.id FROM cts_dv_employee dv1
+                JOIN employee_department_mapping e1 ON lower(e1.email) = lower(dv1.email)
+                WHERE dv1.admin_id = qe.updated_by::text
+                  AND e1.enabled = true AND e1.department = :d
+                ORDER BY e1.id LIMIT 1
+            ) edm_u ON true
+            -- altfel: echipa care proceseaza reclamatiile (un singur rand cand e un singur om)
+            LEFT JOIN LATERAL (
+                SELECT e2.id FROM employee_department_mapping e2
+                WHERE e2.department = :d AND e2.enabled = true
+                ORDER BY e2.id LIMIT 1
+            ) edm_any ON true
+            WHERE qe.deleted_at IS NULL
+              AND qe.{end_col} IS NOT NULL
+              AND date_trunc('month', qe.{end_col} AT TIME ZONE 'Europe/Bucharest')::date = :first
+        """),
+        {"d": department, "first": first},
+    ).fetchall()
+    if biz is None:
+        return [(r[0], None) for r in rows]
+    return [(op_id, biz.business_minutes(department, op_id, p_start, p_end, holidays))
+            for op_id, p_start, p_end in rows]
 
 
 def _bd_status(mins: Optional[float], limit: Optional[float], allow_zero: bool = False) -> str:
@@ -1038,42 +1201,121 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 "in_afara_programului": (mins == 0),
             })
 
-    elif tip == "apel":
-        # `durata` = cts_response_seconds (SECUNDE pana la raspuns = ring_seconds), nu minute
-        # business. allow_zero=True: un apel raspuns instant e o masuratoare valida (_accumulate).
-        #
-        # CLIENT: `raw->>'client_id'` e ID-ul din IRIS, deci se face join pe `clients.iris_client_id`,
-        # NU pe cheia primara locala `clients.id`. Bug pana la v0.75.0: join-ul pe `id` nimerea peste
-        # un client complet diferit pe 671 din 743 de apeluri (90%) pe august 2026 -- ex. apel 720757,
-        # CTS trimite client_id=11442 = TRANSEMC TRAVEL SRL (clients.id=11528, iris_client_id=11442),
-        # dar se afisa EURO RIN SRL (clients.id=11442). Restul codebase-ului (cts_tasks_training.py,
-        # clients.py) folosea deja corect `iris_client_id`.
-        #
-        # SOLUTIONAT: `raw->>'solved_at'` e momentul real de inchidere (confirmat cu sursa BI:
-        # 05:18:44 / 05:44:52 pe apelurile 720757 / 721450). Pana la v0.75.0 se punea `p_start` si
-        # in `created_at` si in `solved_at`, deci coloana "Solutionat" arata ora de START.
-        # Textul din JSON e naiv in UTC -> se marcheaza explicit.
+    elif tip == "reclamatie":
+        end_col = _RECLAMATIE_CATEGORII.get((categorie or "").strip().lower())
+        if end_col is None:
+            return []
+        # Aceleasi surse si filtre ca `_fetch_reclamatie_rows`, plus cimpurile de identificare:
+        # cine a fost evaluat, pe ce lucrare, si daca reclamatia a iesit fondata.
         raw = db.execute(
-            text(r"""
+            text(f"""
+                SELECT qe.id AS row_id,
+                       COALESCE(edm_u.id, edm_any.id) AS op_id,
+                       COALESCE(edm_any.name, edm_u.name) AS op_name,
+                       cl.name AS client,
+                       qe.entity AS entity, qe.entity_id AS entity_id,
+                       qe.observations AS observations,
+                       qe.is_according_to_the_procedure AS conform,
+                       edm_r.name AS evaluat,
+                       edm_r.department AS dept_evaluat,
+                       qe.created_at AS p_start,
+                       qe.{end_col}  AS p_end,
+                       -- Ambele praguri, indiferent de categoria scorata: in lista trebuie sa se
+                       -- vada tot lantul (inregistrata -> preluata -> solutionata) si cite minute
+                       -- de PROGRAM s-au scurs pina la fiecare, nu doar cel care da statusul.
+                       qe.in_progress_at AS contact_at,
+                       qe.solved_at      AS solutionat_at
+                FROM cts_quality_evaluation qe
+                -- Toate rezolvarile de admin_id trec prin LATERAL + LIMIT 1: `cts_dv_employee`
+                -- are acelasi admin_id (si acelasi email) pe mai multe randuri, deci un JOIN
+                -- simplu ar dubla reclamatia in lista fata de calcul.
+                LEFT JOIN LATERAL (
+                    SELECT e1.id, e1.name FROM cts_dv_employee dv1
+                    JOIN employee_department_mapping e1 ON lower(e1.email) = lower(dv1.email)
+                    WHERE dv1.admin_id = qe.updated_by::text
+                      AND e1.enabled = true AND e1.department = :d
+                    ORDER BY e1.id LIMIT 1
+                ) edm_u ON true
+                LEFT JOIN LATERAL (
+                    SELECT e2.id, e2.name FROM employee_department_mapping e2
+                    WHERE e2.department = :d AND e2.enabled = true
+                    ORDER BY e2.id LIMIT 1
+                ) edm_any ON true
+                -- persoana EVALUATA (responsible_id = admin din CTS), pentru context in lista
+                LEFT JOIN LATERAL (
+                    SELECT e3.name, e3.department FROM cts_dv_employee dv3
+                    JOIN employee_department_mapping e3 ON lower(e3.email) = lower(dv3.email)
+                    WHERE dv3.admin_id = qe.responsible_id::text
+                    ORDER BY e3.id LIMIT 1
+                ) edm_r ON true
+                LEFT JOIN clients cl ON cl.iris_client_id = qe.client_id
+                WHERE qe.deleted_at IS NULL
+                  AND qe.{end_col} IS NOT NULL
+                  AND date_trunc('month', qe.{end_col} AT TIME ZONE 'Europe/Bucharest')::date = :first
+            """),
+            {"d": department, "first": first},
+        ).fetchall()
+        _ENTITY_LABEL = {"client_contact_email_log": "email", "task": "task",
+                         "client_call_log": "apel"}
+        for r in raw:
+            mins = biz.business_minutes(department, r.op_id, r.p_start, r.p_end, holidays_arr)
+            # Ambele durate se masoara DIN MOMENTUL INREGISTRARII (created_at), nu una din alta:
+            # contact = inregistrare -> preluare, solutionare = inregistrare -> inchidere. Asa e
+            # definit SLA-ul, deci timpul de solutionare il include pe cel de contact.
+            mins_contact = (biz.business_minutes(department, r.op_id, r.p_start, r.contact_at, holidays_arr)
+                            if r.contact_at else None)
+            mins_solutionare = (biz.business_minutes(department, r.op_id, r.p_start, r.solutionat_at, holidays_arr)
+                                if r.solutionat_at else None)
+            # is_according_to_the_procedure: 1 = s-a respectat procedura => NEFONDATA.
+            fondata = (r.conform == 0)
+            out.append({
+                "id": r.row_id, "op_id": r.op_id, "solved_by": r.op_name,
+                "client": r.client,
+                "subiect": (r.observations or "").strip() or None,
+                "categorie": _ENTITY_LABEL.get(r.entity, r.entity),
+                "evaluat": r.evaluat, "dept_evaluat": r.dept_evaluat,
+                "fondata": fondata,
+                "created_at": _iso(r.p_start), "solved_at": _iso(r.p_end),
+                # Lantul complet, pentru verificare vizuala in modal. `solved_at` ramine capatul
+                # categoriei scorate (el da statusul on time / overdue).
+                "contact_at": _iso(r.contact_at),
+                "solutionat_at": _iso(r.solutionat_at),
+                "durata_contact": round(mins_contact, 1) if mins_contact is not None else None,
+                "durata_solutionare": round(mins_solutionare, 1) if mins_solutionare is not None else None,
+                "durata": round(mins, 1) if mins is not None else None,
+                "status": _bd_status(mins, limita),
+                "in_afara_programului": (mins == 0),
+            })
+
+    elif tip == "apel":
+        # Aceeasi sursa si aceleasi filtre ca `_fetch_apel_rows` (While1, doar 'inbound',
+        # atribuire pe numele agentului), ca numarul de randuri de aici sa coincida cu volumul
+        # din raport. `durata` = SECUNDE pana la raspuns, nu minute business.
+        # allow_zero=True: un apel raspuns instant e o masuratoare valida (_accumulate).
+        #
+        # CLIENT: `calls.client_id` e cheia LOCALA (o pune `_match_client_phone` la ingest, dupa
+        # numarul de telefon), deci join pe `clients.id` -- spre deosebire de feed-urile CTS, unde
+        # `client_id` e ID-ul din IRIS si se joina pe `iris_client_id`.
+        #
+        # `solved_at` nu exista pe un apel While1; incheierea e start + durata convorbirii.
+        raw = db.execute(
+            text(f"""
+                {_APEL_AGENT_CTE}
                 SELECT edm.id AS op_id, edm.name AS op_name, c.id AS row_id,
-                       c.cts_response_seconds AS secunde,
-                       c.cts_category AS categorie,
-                       c.raw->>'issue_name' AS subiect,
-                       cl.name AS client, c.cts_started_at AS p_start,
-                       CASE WHEN c.raw->>'solved_at' ~ '^\d{4}-\d\d-\d\d'
-                            THEN (c.raw->>'solved_at')::timestamp AT TIME ZONE 'UTC'
-                       END AS p_solved,
-                       COALESCE(ca.caller_number, '') AS telefon
-                FROM cts_calls_ground_truth c
-                JOIN employee_department_mapping edm ON lower(c.cts_assignee_email) = lower(edm.email)
-                LEFT JOIN clients cl ON cl.iris_client_id = NULLIF(c.raw->>'client_id','')::bigint
-                LEFT JOIN calls ca ON ca.id = c.call_local_id
-                WHERE edm.department=:d AND edm.enabled=true
-                  AND c.cts_response_seconds IS NOT NULL
-                  -- doar apeluri PRIMITE, ca in _fetch_apel_rows (aici tabela `calls` e deja
-                  -- alaturata ca `ca`, pentru numarul de telefon)
-                  AND ca.direction = 'inbound'
-                  AND date_trunc('month', c.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+                       {_APEL_MINS_SQL} AS secunde,
+                       COALESCE(g.cts_category, c.ai_category) AS categorie,
+                       COALESCE(g.raw->>'issue_name', c.ai_summary) AS subiect,
+                       cl.name AS client,
+                       c.started_at AS p_start,
+                       c.started_at + make_interval(secs => COALESCE(c.duration_seconds, 0)) AS p_solved,
+                       COALESCE(c.caller_number, '') AS telefon,
+                       c.call_status AS call_status
+                FROM calls c
+                {_APEL_AGENT_JOIN}
+                LEFT JOIN clients cl ON cl.id = c.client_id
+                WHERE edm.department=:d
+                  AND c.direction = 'inbound'
+                  AND date_trunc('month', c.started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
             """),
             {"d": department, "first": first},
         ).fetchall()
@@ -1083,6 +1325,10 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 "id": r.row_id, "op_id": r.op_id, "solved_by": r.op_name,
                 "client": r.client, "subiect": r.subiect, "categorie": r.categorie,
                 "telefon": r.telefon or None,
+                # Starea apelului din centrala: un 'NO ANSWER' apare in lista (a intrat, e volum)
+                # dar nu are timp de raspuns, deci iese 'nemasurat' -- fara coloana asta ar parea
+                # o eroare de calcul.
+                "call_status": r.call_status,
                 "created_at": _iso(r.p_start), "solved_at": _iso(r.p_solved or r.p_start),
                 "durata": round(secs, 1) if secs is not None else None,
                 "status": _bd_status(secs, limita, allow_zero=True),
@@ -1398,6 +1644,15 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
         for op_id, mins in _fetch_device_ops_rows(db, department, first, o["categorie"], holidays_arr, biz=biz):
             _accumulate(key, op_id, mins, o["limita_minute"])
 
+    # 4b-ter) reclamatii (Quality Evaluation) -- un fetch per categorie (contact / solutionare),
+    #     fiecare cu propriul SLA. Toate reclamatiile firmei intra la departamentul care le
+    #     proceseaza (Suport 3), nu la departamentul persoanei evaluate.
+    for o in [x for x in objectives if x["tip"] == "reclamatie"]:
+        key = ("reclamatie", o["categorie"] or "__general__")
+        for op_id, mins in _fetch_reclamatie_rows(db, department, first, o["categorie"],
+                                                   holidays_arr, biz=biz):
+            _accumulate(key, op_id, mins, o["limita_minute"])
+
     # 4c) apeluri raspunse -- un singur fetch (azi exista un singur obiectiv 'apel', general; daca
     #     apar obiective 'apel' per-categorie in viitor, _fetch_apel_rows va avea nevoie de acelasi
     #     parametru de filtrare ca _fetch_task_rows).
@@ -1532,10 +1787,32 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
             "vol_task": op_vol_by_tip.get("task", 0),
             "vol_apel": op_vol_by_tip.get("apel", 0),
             "vol_device_ops": op_vol_by_tip.get("device_ops", 0),
+            # ATENTIE la reclamatii: aceeasi reclamatie apare in DOUA obiective (contact si
+            # solutionare), deci `vol_reclamatie` e suma celor doua praguri, nu numarul de
+            # reclamatii distincte. Pentru tabelul per operator se foloseste `obiective` de mai
+            # jos, care le tine separate — la fel cum sint si in configurarea departamentului.
+            "vol_reclamatie": op_vol_by_tip.get("reclamatie", 0),
             "cotiz_email": _cotiz("email"),
             "cotiz_task": _cotiz("task"),
             "cotiz_apel": _cotiz("apel"),
             "cotiz_device_ops": _cotiz("device_ops"),
+            "cotiz_reclamatie": _cotiz("reclamatie"),
+            # Volum + cotizatie PER OBIECTIV (tip + categorie), sursa exacta pentru coloanele din
+            # tabelul echipei. Fara asta, un tip cu mai multe categorii (reclamatii: contact +
+            # solutionare) nu se putea afisa corect pe coloane separate.
+            "obiective": [
+                {
+                    "tip": o["tip"],
+                    "categorie": o["categorie"],
+                    "total": (obj_slots.get((o["tip"], o["categorie"] or "__general__")) or {}).get("total", 0),
+                    "measurable": (obj_slots.get((o["tip"], o["categorie"] or "__general__")) or {}).get("measurable", 0),
+                    "in_timp": (obj_slots.get((o["tip"], o["categorie"] or "__general__")) or {}).get("in_timp", 0),
+                    "cotiz": (round(100.0 * (obj_slots.get((o["tip"], o["categorie"] or "__general__")) or {}).get("total", 0)
+                                    / per_obj[(o["tip"], o["categorie"] or "__general__")]["total"], 2)
+                              if per_obj[(o["tip"], o["categorie"] or "__general__")]["total"] > 0 else None),
+                }
+                for o in objectives
+            ],
             "device_ops_breakdown": [
                 {
                     "categorie": cat,
@@ -1706,6 +1983,7 @@ def aggregate_reports(reports: list) -> dict:
                     "mails": 0, "volum_total": 0, "measurable": 0, "in_timp_w": 0.0,
                     "weight_active": 0.0,
                     "vol_email": 0, "vol_task": 0, "vol_apel": 0, "vol_device_ops": 0,
+                    "vol_reclamatie": 0,
                     "_obj_slots": {},  # (tip, cat) -> {measurable, in_timp, pondere}
                 }
             a = op_acc[oid]
@@ -1716,6 +1994,7 @@ def aggregate_reports(reports: list) -> dict:
             a["vol_task"] += op.get("vol_task") or 0
             a["vol_apel"] += op.get("vol_apel") or 0
             a["vol_device_ops"] += op.get("vol_device_ops") or 0
+            a["vol_reclamatie"] += op.get("vol_reclamatie") or 0
 
     # Recalcul achieved per operator din obiectivele agregate per operator
     for r in reports:
@@ -1782,10 +2061,15 @@ def aggregate_reports(reports: list) -> dict:
             "contributie": contributie,
             "vol_email": a["vol_email"], "vol_task": a["vol_task"], "vol_apel": a["vol_apel"],
             "vol_device_ops": a["vol_device_ops"],
+            # Pe interval nu avem defalcarea per categorie (raspunsul lunar nu o pastreaza), deci
+            # reclamatiile apar cumulat: contact + solutionare. Pe o singura luna, tabelul
+            # foloseste `obiective`, care le tine separate.
+            "vol_reclamatie": a["vol_reclamatie"],
             "cotiz_email": _cotiz("email"),
             "cotiz_task": cotiz_task,
             "cotiz_apel": _cotiz("apel"),
             "cotiz_device_ops": _cotiz("device_ops"),
+            "cotiz_reclamatie": _cotiz("reclamatie"),
         })
     operatori_out.sort(key=lambda x: x["volum_total"], reverse=True)
 
@@ -2585,32 +2869,31 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
 
     # ---- apeluri ----
     apel_uid_filter = "AND edm.id = :uid" if user_id is not None else ""
+    # Aceeasi sursa ca raportul lunar: While1, doar apeluri primite (vezi _fetch_apel_rows).
     apel_rows = db.execute(
-        text(r"""
+        text(f"""
+            {_APEL_AGENT_CTE}
             SELECT edm.id AS op_id,
-                   (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date AS call_day,
-                   cgt.cts_response_seconds AS secs,
-                   cgt.cts_duration_seconds AS dur_secs
-            FROM cts_calls_ground_truth cgt
-            JOIN employee_department_mapping edm ON lower(cgt.cts_assignee_email) = lower(edm.email)
-            LEFT JOIN calls cdir ON cdir.id = cgt.call_local_id
+                   (c.started_at AT TIME ZONE 'Europe/Bucharest')::date AS call_day,
+                   {_APEL_MINS_SQL} AS secs,
+                   c.duration_seconds AS dur_secs
+            FROM calls c
+            {_APEL_AGENT_JOIN}
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
-                AND da.work_date = (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date
+                AND da.work_date = (c.started_at AT TIME ZONE 'Europe/Bucharest')::date
             LEFT JOIN department_schedule ds
                 ON ds.department = edm.department
-                AND ds.weekday = EXTRACT(ISODOW FROM (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest'))::int
+                AND ds.weekday = EXTRACT(ISODOW FROM (c.started_at AT TIME ZONE 'Europe/Bucharest'))::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
                 FROM department_schedule WHERE active = true
             ) dsc ON dsc.department = edm.department
-            WHERE edm.enabled = true AND edm.department = ANY(:depts)
-              AND cgt.cts_response_seconds IS NOT NULL
-              -- doar apeluri PRIMITE, aceeasi regula ca in raportul lunar (_APEL_INBOUND_WHERE)
-              AND cdir.direction = 'inbound'
-              """ + apel_uid_filter + """
-              AND (cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
+            WHERE edm.department = ANY(:depts)
+              AND c.direction = 'inbound'
+              """ + apel_uid_filter + f"""
+              AND (c.started_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
               AND (
                 CASE
                   WHEN da.work_date IS NOT NULL THEN da.present = true
@@ -2652,7 +2935,13 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             a_meas += 1
             if op_id in op_agg:
                 op_agg[op_id].setdefault("apel_sum_secs", 0.0)
+                op_agg[op_id].setdefault("apel_meas", 0)
                 op_agg[op_id]["apel_sum_secs"] += s
+                # Numaram separat apelurile CU timp de raspuns: de cand sursa e While1, un apel
+                # primit poate exista fara el (NO ANSWER, sau ring_seconds inca necompletat pe
+                # randurile ingerate inainte de migrarea 20260813c). Media trebuie impartita la
+                # cate masuratori avem, nu la volumul total -- altfel iese artificial mica.
+                op_agg[op_id]["apel_meas"] += 1
             if apel_lim is not None:
                 a_scope_meas += 1
                 if dkey in a_daily:
@@ -2703,7 +2992,8 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
                "task_avg_tts_min": _avg(a.get("task_sum_tts", 0.0), a.get("task_tts_meas", 0)),
                "task_in_timp_pct": _pct(a.get("task_in_timp", 0), a.get("task_scope_meas", 0)),
                "apel_volum": a.get("apel_volum", 0),
-               "apel_avg_sec": round(a["apel_sum_secs"] / a["apel_volum"], 1) if a.get("apel_volum", 0) > 0 else None,
+               "apel_avg_sec": (round(a["apel_sum_secs"] / a["apel_meas"], 1)
+                                if a.get("apel_meas", 0) > 0 else None),
                "apel_in_timp_pct": _pct(a.get("apel_in_timp", 0), a.get("apel_scope_meas", 0))}
               for oid, a in op_agg.items()]
     op_out.sort(key=lambda x: x["mails"], reverse=True)

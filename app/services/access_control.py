@@ -30,7 +30,7 @@ ALL_MODULES = (
     "dashboard", "clients", "utilizatori", "ai-analiza", "reports-stats",
     "satisfactie", "productivity", "emails", "documents", "cts-training",
     "reports", "taskuri", "device-ops", "apeluri", "cts-calls-training",
-    "calls-analitice", "personal-mailboxes", "feedback-config",
+    "calls-analitice", "quality-eval", "personal-mailboxes", "feedback-config",
     "feedback-campaigns", "feedback-dashboard",
 ) + SETTINGS_MODULES
 

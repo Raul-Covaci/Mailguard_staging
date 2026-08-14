@@ -47,6 +47,8 @@ def cts_training_list(
     date_from: str = Query("", description="data start YYYY-MM-DD"),
     date_to: str = Query("", description="data sfarsit YYYY-MM-DD"),
     direction: str = Query("", description="'', 'received', 'sent'"),
+    assignee: str = Query("", description="filtru utilizator (email assignee CTS, gol = toti)"),
+    status: str = Query("", description="filtru status CTS ('new'|'in progress'|'solved')"),
     search_id: str = Query("", description="cauta dupa ID email (gt.id sau e.id)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -90,6 +92,16 @@ def cts_training_list(
     if direction in ("received", "sent"):
         where.append("COALESCE(gt.cts_direction,'received') = :direction")
         params["direction"] = direction
+
+    # Utilizator = cine a preluat mailul in CTS (adevarul de teren), nu sugestia AI: filtrul
+    # raspunde la "ce a lucrat X", nu la "ce i-am fi dat lui X".
+    if assignee.strip():
+        where.append("lower(gt.cts_assignee_email) = lower(:assignee)")
+        params["assignee"] = assignee.strip()
+
+    if status.strip():
+        where.append("lower(gt.cts_status) = lower(:status)")
+        params["status"] = status.strip()
 
     if search_id.strip().isdigit():
         where.append("(gt.email_id = :search_id OR gt.id = :search_id)")
@@ -326,6 +338,8 @@ def cts_training_stats(
     dept_to: str = Query(""),
     date_from: str = Query(""),
     date_to: str = Query(""),
+    assignee: str = Query(""),
+    status: str = Query(""),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
@@ -361,6 +375,12 @@ def cts_training_stats(
             params["date_to"] = date_to
         except ValueError:
             pass
+    if assignee.strip():
+        where_parts.append("lower(gt.cts_assignee_email) = lower(:assignee)")
+        params["assignee"] = assignee.strip()
+    if status.strip():
+        where_parts.append("lower(gt.cts_status) = lower(:status)")
+        params["status"] = status.strip()
 
     where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
@@ -656,6 +676,30 @@ def cts_training_sync_recent(hours: int = Query(24, ge=1, le=168),
     _th.Thread(target=SYNC.sync_recent_guarded, kwargs={"hours": hours}, daemon=True).start()
     return {"ok": True, "started": True, "async": True, "window_hours": hours,
             "message": "Sync pornit in fundal. Lista se actualizeaza in cateva momente."}
+
+
+@router.get("/cts-training/assignees")
+def cts_training_assignees(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Utilizatorii care APAR ca assignee CTS pe mailuri — pentru selectul de filtru.
+
+    Numele vine din `cts_assignee_name` (cum il scrie CTS); daca lipseste, cade pe
+    `employee_department_mapping`. Selectul e limitat la cine chiar are mailuri, nu la toti
+    angajatii — altfel ar avea 300 de intrari inutile.
+    """
+    rows = db.execute(text("""
+        SELECT lower(gt.cts_assignee_email) AS email,
+               COALESCE(max(gt.cts_assignee_name), max(edm.name)) AS name,
+               max(edm.department) AS department,
+               count(*) AS n
+        FROM cts_ground_truth gt
+        LEFT JOIN employee_department_mapping edm ON lower(edm.email) = lower(gt.cts_assignee_email)
+        WHERE gt.cts_assignee_email IS NOT NULL AND gt.cts_assignee_email <> ''
+          AND gt.cts_deleted_at IS NULL
+        GROUP BY 1
+        ORDER BY 2
+    """)).fetchall()
+    return {"assignees": [{"email": r[0], "name": r[1] or r[0], "department": r[2],
+                           "count": int(r[3])} for r in rows]}
 
 
 @router.get("/cts-training/sync-config")
