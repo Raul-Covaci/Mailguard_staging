@@ -800,18 +800,22 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         {_dep_call}
     """), _p).fetchone()
 
-    # sesizări / reclamații deschise — nu există tabelă dedicată: sunt valori de
-    # categorie. Același COALESCE ca în productivity._fetch_email_rows (ground
-    # truth primează, ai_category e fallback pentru ce n-a fost încă clasificat în CTS).
+    # SESIZĂRI — categorie de email, nu există tabelă dedicată. Același COALESCE ca în
+    # productivity._fetch_email_rows (ground truth primează, ai_category e fallback pentru ce
+    # n-a fost încă clasificat în CTS).
+    #
+    # RECLAMAȚIILE au ieșit din interogarea asta (2026-08-14): sursa lor e acum modulul Quality
+    # Evaluation (`recl_row` mai jos), nu categoria emailului. Filtrele de mai jos numără DOAR
+    # 'sesizare'; cifrele mixte se compun în răspuns, din cele două surse.
     sesiz_row = db.execute(text(f"""
         SELECT
-            COUNT(*) FILTER (WHERE cat IN ('sesizare','reclamatie') AND NOT rezolvat)              AS deschise,
-            COUNT(*) FILTER (WHERE cat = 'sesizare'   AND NOT rezolvat)                            AS sesizari_deschise,
-            COUNT(*) FILTER (WHERE cat = 'reclamatie' AND NOT rezolvat)                            AS reclamatii_deschise,
-            COUNT(*) FILTER (WHERE cat IN ('sesizare','reclamatie') AND rezolvat AND solved_azi)   AS rezolvate_azi,
-            COUNT(*) FILTER (WHERE cat IN ('sesizare','reclamatie') AND NOT rezolvat
+            COUNT(*) FILTER (WHERE cat = 'sesizare' AND NOT rezolvat)                              AS deschise,
+            COUNT(*) FILTER (WHERE cat = 'sesizare' AND NOT rezolvat)                              AS sesizari_deschise,
+            COUNT(*) FILTER (WHERE cat = 'reclamatie' AND NOT rezolvat)                            AS reclamatii_email_deschise,
+            COUNT(*) FILTER (WHERE cat = 'sesizare' AND rezolvat AND solved_azi)                   AS rezolvate_azi,
+            COUNT(*) FILTER (WHERE cat = 'sesizare' AND NOT rezolvat
                              AND DATE(changed_loc) < CURRENT_DATE)                                 AS restante,
-            COUNT(*) FILTER (WHERE cat IN ('sesizare','reclamatie') AND NOT rezolvat
+            COUNT(*) FILTER (WHERE cat = 'sesizare' AND NOT rezolvat
                              AND changed_loc < NOW() - INTERVAL '7 days')                          AS peste_7z
         FROM (
             SELECT lower(coalesce(g.cts_category, e.ai_category))              AS cat,
@@ -843,7 +847,58 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
     """), _p).fetchone()
 
-    # ce s-a rezolvat azi, pe categorie de email (informație vs sesizare vs reclamație)
+    # RECLAMAȚII (agregat pe grup) — sursa e modulul Quality Evaluation din CTS
+    # (`cts_quality_evaluation`), NU categoria emailului. Categoria marca alt lucru: un mail pe
+    # care operatorul l-a încadrat „reclamatie", care nu se potrivea cu ce se vede în CTS
+    # (constatat 2026-08-13: 8 „reclamații deschise" pe Operațional din emailuri, față de 16
+    # reclamații reale deschise în CTS). Aici un rând = o reclamație reală, cu ciclul ei
+    # new → in progress → solved.
+    #
+    # Departamentul e al persoanei EVALUATE, exact ca la cardurile per departament de mai jos,
+    # deci suma cardurilor = cifra de grup de aici. (În productivitate aceleași reclamații merg
+    # integral la Suport 3 — echipa care le procesează — vezi _fetch_reclamatie_rows.)
+    _recl_sql = text(f"""
+        SELECT
+            COUNT(*) FILTER (WHERE primit_azi)                                  AS primite_azi,
+            COUNT(*) FILTER (WHERE rezolvat_azi)                                AS rezolvate_azi,
+            COUNT(*) FILTER (WHERE deschisa)                                    AS deschise,
+            COUNT(*) FILTER (WHERE deschisa AND NOT primit_azi)                 AS restante,
+            COUNT(*) FILTER (WHERE deschisa AND creat < NOW() - INTERVAL '7 days') AS peste_7z,
+            COUNT(*) FILTER (WHERE primit_azi AND entity = 'client_call_log')   AS apel_azi
+        FROM (
+            SELECT qe.entity AS entity,
+                   qe.created_at AS creat,
+                   (DATE(qe.created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS primit_azi,
+                   (qe.status = 3
+                    AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
+                   (qe.status IS DISTINCT FROM 3)                               AS deschisa
+            FROM cts_quality_evaluation qe
+            -- department_id (CTS) -> slug-ul nostru. LATERAL + LIMIT 1: `cts_dv_employee` are
+            -- rânduri multiple per persoană, iar `department_id` e TEXT acolo și INT aici.
+            JOIN LATERAL (
+                SELECT e.department
+                FROM cts_dv_employee dv
+                JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+                WHERE dv.department_id = qe.department_id::text AND e.enabled = true
+                GROUP BY e.department
+                ORDER BY count(*) DESC, e.department
+                LIMIT 1
+            ) dep ON true
+            WHERE qe.deleted_at IS NULL
+              AND dep.department = ANY(:depts)
+        ) r
+    """)
+    try:
+        recl_row = db.execute(_recl_sql, _p).fetchone()
+    except Exception:
+        # Monitorul e un ecran de perete: o problemă pe sursa de reclamații nu are voie să
+        # doboare tot payload-ul (mail/task/apel rămân valabile). Se raportează 0 și se loghează.
+        logger.exception("monitor_live reclamatii (quality evaluation)")
+        recl_row = (0, 0, 0, 0, 0, 0)
+
+    # Ce s-a rezolvat azi, pe CATEGORIA EMAILULUI (informație / sesizare / reclamație).
+    # Atenție la cheia 'reclamatie' de aici: e categoria pusă pe mail de operator, NU o
+    # reclamație din Quality Evaluation. Cifra reală de reclamații e în blocul `reclamatii`.
     cat_rows = db.execute(text(f"""
         SELECT coalesce(nullif(lower(coalesce(g.cts_category, e.ai_category)), ''), 'neclasificat') AS cat,
                COUNT(*) AS n
@@ -1218,17 +1273,32 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             "rezolvate_azi": int(dev_row[0] or 0),
             "in_asteptare":  int(dev_row[1] or 0),
         },
+        # RECLAMAȚII — bloc propriu, alimentat exclusiv din Quality Evaluation. Cifrele de aici
+        # sunt suma cardurilor per departament (aceeași atribuire, pe persoana evaluată).
+        "reclamatii": {
+            "primite_azi":   int(recl_row[0] or 0),
+            "rezolvate_azi": int(recl_row[1] or 0),
+            "deschise":      int(recl_row[2] or 0),
+            "restante":      int(recl_row[3] or 0),
+            "peste_7z":      int(recl_row[4] or 0),
+            "apel_azi":      int(recl_row[5] or 0),
+        },
+        # SESIZĂRI + RECLAMAȚII, cheile istorice. Partea de SESIZARE rămâne pe categoria
+        # emailului (nu există altă sursă), partea de RECLAMAȚIE vine acum din Quality
+        # Evaluation — de-aia câmpurile mixte se compun din două surse, nu dintr-o interogare.
         "sesizari": {
-            "deschise":            int(sesiz_row[0] or 0),
+            "deschise":            int(sesiz_row[1] or 0) + int(recl_row[2] or 0),
             "sesizari_deschise":   int(sesiz_row[1] or 0),
-            "reclamatii_deschise": int(sesiz_row[2] or 0),
-            "rezolvate_azi":       int(sesiz_row[3] or 0),
+            "reclamatii_deschise": int(recl_row[2] or 0),
+            # emailurile de tip sesizare închise azi + reclamațiile CTS închise azi
+            "rezolvate_azi":       int(sesiz_row[3] or 0) + int(recl_row[1] or 0),
             # deschise dinainte de azi (restanțe) și cele care depășesc 7 zile
-            "restante":            int(sesiz_row[4] or 0),
-            "peste_7z":            int(sesiz_row[5] or 0),
-            # intrate azi pe telefon (aceleași categorii, sursă apeluri)
+            "restante":            int(sesiz_row[4] or 0) + int(recl_row[3] or 0),
+            "peste_7z":            int(sesiz_row[5] or 0) + int(recl_row[4] or 0),
+            # intrate azi pe telefon: sesizările din categoria apelului, reclamațiile din CTS
+            # (Quality Evaluation înregistrează pe ce lucrare s-a reclamat — aici, un apel).
             "apel_sesizari_azi":   int(sesiz_call[0] or 0),
-            "apel_reclamatii_azi": int(sesiz_call[1] or 0),
+            "apel_reclamatii_azi": int(recl_row[5] or 0),
         },
         "rezolvate_categorii": rezolvate_categorii,
         "hourly": hourly,

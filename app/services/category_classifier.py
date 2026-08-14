@@ -12,6 +12,7 @@ import re
 import json
 import hashlib
 import logging
+import unicodedata
 from typing import Dict, Any, Optional
 
 from sqlalchemy import text
@@ -154,6 +155,28 @@ _BASE_TAIL = (
 
 _CONTEXT_HINT = (
     "\n\nDaca primesti un CONTEXT ISTORIC inainte de emailul curent:\n"
+    # OPS-2026-0141 (14.08.2026): clientul office@evologistik.ro trimite ZILNIC aceeasi cerere de
+    # rutina ("alimentati contul cu suma din OP atasat"). Contextul istoric o transforma in
+    # "5 contactari fara raspuns" -> sesizare, apoi reclamatie, desi textul curent nu are nicio
+    # nemultumire. Verificat pe mailurile 60334/60953/64994/66023/66042: FARA istoric ies toate
+    # 'informatie' cu 0.92-0.95; CU istoric ies sesizare/reclamatie. De-aia regulile de mai jos.
+    "- REPETITIA UNEI CERERI DE RUTINA NU E PROBLEMA. Daca acelasi expeditor trimite periodic "
+    "(zilnic/saptamanal) aceeasi solicitare administrativa normala — alimentare/reincarcare cont, "
+    "transmitere OP sau alte documente, cerere de factura/extras — FIECARE mail e o tranzactie "
+    "NOUA, nu dovada ca precedentele au fost ignorate. Numarul de mailuri similare NU e, singur, "
+    "motiv de sesizare sau reclamatie.\n"
+    "- ESCALADAREA CERE DOVADA IN TEXTUL CURENT. Poti trece la sesizare/reclamatie pe baza "
+    "contextului DOAR daca emailul CURENT contine el insusi o problema sau o nemultumire explicita "
+    "(ex. 'v-am mai scris', 'nu mi-a raspuns nimeni', 'a treia oara', 'inca nu s-a rezolvat', "
+    "'nu functioneaza'). Daca textul curent e o cerere/transmitere neutra, incadrarea se face DUPA "
+    "el, nu dupa istoric — chiar daca in istoric apar sesizari sau reclamatii.\n"
+    "- ISTORICUL NU CONTINE RASPUNSURILE NOASTRE. In blocul de context apar DOAR mailurile "
+    "PRIMITE de la client; mailurile trimise de firma, apelurile si rezolvarile din CTS NU sunt "
+    "acolo. Deci NU poti sti daca s-a raspuns sau nu, si NU ai voie sa folosesti drept motiv "
+    "'fara raspuns documentat', 'nu s-a rezolvat' sau 'compania nu a reactionat' — asta e o "
+    "presupunere, nu o observatie. Doar clientul poate afirma asta, in textul curent.\n"
+    "- CATEGORIILE DIN ISTORIC POT FI GRESITE. Sunt incadrari anterioare ale aceluiasi sistem, nu "
+    "adevar verificat. NU le prelua in lant (o eroare veche s-ar propaga si s-ar agrava).\n"
     "- Problema recurenta (2+ sesizari similare recente) + email curent ambiguu "
     "-> confirma sesizare/reclamatie.\n"
     "- Sesizare anterioara ignorata/nerezolvata + nemultumire explicita acum "
@@ -271,6 +294,57 @@ def _is_body_insignificant(body: str) -> bool:
     return _real_word_count(body) < 5
 
 
+# ── Cerere de rutina: cand NU are voie sa intervina contextul istoric ────────────────────────
+# OPS-2026-0141 (14.08.2026). office@evologistik.ro trimite ZILNIC acelasi mail: "Va rog sa
+# alimentati contul cu suma din OP atasat". Blocul de CONTEXT ISTORIC (ultimele 5 mailuri ale
+# expeditorului) transforma repetitia in "5 contactari fara raspuns" -> sesizare, iar la mailul
+# urmator categoria veche din istoric devine "escaladare" -> reclamatie. Masurat pe 60334/60953/
+# 64994/66023/66042: CU istoric ies sesizare/reclamatie, FARA istoric ies toate 'informatie' cu
+# 0.92-0.95.
+#
+# Instructiunile in prompt n-au fost suficiente (Haiku tot invoca "fara raspuns documentat" pe
+# 2 din 5), iar scoaterea categoriilor din istoric a rezolvat cele 5 dar a rupt detectia
+# reclamatiilor reale (set de control cu adevar CTS: 90% -> 73%). De-aia filtrul e AICI,
+# determinist si ingust: contextul se taie DOAR pentru mailurile care sunt clar cereri de rutina.
+_ROUTINE_HINTS = (
+    "alimentati contul", "alimentare cont", "alimentati", "incarcati contul", "incarcarea contului",
+    "incarcare cont", "reincarcare cont", "reincarcati", "sa incarcati", "suma din op",
+    "op atasat", "op-ul atasat", "ordinul de plata", "atasat op", "extras de cont",
+    "va rog sa alimentati", "va rugam sa alimentati",
+)
+# Orice semnal de PROBLEMA sau de NEMULTUMIRE anuleaza scutirea: acolo istoricul chiar ajuta.
+_TROUBLE_HINTS = (
+    "nu functioneaza", "nu merge", "nu mai merge", "eroare", "defect", "problema", "probleme",
+    "nu apare", "nu se vede", "nu vad", "nu transmite", "nu pot", "nu am primit", "nu s-a",
+    "inca nu", "tot nu", "nu a fost", "nu ati", "nu mi-a", "nu ma", "nu am reusit",
+    "v-am mai", "v-am scris", "v-am sunat", "am mai scris", "am mai sunat", "a doua oara",
+    "a treia oara", "a patra oara", "de cate ori", "nimeni", "degeaba", "nemultumit",
+    "nemultumire", "reziliez", "reziliere", "renunt", "reclamatie", "amenda", "penalitat",
+    "gresit", "gresita", "incorect", "blocat", "urgent", "intarziere", "de ce nu",
+)
+
+
+def _deaccent(s: str) -> str:
+    return (unicodedata.normalize("NFKD", s or "")
+            .encode("ascii", "ignore").decode("ascii").lower())
+
+
+def _is_routine_request(body: str, subject: str) -> bool:
+    """True daca mailul e o cerere administrativa periodica, fara niciun semnal de problema.
+
+    Conditii CUMULATIVE (deliberat inguste — in dubiu, pastram contextul):
+      1. text scurt (sub 60 de cuvinte reale) — cererile de rutina sunt de 1-2 randuri;
+      2. contine o formulare de rutina (alimentare cont / OP / extras);
+      3. NU contine niciun marker de problema sau nemultumire.
+    """
+    txt = _deaccent(_strip_signatures(body or "") + " " + (subject or ""))
+    if _real_word_count(body) > 60:
+        return False
+    if not any(h in txt for h in _ROUTINE_HINTS):
+        return False
+    return not any(h in txt for h in _TROUBLE_HINTS)
+
+
 def _attachment_count(email: Dict[str, Any], attachments=None) -> int:
     """Numarul de atasamente. Daca lista nu e data, o numara din DB dupa email_id."""
     if attachments is not None:
@@ -343,7 +417,15 @@ def _format_history_block(history):
         "=== CONTEXT ISTORIC (ultimele mailuri din aceeasi conversatie/expeditor, "
         "de la cel mai vechi la cel mai recent) ===",
         "REGULA: email-ul curent (marcat mai jos) este DECISIV. Contextul arata "
-        "tipare recurente si escaladari — nu inlocuieste intentia email-ului curent.\n",
+        "tipare recurente si escaladari — nu inlocuieste intentia email-ului curent.",
+        # Vezi nota de la _CONTEXT_HINT: fara avertismentele astea, un client care trimite zilnic
+        # aceeasi cerere de rutina ajunge clasificat 'reclamatie' din simpla repetitie.
+        "ATENTIE: mailuri repetate cu ACEEASI cerere de rutina (alimentare cont, trimitere OP/"
+        "documente, cerere de factura) inseamna doar ca activitatea e periodica — NU ca cererile "
+        "anterioare au fost ignorate. Lista de mai jos contine DOAR mailuri PRIMITE de la client; "
+        "raspunsurile noastre nu apar aici, deci 'fara raspuns' NU se poate deduce din ea. "
+        "Categoriile afisate sunt incadrari anterioare ale aceluiasi sistem, nu adevar verificat: "
+        "nu le prelua in lant, o eroare veche s-ar agrava la fiecare mail.\n",
     ]
     for i, em in enumerate(items, 1):
         cat = em.get("ai_category") or "?"
@@ -359,7 +441,7 @@ def _format_history_block(history):
         body_snippet = body_raw[:250].replace("\n", " ").strip()
         if len(body_raw) > 250:
             body_snippet += "..."
-        lines.append(f"[{i}/{len(items)}] {recv} | {cat}")
+        lines.append(f"[{i}/{len(items)}] {recv} | {cat} (mail primit de la client)")
         lines.append(f"De la: {frm}")
         if subj:
             lines.append(f"Subiect: {subj}")
@@ -490,13 +572,21 @@ def _classify_category_impl(email: Dict[str, Any],
 
     # Context istoric (OPS-2026-0129): ultimele 5 mailuri clasificate ale aceluiasi expeditor.
     # Daca nu exista istoric (client nou, eroare DB) -> hist_block="" -> content neschimbat.
-    history = _get_email_history(
-        email_id=email.get("id"),
-        from_address=email.get("from_address"),
-        conversation_id=email.get("conversation_id"),
-        received_at=email.get("received_at"),
-        limit=5,
-    )
+    #
+    # EXCEPTIE (OPS-2026-0141): cererile de rutina NU primesc context. Vezi _is_routine_request —
+    # pentru ele istoricul nu adauga informatie, doar transforma repetitia in "escaladare".
+    if _is_routine_request(body, email.get("subject")):
+        logger.info("category: context istoric sarit (cerere de rutina) email_id=%s",
+                    email.get("id"))
+        history = []
+    else:
+        history = _get_email_history(
+            email_id=email.get("id"),
+            from_address=email.get("from_address"),
+            conversation_id=email.get("conversation_id"),
+            received_at=email.get("received_at"),
+            limit=5,
+        )
     hist_block = _format_history_block(history)
     if hist_block:
         content = (hist_block
