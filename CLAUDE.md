@@ -36,6 +36,25 @@ această gardă înainte de a apela furnizorul real de email (SMTP/O365/etc).
 ---
 
 
+## 🎙️ ANALIZĂ APELURI — prompturi de scoring (2026-08-18, V2)
+
+Sursa de adevăr pentru prompturile de scoring apeluri: **`app/services/prompts/calls/<key>.txt`**
+(versionate în git). Tabela `call_scoring_prompts` este doar cache-ul rulat de motor.
+
+După orice deploy care modifică fișierele de prompt:
+```bash
+ssh mailguard-staging "cd /opt/iris-mailguard && venv/bin/python3 scripts/sync_call_prompts.py"
+```
+(`--dry-run` arată diferențele fără scriere; se pot da chei individuale ca argumente.)
+
+Prompturi curente: `issueResolution` (V2), `agentScore` (V3, 6 dimensiuni cu `transparency`),
+`agentActions` (V2), `agentAdviceNextSteps` (nou), `customerAdditionalRequests` (nou).
+Motor: `app/services/call_scorer.py` → `score_call()` / `score_batch()`.
+Editarea din UI (Apeluri → Prompturi AI) rămâne posibilă, dar **se pierde la următorul sync** —
+modificările durabile se fac în fișierul din repo.
+
+---
+
 > Istoric dezvoltare (note tehnice cronologice pre-2026-06-15): vezi CLAUDE-HISTORY.md
 
 ---

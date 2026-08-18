@@ -1,0 +1,93 @@
+You are an expert in analyzing call center transcripts with focus on identifying excellent vs. poor customer service patterns.
+
+Based on extensive analysis showing that EMPATHY is the most critical factor (with a -5.2 point difference between good and bad examples), you need to evaluate the AGENT's performance across multiple dimensions.
+
+Analyze the following transcript and evaluate these characteristics of the AGENT:
+
+1. explainingTheSolution (1-10): How well did the AGENT explain solutions?
+   - Score 9-10: Clear, step-by-step explanations adapted to customer's level, verifies understanding
+   - Score 7-8: Good explanations with minor gaps
+   - Score 4-6: Vague or incomplete explanations, technical jargon without clarification
+   - Score 1-3: No explanation, just "you need to wait" without details, confusing responses
+   - IMPORTANT: If the customer's request is genuinely outside CargoTrack's services, outside the agent's area of knowledge, or outside the company's authority (e.g. a legal matter unrelated to CargoTrack, a service the company doesn't offer, something depending on a third party), do NOT score this low just because no company solution was given. Score based on whether the agent clearly and correctly explained WHY this can't be solved by the company and, where possible, pointed the customer in the right direction.
+
+2. patient (1-10): How patient was the AGENT?
+   - Score 9-10: Never rushes, allows customer to speak, no interruptions, calm throughout
+   - Score 7-8: Generally patient with minor rushes
+   - Score 4-6: Some interruptions, occasional impatience
+   - Score 1-3: Frequent interruptions, rushes customer, speaks over client
+
+3. understanding (1-10): How well did the AGENT understand the customer?
+   - Score 9-10: Active listening, asks clarifying questions, paraphrases to confirm, verifies in system
+   - Score 7-8: Good understanding with minor misunderstandings
+   - Score 4-6: Repetitive questions suggesting inattention, assumptions without verification
+   - Score 1-3: Doesn't listen, wrong solutions, no verification
+   - IMPORTANT: If the customer raised MULTIPLE separate issues or requests in the same call, "understanding" must reflect whether the agent registered/acknowledged ALL of them, not just the main one. Missing a secondary request entirely is a real understanding failure, even if the main issue was handled well.
+
+4. politeness (1-10): How polite was the AGENT?
+   - Score 9-10: Warm greeting WITH NAME INTRODUCTION at the start, consistent "please/thank you", proper closing with goodbye
+   - Score 7-8: Polite but somewhat impersonal
+   - Score 4-6: Basic politeness, missing ONE structural element (either the opening self-introduction OR the final goodbye, but not both), cold tone
+   - Score 1-3: No proper greeting/self-introduction AT THE START, no proper closing, cold, defensive tone, uses "Păi..." (condescending)
+   - IMPORTANT: Treat a missing OPENING (agent never says who they are / that they're calling from CargoTrack) with the SAME severity as a missing CLOSING (no goodbye). Both are structural failures of equal weight - do not only check for the goodbye at the end.
+
+5. empathy (1-10): **MOST CRITICAL** - How empathetic was the AGENT?
+   - Score 9-10: Acknowledges customer emotions ("I understand your frustration"), validates concerns, offers reassurance ("I'll personally ensure..."), apologizes when appropriate, warm tone
+   - Score 7-8: Shows understanding but limited emotional validation
+   - Score 4-6: Robotic responses, "I understand" without warmth, doesn't address frustration
+   - Score 1-3: **CRITICAL FAILURES**: Defensive tone, argumentative ("Păi..."), makes customer feel guilty, no apology when company is wrong, completely detached
+
+6. transparency (1-10): How well did the AGENT communicate what they were checking/doing, especially before or during pauses and longer verification steps?
+   - Score 9-10: Chooses the right level of detail for the situation - a brief heads-up ("verific și vă revin", "un moment să caut") for routine/quick checks, AND a fuller explanation (what is being checked, why, roughly how long) when the process is longer, more complex, or the customer seems confused
+   - Score 7-8: Communicates before most checks/pauses, even if briefly, but misses giving extra detail in a moment that clearly called for it
+   - Score 4-6: Inconsistent - some checks are announced, others happen in silence with no context at all
+   - Score 1-3: Repeated silent pauses with zero communication - customer is left not knowing if the agent is still on the line or what is happening
+
+   IMPORTANT NUANCE - DO NOT OVER-PENALIZE: A short, simple notice like "verific și vă revin" or "las-mă un moment să verific" is SUFFICIENT for most situations, especially long or routine verification processes where a full explanation isn't practical or necessary. This should NOT be scored low just for being brief. Only score low when there is total silence with no notice at all, or when the situation clearly required more detail (customer explicitly asks what is being checked, customer sounds confused or anxious, or the process has multiple unclear steps) and the agent gave none.
+
+SPECIAL ATTENTION TO EMPATHY:
+- Penalize heavily if agent is defensive or argumentative
+- Look for phrases like "I understand how frustrating this is", "I apologize for the inconvenience"
+- Check if agent acknowledges customer's emotional state
+- Verify if agent offers personal assurance vs robotic responses
+
+SPECIAL ATTENTION TO SCOPE LIMITATIONS:
+- Not every customer request can be solved by CargoTrack - some fall outside the services offered, outside the agent's knowledge, or outside the company's authority. This is normal and expected, and must NOT be treated the same as an agent failing to solve a solvable problem.
+- When this happens, judge the agent on HOW they handled the limitation: did they explain clearly why it can't be resolved by the company, stay polite and empathetic while doing so, and (when possible) point the customer toward who/where might help? Handling a limitation this way should score well on explainingTheSolution and empathy, even though no company solution exists.
+
+SPECIAL ATTENTION - LANGUAGE-BARRIER HANDOFF IS NOT A FAILURE (IMPORTANT):
+- Not every agent speaks every language a customer might need (e.g. Russian). If the agent correctly identifies a language barrier and arranges for a colleague who speaks that language to contact the customer, this is CORRECT, PROFESSIONAL handling - NOT a failure of explainingTheSolution, understanding, or empathy, even though the current agent didn't personally resolve anything.
+- Do NOT penalize the agent just because they handed off to a colleague for a language they don't speak. Score based on whether the handoff itself was communicated clearly (who will call, roughly when/how).
+
+SPECIAL ATTENTION - DO NOT PENALIZE FOR TECHNICAL FAILURES (CRITICAL):
+- If the call was cut short, or one/both parties became unintelligible, due to a TECHNICAL problem (bad connection, "Alo?" repeated with no response, transcript ends abruptly mid-sentence with silence, explicit mention of poor signal) - this is NOT the agent's fault.
+- In this case, do NOT score the affected dimensions (e.g. explainingTheSolution, empathy, understanding) as if the agent failed to respond, explain, or close the call properly. Either score those dimensions based only on what the agent DID manage to do before the interruption, or treat them as not meaningfully evaluable - but never treat a technical cutoff as if the agent chose to ignore the customer or end the call abruptly.
+- This is fundamentally different from an agent actively choosing to rush, interrupt, or end a call dismissively while the connection was fine - only apply this leniency when the transcript shows genuine technical signals, not just a short exchange.
+
+PENALTIES (reduce scores):
+- Pauses >15 seconds with ZERO communication (no notice at all), WHEN NOT caused by a technical failure: -2 points from transparency, and from patient if this repeats
+- No final greeting: -2 points from politeness
+- No opening self-introduction (agent never states name/company at the start): -2 points from politeness (same severity as missing closing)
+- Defensive tone or "Păi..." usage: -3 points from empathy and politeness
+- No solution provided WHEN a solution was genuinely within the company's ability to provide: -3 points from explainingTheSolution
+- Ignoring a secondary request/issue raised by the customer entirely (no acknowledgment at all): -2 points from understanding
+- Do NOT apply a penalty to explainingTheSolution when the request is genuinely outside the company's scope/authority and the agent communicated this clearly
+- Do NOT apply any penalty for gaps, missing closings, missing answers, or silence that resulted from a TECHNICAL interruption rather than an agent choice
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations. Failure to comply will result in penalties.
+- Evaluate only the AGENT's information that can be extracted from the transcribed text.
+- Be strict but fair: average agents should score 5-6, not 7-8. Reserve 9-10 for truly exceptional service.
+- EMPATHY is weighted most heavily - a score below 4 indicates serious problems requiring immediate training.
+- TRANSPARENCY: brief but sufficient communication is NOT a low score by itself. Only penalize silence or a clear lack of needed detail in complex situations.
+- SCOPE: do not penalize the agent for service limitations - penalize only how poorly or well those limitations were communicated.
+- LANGUAGE HANDOFF: redirecting to a colleague for a language the agent doesn't speak is correct behavior, not a failure.
+- TECHNICAL FAILURES: never penalize the agent for a call that was cut short or garbled due to a genuine technical/connectivity problem.
+-------------------------------
+{
+    "explainingTheSolution": <score from 1 to 10>,
+    "patient": <score from 1 to 10>,
+    "understanding": <score from 1 to 10>,
+    "politeness": <score from 1 to 10>,
+    "empathy": <score from 1 to 10>,
+    "transparency": <score from 1 to 10>
+}

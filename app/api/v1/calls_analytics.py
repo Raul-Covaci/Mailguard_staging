@@ -102,6 +102,10 @@ def analytics_dashboard(
             ROUND(AVG(cas.customer_score_total)::numeric, 2) AS avg_customer_score,
             COUNT(*) FILTER (WHERE cas.is_valid_call = false) AS invalid_calls,
             COUNT(*) FILTER (WHERE cas.issue_resolved = true) AS resolved_calls,
+            COUNT(*) FILTER (WHERE cas.agent_next_steps_clear = true) AS next_steps_clear_calls,
+            COUNT(*) FILTER (WHERE cas.agent_next_steps_clear IS NOT NULL) AS next_steps_scored_calls,
+            COUNT(*) FILTER (WHERE cas.issue_within_company_scope = false) AS out_of_scope_calls,
+            COALESCE(SUM(cas.customer_unacknowledged_count), 0) AS unacknowledged_requests,
             COUNT(cas.id) AS scored_calls
         FROM calls c
         LEFT JOIN call_ai_scores cas ON cas.call_id = c.id
@@ -155,6 +159,9 @@ def analytics_dashboard(
     scored = kpi_dict.get("scored_calls") or 0
     kpi_dict["answered_pct"] = round(answered * 100.0 / total, 1) if total else None
     kpi_dict["resolved_pct"] = round(resolved * 100.0 / scored, 1) if scored else None
+    ns_scored = kpi_dict.get("next_steps_scored_calls") or 0
+    ns_clear = kpi_dict.get("next_steps_clear_calls") or 0
+    kpi_dict["next_steps_clear_pct"] = round(ns_clear * 100.0 / ns_scored, 1) if ns_scored else None
 
     return {"kpi": kpi_dict, "series": series, "days": days}
 
@@ -241,8 +248,12 @@ def analytics_scores(
             ROUND(AVG(cas.agent_understanding)::numeric, 2) AS avg_understanding,
             ROUND(AVG(cas.agent_politeness)::numeric, 2) AS avg_politeness,
             ROUND(AVG(cas.agent_empathy)::numeric, 2) AS avg_empathy,
+            ROUND(AVG(cas.agent_transparency)::numeric, 2) AS avg_transparency,
             COUNT(cas.id) AS scored_count,
-            COUNT(*) FILTER (WHERE cas.issue_resolved = true) AS resolved_count
+            COUNT(*) FILTER (WHERE cas.issue_resolved = true) AS resolved_count,
+            COUNT(*) FILTER (WHERE cas.agent_next_steps_clear = true) AS next_steps_clear_count,
+            COUNT(*) FILTER (WHERE cas.agent_next_steps_clear IS NOT NULL) AS next_steps_scored_count,
+            COALESCE(SUM(cas.customer_unacknowledged_count), 0) AS unacknowledged_requests
         FROM calls c
         INNER JOIN call_ai_scores cas ON cas.call_id = c.id
         WHERE {date_filter}
@@ -375,12 +386,19 @@ def analytics_rescore_missing_binary(
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
-    """Rescorează apelurile care au call_ai_scores dar coloanele binare noi sunt NULL."""
+    """Rescorează apelurile cu call_ai_scores incomplete (KPI binare vechi sau câmpuri V2 lipsă)."""
     from app.services import call_scorer
     rows = db.execute(text(
         "SELECT call_id FROM call_ai_scores "
-        "WHERE agentul_sa_prezentat IS NULL AND clientul_aminta_judecata IS NULL "
-        "AND clientul_aminta_renuntare IS NULL AND clientul_contactat_anterior IS NULL "
+        "WHERE ("
+        "  agentul_sa_prezentat IS NULL AND clientul_aminta_judecata IS NULL "
+        "  AND clientul_aminta_renuntare IS NULL AND clientul_contactat_anterior IS NULL"
+        ") OR ("
+        # scripturile V2: transparency (agentScore V3), scope/soluție (issueResolution V2),
+        # pași următori (agentActions V2)
+        "  agent_transparency IS NULL OR issue_within_company_scope IS NULL "
+        "  OR agent_next_steps_clear IS NULL"
+        ") "
         "LIMIT 50"
     )).fetchall()
     call_ids = [r[0] for r in rows]
@@ -591,6 +609,32 @@ def analytics_binary_stats(
             # Prompt fără coloană dedicată în call_ai_scores — total 0 (nu e scorat încă)
             results.append({"key": key, "label": label, "positive": 0, "negative": 0, "total": 0})
 
+    # Indicatori binari derivați din prompturile V2 (nu au prompt binar dedicat, dar
+    # rezultatul lor e boolean → merită card donut la fel ca restul).
+    seen = {r["key"] for r in results}
+    DERIVED = [
+        ("issueWithinCompanyScope", "Cerere în competența companiei", "cas.issue_within_company_scope"),
+        ("agentNextStepsClear", "Pași următori comunicați clar", "cas.agent_next_steps_clear"),
+        ("customerRequestsAcknowledged", "Toate cererile clientului recepționate",
+         "(cas.customer_unacknowledged_count = 0)"),
+    ]
+    for key, label, expr in DERIVED:
+        if key in seen:
+            continue
+        sql = f"""
+            SELECT
+                COUNT(*) FILTER (WHERE {expr} = true)  AS positive,
+                COUNT(*) FILTER (WHERE {expr} = false) AS negative,
+                COUNT(*) FILTER (WHERE {expr} IS NOT NULL) AS total
+            FROM calls c
+            INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+            WHERE {date_filter} {agent_filter} {bl_sql}
+        """
+        row = db.execute(text(sql), params).fetchone()
+        if row:
+            results.append({"key": key, "label": label,
+                            "positive": row[0] or 0, "negative": row[1] or 0, "total": row[2] or 0})
+
     return {"stats": results}
 
 
@@ -630,6 +674,7 @@ def analytics_score_stats(
             ROUND(AVG(cas.agent_understanding)::numeric, 2)      AS agent_understanding,
             ROUND(AVG(cas.agent_politeness)::numeric, 2)         AS agent_politeness,
             ROUND(AVG(cas.agent_empathy)::numeric, 2)            AS agent_empathy,
+            ROUND(AVG(cas.agent_transparency)::numeric, 2)        AS agent_transparency,
             ROUND(AVG(cas.customer_score_total)::numeric, 2)     AS customer_total,
             ROUND(AVG(cas.customer_explaining)::numeric, 2)      AS customer_explaining,
             ROUND(AVG(cas.customer_patient)::numeric, 2)         AS customer_patient,
@@ -653,6 +698,7 @@ def analytics_score_stats(
             "understanding": d.get("agent_understanding"),
             "politeness":    d.get("agent_politeness"),
             "empathy":       d.get("agent_empathy"),
+            "transparency":  d.get("agent_transparency"),
         },
         "customer": {
             "total":         d.get("customer_total"),
@@ -718,11 +764,39 @@ def scoring_prompts_list(
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
+    # Prompturile noi versionate în repo apar în listă fără pas manual (insert-only:
+    # textele deja existente în DB — inclusiv cele editate din UI — NU se suprascriu).
+    from app.services import call_scorer
+    call_scorer.sync_prompts_from_repo(db, insert_only=True)
     rows = db.execute(text(
-        "SELECT id, key, label, enabled, output_schema, updated_at "
+        "SELECT id, key, label, enabled, output_type, output_schema, updated_at "
         "FROM call_scoring_prompts ORDER BY key"
     )).fetchall()
     return {"prompts": [dict(r._mapping) for r in rows]}
+
+
+@router.post("/calls/analytics/scoring-prompts/sync-repo")
+def scoring_prompts_sync_repo(
+    body: Optional[dict] = None,
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Rescrie prompturile din fișierele versionate în repo (app/services/prompts/calls/).
+
+    Suprascrie textele editate din UI — repo-ul e sursa de adevăr.
+    body: {"dry_run": bool, "keys": [...]}  (ambele opționale)
+    """
+    from app.services import call_scorer
+    body = body or {}
+    res = call_scorer.sync_prompts_from_repo(
+        db,
+        keys=body.get("keys") or None,
+        insert_only=False,
+        dry_run=bool(body.get("dry_run")),
+    )
+    if res.get("error"):
+        raise HTTPException(status_code=500, detail="Sincronizarea prompturilor a eșuat")
+    return {"ok": True, **res}
 
 
 @router.get("/calls/analytics/scoring-prompts/{key}")

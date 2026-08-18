@@ -8,6 +8,49 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.17.0 - 2026-08-18
+
+### MINOR — Scripturi analiză apeluri V2 (3 actualizate + 2 noi)
+
+Prompturile de scoring apeluri devin **versionate în repo** (`app/services/prompts/calls/<key>.txt`),
+sursă de adevăr pentru tabela `call_scoring_prompts`. Sincronizare fără redeploy de cod:
+`python3 scripts/sync_call_prompts.py` (are și `--dry-run`).
+
+**Actualizate:**
+- `issueResolution` V2 — separă „cerere în afara competenței companiei" de „agent a eșuat".
+  Câmpuri noi în output: `mainProblem`, `requestWithinCompanyScope`, `mainSolution`.
+- `agentScore` V3 — a 6-a dimensiune `transparency`; reguli noi (handoff lingvistic și întreruperi
+  tehnice nu se penalizează; lipsa prezentării la început = aceeași severitate ca lipsa salutului final).
+  Scorul total agent = media pe 6 dimensiuni (era 5).
+- `agentActions` V2 — câmpuri noi `nextStepsClearlyStatedToCustomer` + `nextStepsObservation`.
+
+**Noi:**
+- `agentAdviceNextSteps` — observație + sfat concret pe claritatea pașilor următori.
+- `customerAdditionalRequests` — prinde cererile secundare ale clientului; marchează cele
+  nerecepționate de agent (`unacknowledgedCount`).
+
+**DB** (`migrations/20260818_call_scoring_v2_columns.sql`) — coloane noi pe `call_ai_scores`:
+`agent_transparency`, `issue_main_problem`, `issue_main_solution`, `issue_within_company_scope`,
+`agent_next_steps_clear`, `agent_next_steps_observation`, `agent_advice_next_steps`,
+`customer_additional_requests`, `customer_unacknowledged_count`; + seed pentru cele 2 prompturi noi.
+
+**UI Analiza apeluri:**
+- **Întrebări AI**: cele 2 prompturi noi apar automat în listă (sync insert-only la deschiderea
+  tab-ului — nu suprascrie textele editate din UI). Buton nou **„Sincronizează din repo"**
+  (`POST /calls/analytics/scoring-prompts/sync-repo`) care rescrie textele din fișiere.
+- **Dashboard**: KPI-uri noi *% Pași clari*, *Cereri ignorate*, *În afara competenței*; bară
+  *Transparenta* în cardul „KPI medie agenti"; trei donut-uri derivate — *Cerere în competența
+  companiei*, *Pași următori comunicați clar*, *Toate cererile clientului recepționate*.
+- **Scoruri agenți**: coloane noi *Transparenta*, *% Pași clari*, *Cereri ignorate*.
+- **Modal apel → tab „Analiza AI"** (nou): rezultatul complet al întrebărilor AI per apel —
+  problema principală, soluția, verdicte (rezolvat / în competență / pași clari), barele de scor
+  agent (6) și client (5), observația și sfatul pe pași următori, cererile suplimentare ale
+  clientului cu status, frazele cheie și acțiunile promise. Buton „Analizeaza acum / Reanalizeaza".
+  `GET /calls/{id}` întoarce acum și `ai_scores`.
+- Analiza rulează automat pentru fiecare apel după transcriere când `calls.auto_score` e pornit
+  (Setări → Prompturi AI); altfel manual, din „Scoruri Agenti" sau din modalul apelului.
+- „Rescoreaza apeluri incomplete" prinde acum și rândurile fără câmpurile V2.
+
 ## v2.16.1 - 2026-08-18
 
 ### PATCH — Fix model_hint lipsă la sinteza lunară satisfacție

@@ -179,7 +179,14 @@ def get_call(call_id: int, db: Session = Depends(get_db)):
     """), {"id": call_id}).fetchone()
     if not row:
         raise HTTPException(404, "Apel inexistent")
-    return dict(row._mapping)
+    out = dict(row._mapping)
+    # Analiza AI a apelului (scoruri, problemă/soluție, pași următori, cereri suplimentare).
+    # Inclusă aici ca modalul de detaliu să nu mai facă un al doilea fetch.
+    scores = db.execute(text(
+        "SELECT * FROM call_ai_scores WHERE call_id = :id"
+    ), {"id": call_id}).fetchone()
+    out["ai_scores"] = dict(scores._mapping) if scores else None
+    return out
 
 
 @router.get("/calls/{call_id}/audio")

@@ -14209,6 +14209,8 @@ function CallsAnalitice({ setTopbarRight }) {
   var [editText, setEditText]   = useState('');
   var [editLabel, setEditLabel] = useState('');
   var [promptSaving, setPromptSaving] = useState(false);
+  var [promptSync, setPromptSync]     = useState(null);   // rezultat sincronizare din repo
+  var [promptSyncBusy, setPromptSyncBusy] = useState(false);
 
   var [batchBusy, setBatchBusy]     = useState(false);
   var [batchResult, setBatchResult] = useState(null);
@@ -14346,6 +14348,20 @@ function CallsAnalitice({ setTopbarRight }) {
       .then(function () { setEditKey(null); loadPrompts(); })
       .finally(function () { setPromptSaving(false); });
   }
+  function syncPromptsFromRepo() {
+    mgConfirm({
+      title: 'Sincronizezi intrebarile AI din repo?',
+      text: 'Textele din app/services/prompts/calls/ suprascriu ce e in baza de date, inclusiv editarile facute din interfata.',
+      icon: 'warning', confirmButtonText: 'Sincronizeaza', cancelButtonText: 'Anuleaza',
+    }).then(function (r) {
+      if (!r.isConfirmed) return;
+      setPromptSyncBusy(true); setPromptSync(null);
+      api('/calls/analytics/scoring-prompts/sync-repo', { method: 'POST', body: JSON.stringify({}) })
+        .then(function (d) { setPromptSync(d); loadPrompts(); })
+        .catch(function (e) { setPromptSync({ error: String(e.message || e) }); })
+        .finally(function () { setPromptSyncBusy(false); });
+    });
+  }
   function togglePrompt(key, enabled) {
     api('/calls/analytics/scoring-prompts/' + encodeURIComponent(key), { method: 'PUT', body: JSON.stringify({ enabled: enabled }) }).then(loadPrompts);
   }
@@ -14424,7 +14440,9 @@ function CallsAnalitice({ setTopbarRight }) {
       { key: 'understanding', label: 'Intelegerea problemei', color: colors[2] },
       { key: 'politeness',    label: 'Politete',            color: colors[3] },
       { key: 'empathy',       label: 'Empatie',             color: colors[4] },
-    ];
+      // Transparenta exista doar pe agent (agentScore V3); pe client lipseste din date.
+      { key: 'transparency',  label: 'Transparenta',        color: colors[5] || colors[0] },
+    ].filter(function (d) { return d.key !== 'transparency' || data.transparency != null; });
     return h('div', { className: 'card', style: { flex: '1 1 280px', minWidth: 260, padding: '16px 18px', borderTop: '3px solid ' + accent } }, [
       h('div', { key: 'hd', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14 } }, [
         h('span', { style: { fontSize: 14, fontWeight: 700 } }, title),
@@ -14529,6 +14547,13 @@ function CallsAnalitice({ setTopbarRight }) {
         kc('scr', 'Scor agent mediu', noScore ? 'Nescorat' : kpi.avg_agent_score + '/10', noScore ? 'Ruleaza scoring din tab Scoruri' : 'din ' + fmt(kpi.scored_calls) + ' scorati', '#a855f7'),
         kc('res', '% Rezolvate',      noScore ? 'Nescorat' : (kpi.resolved_pct != null ? kpi.resolved_pct + '%' : '—'), noScore ? 'necesita scoring' : 'din apeluri scorat', '#f59e0b'),
         kc('ten', 'Ton tensionat',    kpi.tone_tensionat != null ? fmt(kpi.tone_tensionat) : '—', 'apeluri tensionate', '#ef4444'),
+        // KPI din scripturile V2 de analiza apeluri
+        kc('nxt', '% Pasi clari',     noScore ? 'Nescorat' : (kpi.next_steps_clear_pct != null ? kpi.next_steps_clear_pct + '%' : '—'),
+           noScore ? 'necesita scoring' : 'pasi urmatori comunicati clar', '#06b6d4'),
+        kc('ign', 'Cereri ignorate',  noScore ? 'Nescorat' : fmt(kpi.unacknowledged_requests || 0),
+           noScore ? 'necesita scoring' : 'cereri client nerecepționate de agent', '#ef4444'),
+        kc('oos', 'In afara competentei', noScore ? 'Nescorat' : fmt(kpi.out_of_scope_calls || 0),
+           noScore ? 'necesita scoring' : 'cereri pe care compania nu le poate rezolva', '#6b7280'),
       ]),
       secH('Volum apeluri pe zi', '#3b82f6'),
       series.length ? h(MultiLineChart, {
@@ -14545,7 +14570,7 @@ function CallsAnalitice({ setTopbarRight }) {
       sStats && sStats.scored_calls > 0 ? h('div', { key: 'score-kpi' }, [
         secH('KPI medie scoruri AI (' + sStats.scored_calls + ' apeluri scorat)', '#a855f7'),
         h('div', { key: 'kpi-row', style: { display: 'flex', flexWrap: 'wrap', gap: 14 } }, [
-          KpiScoreCard('KPI medie agenti', sStats.agent, ['#f59e0b', '#3b82f6', '#06b6d4', '#10b981', '#a855f7'], '#a855f7'),
+          KpiScoreCard('KPI medie agenti', sStats.agent, ['#f59e0b', '#3b82f6', '#06b6d4', '#10b981', '#a855f7', '#ec4899'], '#a855f7'),
           KpiScoreCard('KPI medie clienti', sStats.customer, ['#f59e0b', '#3b82f6', '#06b6d4', '#10b981', '#a855f7'], '#06b6d4'),
         ]),
       ]) : null,
@@ -14629,7 +14654,10 @@ function CallsAnalitice({ setTopbarRight }) {
                 h('th', { style: { minWidth: 110 } }, 'Empatie'),
                 h('th', { style: { minWidth: 110 } }, 'Claritate'),
                 h('th', { style: { minWidth: 110 } }, 'Profesionalism'),
+                h('th', { style: { minWidth: 110 } }, 'Transparenta'),
                 h('th', { style: { textAlign: 'right' } }, '% Rezolvate'),
+                h('th', { style: { textAlign: 'right' }, title: 'Apeluri in care pasii urmatori au fost comunicati clar' }, '% Pasi clari'),
+                h('th', { style: { textAlign: 'right' }, title: 'Cereri suplimentare ale clientului pe care agentul nu le-a recepționat deloc' }, 'Cereri ignorate'),
               ])),
               h('tbody', null, agents.map(function (a, i) {
                 return h('tr', { key: i }, [
@@ -14639,7 +14667,10 @@ function CallsAnalitice({ setTopbarRight }) {
                   h('td', null, scoreBar(a.avg_empathy)),
                   h('td', null, scoreBar(a.avg_explaining)),
                   h('td', null, scoreBar(a.avg_politeness)),
+                  h('td', null, scoreBar(a.avg_transparency)),
                   h('td', { style: { textAlign: 'right' } }, a.resolved_count != null && a.scored_count ? Math.round(a.resolved_count * 100 / a.scored_count) + '%' : '—'),
+                  h('td', { style: { textAlign: 'right' } }, a.next_steps_scored_count ? Math.round((a.next_steps_clear_count || 0) * 100 / a.next_steps_scored_count) + '%' : '—'),
+                  h('td', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: (a.unacknowledged_requests || 0) > 0 ? 'var(--rd)' : 'var(--t3)' } }, a.unacknowledged_requests || 0),
                 ]);
               }))
             ])
@@ -14693,8 +14724,8 @@ function CallsAnalitice({ setTopbarRight }) {
   })();
 
   // ── Tab Prompturi AI ───────────────────────────────────────────────────────
-  var OTYPE_LABELS = { binary: 'Binar', score: 'Scor', advice: 'Sfat', text: 'Text' };
-  var OTYPE_COLORS = { binary: '#3b82f6', score: '#a855f7', advice: '#10b981', text: '#6b7280' };
+  var OTYPE_LABELS = { binary: 'Binar', score: 'Scor', advice: 'Sfat', text: 'Text', json: 'JSON' };
+  var OTYPE_COLORS = { binary: '#3b82f6', score: '#a855f7', advice: '#10b981', text: '#6b7280', json: '#f59e0b' };
 
   // Modal editare prompt
   var editModal = editKey ? h('div', { style: { position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.5)' } },
@@ -14716,8 +14747,23 @@ function CallsAnalitice({ setTopbarRight }) {
     var items = prompts && prompts.prompts ? prompts.prompts : [];
     if (!items.length) return h('div', { style: { color: 'var(--t3)', padding: 20 } }, 'Se incarca...');
     return h('div', null, [
-      h('div', { key: 'hint', style: { fontSize: 12, color: 'var(--t3)', marginBottom: 12 } },
-        'Prompturile active sunt rulate la scoring batch. Toggle ON/OFF controleaza daca promptul e inclus in analiza.'),
+      h('div', { key: 'hint', style: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 12 } }, [
+        h('span', { key: 't', style: { fontSize: 12, color: 'var(--t3)', flex: '1 1 320px' } },
+          'Intrebarile active sunt rulate la fiecare apel scorat. Toggle ON/OFF controleaza daca intrebarea e inclusa in analiza. Sursa de adevar a textelor: fisierele din app/services/prompts/calls/.'),
+        h('button', { key: 'sy', className: 'btn secondary', disabled: promptSyncBusy, onClick: syncPromptsFromRepo,
+          title: 'Rescrie textele intrebarilor din fisierele versionate in repo' },
+          promptSyncBusy ? 'Se sincronizeaza...' : 'Sincronizeaza din repo'),
+      ]),
+      promptSync ? h('div', { key: 'syres', style: {
+        marginBottom: 12, padding: '8px 12px', borderRadius: 6, fontSize: 12,
+        background: promptSync.error ? 'color-mix(in srgb, var(--rd) 10%, transparent)' : 'color-mix(in srgb, var(--gn) 10%, transparent)',
+        border: '1px solid ' + (promptSync.error ? 'color-mix(in srgb, var(--rd) 30%, transparent)' : 'color-mix(in srgb, var(--gn) 30%, transparent)'),
+        color: promptSync.error ? 'var(--rd)' : 'var(--gn)',
+      } }, promptSync.error
+        ? ('Eroare sincronizare: ' + promptSync.error)
+        : ('Sincronizat din repo: ' + (promptSync.inserted || []).length + ' noi, ' + (promptSync.updated || []).length + ' actualizate, ' + (promptSync.unchanged || []).length + ' neschimbate.'
+           + ((promptSync.updated || []).length ? ' Ruleaza „Rescoreaza apeluri incomplete" pentru a aplica pe apelurile deja scorate.' : ''))
+      ) : null,
       h('div', { key: 'tbl', className: 'table-wrap' },
         h('table', null, [
           h('thead', null, h('tr', null, [
@@ -15009,11 +15055,162 @@ function metaField(label, value) {
   ]);
 }
 
+
+// Panou „Analiza AI" din modalul de apel — rezultatul intrebarilor AI (call_ai_scores)
+// pentru apelul curent: problema/solutia, scoruri agent+client, pasi urmatori, cereri
+// suplimentare ale clientului. Datele vin odata cu GET /calls/{id} (camp ai_scores).
+function CallAiAnalysis({ scores, callId, onRescored }) {
+  var [busy, setBusy] = useState(false);
+  var lblS = { fontSize: 11, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.04em', fontWeight: 700, marginBottom: 6 };
+  var cardS = { border: '1px solid var(--bd)', borderRadius: 8, padding: '12px 14px', background: 'var(--bg2)' };
+
+  function scoreNow() {
+    setBusy(true);
+    api('/calls/analytics/score-now/' + callId + '?force=true', { method: 'POST' })
+      .then(function (r) {
+        if (r && r.ok) { mgToast('success', 'Apel scorat.', 2500); if (onRescored) onRescored(); }
+        else mgToast('error', 'Scoring esuat: ' + ((r && r.reason) || 'necunoscut'), 4000);
+      })
+      .catch(function (e) { mgToast('error', 'Scoring esuat: ' + (e.message || e), 4000); })
+      .finally(function () { setBusy(false); });
+  }
+
+  var rescoreBtn = h('button', { key: 'rs', className: 'btn secondary', disabled: busy, onClick: scoreNow, style: { padding: '5px 12px', fontSize: 12 } },
+    busy ? 'Se analizeaza...' : (scores ? 'Reanalizeaza' : 'Analizeaza acum'));
+
+  if (!scores) {
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-start' } }, [
+      h('div', { key: 'm', style: { color: 'var(--t3)', fontSize: 13 } },
+        'Apelul nu a fost inca analizat de AI. Analiza ruleaza automat dupa transcriere (daca e pornita in Setari) sau din tab-ul „Scoruri Agenti".'),
+      rescoreBtn,
+    ]);
+  }
+
+  var badge = function (key, txt, col) {
+    return h('span', { key: key, style: { display: 'inline-block', padding: '2px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700,
+      background: col + '22', color: col, border: '1px solid ' + col + '55' } }, txt);
+  };
+  var boolBadge = function (key, val, txtTrue, txtFalse) {
+    if (val == null) return badge(key, 'necunoscut', '#6b7280');
+    return badge(key, val ? txtTrue : txtFalse, val ? '#10b981' : '#ef4444');
+  };
+  var bar = function (label, val, color) {
+    var pct = val == null ? 0 : Math.min(100, Math.round(val / 10 * 100));
+    return h('div', { key: label, style: { marginBottom: 8 } }, [
+      h('div', { key: 'r', style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 } }, [
+        h('span', null, label),
+        h('span', { style: { fontVariantNumeric: 'tabular-nums', color: color, fontWeight: 600 } }, val != null ? val : '—'),
+      ]),
+      h('div', { key: 'b', style: { height: 5, borderRadius: 3, background: 'var(--bg3)' } },
+        h('div', { style: { width: pct + '%', height: '100%', borderRadius: 3, background: color } })),
+    ]);
+  };
+  var textBlock = function (key, label, value) {
+    if (!value) return null;
+    return h('div', { key: key, style: cardS }, [
+      h('div', { key: 'l', style: lblS }, label),
+      h('div', { key: 'v', style: { fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' } }, value),
+    ]);
+  };
+  var asObj = function (v) {
+    if (!v) return null;
+    if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return null; } }
+    return v;
+  };
+
+  var actions  = asObj(scores.agent_actions) || {};
+  var addl     = asObj(scores.customer_additional_requests) || {};
+  var addlList = Array.isArray(addl.additionalRequests) ? addl.additionalRequests : [];
+  var STATUS_COL = { 'rezolvat': '#10b981', 'urmeaza sa fie rezolvat': '#f59e0b', 'in afara competentei': '#6b7280', 'ignorat': '#ef4444' };
+
+  return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, [
+    // Antet: verdicte rapide
+    h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+      boolBadge('res', scores.issue_resolved, 'Rezolvat', 'Nerezolvat'),
+      scores.issue_within_company_scope === false ? badge('oos', 'In afara competentei companiei', '#6b7280') : null,
+      boolBadge('nxt', scores.agent_next_steps_clear, 'Pasi urmatori clari', 'Pasi urmatori neclari'),
+      scores.is_valid_call === false ? badge('inv', 'Apel invalid', '#ef4444') : null,
+      addl.unacknowledgedCount ? badge('ign', addl.unacknowledgedCount + ' cereri ignorate', '#ef4444') : null,
+      h('div', { key: 'sp', style: { marginLeft: 'auto' } }, rescoreBtn),
+    ]),
+
+    textBlock('prob', 'Problema principala', scores.issue_main_problem || scores.issue_summary),
+    textBlock('sol', 'Solutia / raspunsul agentului', scores.issue_main_solution),
+
+    // Scoruri
+    h('div', { key: 'sc', style: { display: 'flex', gap: 14, flexWrap: 'wrap' } }, [
+      h('div', { key: 'ag', style: Object.assign({ flex: '1 1 260px' }, cardS) }, [
+        h('div', { key: 'l', style: lblS }, 'Scor agent' + (scores.agent_score_total != null ? ' — ' + scores.agent_score_total + '/10' : '')),
+        bar('Explicarea solutiei', scores.agent_explaining_solution, '#f59e0b'),
+        bar('Rabdare',             scores.agent_patient,             '#3b82f6'),
+        bar('Intelegere',          scores.agent_understanding,       '#06b6d4'),
+        bar('Politete',            scores.agent_politeness,          '#10b981'),
+        bar('Empatie',             scores.agent_empathy,             '#a855f7'),
+        bar('Transparenta',        scores.agent_transparency,        '#ec4899'),
+      ]),
+      h('div', { key: 'cl', style: Object.assign({ flex: '1 1 260px' }, cardS) }, [
+        h('div', { key: 'l', style: lblS }, 'Scor client' + (scores.customer_score_total != null ? ' — ' + scores.customer_score_total + '/10' : '')),
+        bar('Explicarea problemei', scores.customer_explaining,    '#f59e0b'),
+        bar('Rabdare',              scores.customer_patient,       '#3b82f6'),
+        bar('Intelegere',           scores.customer_understanding, '#06b6d4'),
+        bar('Politete',             scores.customer_politeness,    '#10b981'),
+        bar('Empatie',              scores.customer_empathy,       '#a855f7'),
+      ]),
+    ]),
+
+    textBlock('nxtobs', 'Pasi urmatori — observatie', scores.agent_next_steps_observation),
+    textBlock('nxtadv', 'Sfat agent — pasi urmatori', scores.agent_advice_next_steps),
+
+    // Cereri suplimentare ale clientului
+    addlList.length ? h('div', { key: 'addl', style: cardS }, [
+      h('div', { key: 'l', style: lblS }, 'Cereri suplimentare ale clientului (' + addlList.length + ')'),
+      h('div', { key: 'ls', style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+        addlList.map(function (rq, i) {
+          var st = (rq.resolutionStatus || '').toLowerCase();
+          var col = STATUS_COL[st] || '#6b7280';
+          return h('div', { key: i, style: { borderLeft: '3px solid ' + col, paddingLeft: 10 } }, [
+            h('div', { key: 'r', style: { fontSize: 13, marginBottom: 3 } }, rq.request || '—'),
+            h('div', { key: 'm', style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } }, [
+              badge('st', rq.resolutionStatus || 'necunoscut', col),
+              rq.wasAcknowledged === false ? badge('ack', 'nerecepționata de agent', '#ef4444') : null,
+            ]),
+            rq.notes ? h('div', { key: 'n', style: { fontSize: 12, color: 'var(--t2)', marginTop: 3 } }, rq.notes) : null,
+          ]);
+        })),
+    ]) : null,
+
+    // Actiuni si fraze cheie
+    (actions.actionItems && actions.actionItems.length) || (actions.keyPhrases && actions.keyPhrases.length)
+      ? h('div', { key: 'act', style: { display: 'flex', gap: 14, flexWrap: 'wrap' } }, [
+          actions.keyPhrases && actions.keyPhrases.length ? h('div', { key: 'kp', style: Object.assign({ flex: '1 1 260px' }, cardS) }, [
+            h('div', { key: 'l', style: lblS }, 'Fraze cheie'),
+            h('ul', { key: 'u', style: { margin: 0, paddingLeft: 18, fontSize: 13, lineHeight: 1.5 } },
+              actions.keyPhrases.map(function (x, i) { return h('li', { key: i }, String(x)); })),
+          ]) : null,
+          actions.actionItems && actions.actionItems.length ? h('div', { key: 'ai', style: Object.assign({ flex: '1 1 260px' }, cardS) }, [
+            h('div', { key: 'l', style: lblS }, 'Actiuni promise de agent'),
+            h('ul', { key: 'u', style: { margin: 0, paddingLeft: 18, fontSize: 13, lineHeight: 1.5 } },
+              actions.actionItems.map(function (x, i) { return h('li', { key: i }, String(x)); })),
+          ]) : null,
+        ])
+      : null,
+
+    textBlock('advemp', 'Sfat agent — empatie', scores.agent_advice_empathy),
+    textBlock('advprof', 'Sfat agent — profesionalism', scores.agent_advice_professionalism),
+    textBlock('advclar', 'Sfat agent — claritate', scores.agent_advice_clarity),
+
+    scores.scored_at ? h('div', { key: 'ft', style: { fontSize: 11, color: 'var(--t3)' } },
+      'Analizat ' + new Date(scores.scored_at).toLocaleString('ro-RO') + (scores.model ? ' · ' + scores.model : '')) : null,
+  ]);
+}
+
 function CallDetail({ callId, onClose, allIds, currentIndex, onNext, onPrev }) {
   const [call, setCall] = useState(null);
   const [err, setErr] = useState('');
   const [audioUrl, setAudioUrl] = useState(null);
   const [audioLoading, setAudioLoading] = useState(false);
+  const [pane, setPane] = useState('transcript');   // 'transcript' | 'ai'
+  const [reload, setReload] = useState(0);
 
   useEffect(function() {
     let cancelled = false;
@@ -15035,7 +15232,9 @@ function CallDetail({ callId, onClose, allIds, currentIndex, onNext, onPrev }) {
       window.removeEventListener('keydown', onKey);
       document.body.style.overflow = '';
     };
-  }, [callId]);
+  }, [callId, reload]);
+
+  useEffect(function() { setPane('transcript'); }, [callId]);
 
   function loadAudio() {
     if (audioUrl || audioLoading || !call || call.audio_status !== 'downloaded') return;
@@ -15121,15 +15320,27 @@ function CallDetail({ callId, onClose, allIds, currentIndex, onNext, onPrev }) {
           ]),
         // COLOANA DREAPTA — transcript, scrollabil independent
         h('div', { key: 'main', style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } }, [
-          h('div', { key: 'lbl', style: { padding: '12px 18px', fontSize: 12, fontWeight: 600, color: 'var(--t2)', borderBottom: '1px solid var(--bd)', flexShrink: 0 } }, 'Transcript'),
+          h('div', { key: 'lbl', style: { display: 'flex', gap: 2, padding: '0 18px', borderBottom: '1px solid var(--bd)', flexShrink: 0 } },
+            [{ k: 'transcript', l: 'Transcript' }, { k: 'ai', l: 'Analiza AI' }].map(function(t) {
+              var on = pane === t.k;
+              return h('button', { key: t.k, onClick: function() { setPane(t.k); },
+                style: { padding: '12px 10px', fontSize: 12, fontWeight: on ? 700 : 600, border: 'none', background: 'transparent',
+                  color: on ? 'var(--am)' : 'var(--t2)', borderBottom: '2px solid ' + (on ? 'var(--am)' : 'transparent'),
+                  marginBottom: -1, cursor: 'pointer' } },
+                t.l + (t.k === 'ai' && call && call.ai_scores && call.ai_scores.agent_score_total != null
+                  ? ' · ' + call.ai_scores.agent_score_total + '/10' : ''));
+            })),
           h('div', { key: 'scroll', style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px 18px' } },
-            call ? h(TranscriptConversation, { turns: call.transcript_turns, transcript: call.transcript,
-                agentName: (call.ai_assignee_result && call.ai_assignee_result.assignee_name) || null,
-                clientName: call.client_name || null })
-              : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, sklBubbleWidths.map(function(w, i) {
+            !call
+              ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, sklBubbleWidths.map(function(w, i) {
                   return h('div', { key: i, style: { display: 'flex', justifyContent: i % 2 === 0 ? 'flex-start' : 'flex-end' } },
                     h('div', { className: 'skl2', style: { width: w + '%', height: 34, borderRadius: 10 } }));
-                })))
+                }))
+              : pane === 'ai'
+                ? h(CallAiAnalysis, { scores: call.ai_scores, callId: call.id, onRescored: function() { setReload(function(n) { return n + 1; }); } })
+                : h(TranscriptConversation, { turns: call.transcript_turns, transcript: call.transcript,
+                    agentName: (call.ai_assignee_result && call.ai_assignee_result.assignee_name) || null,
+                    clientName: call.client_name || null }))
         ])
       ]),
       h('div', { key: 'footer', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, padding: '12px 16px', borderTop: '1px solid var(--bd)', flexShrink: 0 } }, [
