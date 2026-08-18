@@ -1911,6 +1911,110 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     }
 
 
+# ---------------------------------------------------------------- productivitate pe ZILE (tab Rapoarte)
+#
+# DE CE: raportul lunar spune CIT s-a atins, nu CIND s-a pierdut. O luna la 88% poate ascunde trei
+# zile la 40% -- ca sa le poti inspecta ("de ce a fost 10 august slab?") ai nevoie de scorul pe zi,
+# defalcat pe obiective.
+#
+# SURSA: exact aceleasi randuri ca raportul lunar, prin `breakdown_rows` (care oglindeste sursele si
+# filtrele din `_fetch_*_rows`). Nu se scrie SQL nou: altfel tabelul zilnic si scorul lunar ar putea
+# diverge in timp.
+#
+# ZIUA unui rind = ziua REZOLVARII (`solved_at`), la fel ca luna in raportul lunar: un mail sosit pe
+# 8 si rezolvat pe 10 conteaza pe 10. La apeluri `solved_at` e sfirsitul convorbirii, deci practic
+# ziua apelului.
+#
+# DIFERENTA de regula fata de scorul lunar, deliberata: un obiectiv fara NICIUN rind intr-o zi nu
+# intra in media zilei (lunar, un obiectiv gol conteaza 100% -- "nu poti rata ce n-a existat").
+# Pe o zi, regula lunara ar da 100% pe canalele fara activitate si ar ascunde exact ziua slaba pe
+# care o cauti. De aceea totalul zilei e media ponderata NUMAI pe obiectivele care au avut ceva
+# masurabil, iar `pondere_activa` spune cita pondere a fost in joc. Consecinta care trebuie spusa in
+# UI: media zilelor NU e egala cu scorul lunar (numitori diferiti).
+def daily_report(db: Session, department: str, year: int, month: int) -> dict:
+    """Scor de productivitate pe fiecare zi a lunii, defalcat pe obiective."""
+    objectives = get_objectives(db, department, tip=None)
+    first, last = _month_bounds(year, month)
+
+    # Cheia unui obiectiv, stabila intre backend si UI.
+    def _key(o) -> str:
+        return o["tip"] if not o.get("categorie") else f'{o["tip"]}:{o["categorie"]}'
+
+    obiective_meta = [{
+        "key": _key(o), "tip": o["tip"], "categorie": o["categorie"],
+        "limita_minute": o["limita_minute"], "unitate": o.get("unitate") or "minute",
+        "pondere": o["pondere"],
+    } for o in objectives]
+
+    # zi -> cheie obiectiv -> contoare
+    per_day: dict = {}
+
+    def _slot(day: str, key: str) -> dict:
+        return per_day.setdefault(day, {}).setdefault(key, {"total": 0, "measurable": 0, "in_timp": 0})
+
+    for o in objectives:
+        key = _key(o)
+        try:
+            rows = breakdown_rows(db, department, o["tip"], first, o["categorie"], o["limita_minute"])
+        except Exception:
+            # Un canal cu sursa stricata nu are voie sa doboare tot tabelul: se raporteaza gol.
+            logger.exception("daily_report: breakdown %s/%s dept=%s", o["tip"], o["categorie"], department)
+            continue
+        for r in rows:
+            # `solved_at` e momentul care da luna in raportul lunar; `created_at` e plasa de
+            # siguranta pentru randurile fara capat de final.
+            ts = r.get("solved_at") or r.get("created_at")
+            if not ts:
+                continue
+            day = str(ts)[:10]          # ISO cu offset RO -> data locala
+            sl = _slot(day, key)
+            sl["total"] += 1
+            if r.get("durata") is not None:
+                sl["measurable"] += 1
+                if r.get("status") == "on_time":
+                    sl["in_timp"] += 1
+
+    zile = []
+    d = first
+    while d <= last:
+        dkey = d.isoformat()
+        buckets = per_day.get(dkey, {})
+        obiective_zi = []
+        weighted_sum = 0.0
+        weight_active = 0.0
+        vol_zi = 0
+        meas_zi = 0
+        for om in obiective_meta:
+            b = buckets.get(om["key"]) or {"total": 0, "measurable": 0, "in_timp": 0}
+            achieved = round(100.0 * b["in_timp"] / b["measurable"], 2) if b["measurable"] > 0 else None
+            obiective_zi.append({
+                "key": om["key"], "total": b["total"], "measurable": b["measurable"],
+                "in_timp": b["in_timp"], "achieved": achieved,
+            })
+            vol_zi += b["total"]
+            meas_zi += b["measurable"]
+            if achieved is not None:
+                weighted_sum += achieved * om["pondere"]
+                weight_active += om["pondere"]
+        zile.append({
+            "day": dkey,
+            "weekday": d.isoweekday(),
+            "volum": vol_zi,
+            "measurable": meas_zi,
+            "pondere_activa": round(weight_active, 2),
+            "total_pct": round(weighted_sum / weight_active, 2) if weight_active > 0 else None,
+            "obiective": obiective_zi,
+        })
+        d += _dt.timedelta(days=1)
+
+    return {
+        "department": department,
+        "month": f"{year:04d}-{month:02d}",
+        "obiective": obiective_meta,
+        "zile": zile,
+    }
+
+
 def trend(db: Session, department: str, months: int = 6, year: Optional[int] = None,
           month: Optional[int] = None) -> list:
     """Serie lunara (ultimele `months` luni pana la year/month inclusiv): obiectiv_atins vs real."""

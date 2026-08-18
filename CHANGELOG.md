@@ -8,6 +8,95 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.15.1 - 2026-08-18
+
+Tabelul „Productivitate zilnică" trece din card separat (unul mare, cu toate departamentele) în
+**cardul fiecărui departament**, ca secțiune colapsabilă sub tabelul de operatori. Cifrele și
+convențiile rămân identice; se schimbă doar locul și granularitatea cererii: fiecare card întreabă
+numai de departamentul lui, deci deschiderea unui card costă 0.29s în loc de 1.03s.
+
+## v2.15.0 - 2026-08-18
+
+### Productivitate zilnică — tab Rapoarte
+
+Secțiune nouă, **colapsată implicit, în cardul fiecărui departament**: un tabel cu o linie per zi, o
+coloană per obiectiv și scorul TOTAL al zilei. Scorul lunar spune cât s-a atins, nu când s-a pierdut
+— o lună la 94% poate ascunde o zi la 78%, iar aici se vede și obiectivul care a tras-o în jos.
+
+Exemplu real, Suport 1 / august (date locale): luna iese 94.25%, dar 03.08 e la **78.6%**, cu
+Emailuri la **61.06% pe 208 măsurabile** — apelurile și task-urile erau la 99-96% în aceeași zi.
+Fără tabel, ziua asta era invizibilă.
+
+Endpoint: `GET /productivity/daily?month=YYYY-MM[&department=]`. Fiecare card cere DOAR
+departamentul lui, la PRIMA deschidere a secțiunii — nu la încărcarea paginii. Cost măsurat: 0.29s
+per departament (1.03s dacă s-ar cere toate șase odată).
+
+**Sursa e aceeași ca raportul lunar**, prin `breakdown_rows` — nu s-a scris SQL nou, altfel tabelul
+zilnic și scorul lunar ar fi putut diverge în timp.
+
+Convenții, scrise și în tooltip-ul „cum se calculează?":
+- **ziua unui element = ziua REZOLVĂRII**, exact ca luna în raportul lunar (un mail sosit pe 8 și
+  rezolvat pe 10 contează pe 10; la apeluri, sfârșitul convorbirii);
+- **un obiectiv fără nimic măsurabil în ziua respectivă NU intră în media zilei.** În scorul lunar,
+  un obiectiv gol contează 100% („nu poți rata ce n-a existat"); pe o singură zi regula asta ar da
+  100% pe toate canalele fără activitate și ar ascunde exact ziua slabă pe care o cauți. Coloana
+  arată `—`, iar `pondere_activa` spune câtă pondere a fost în joc;
+- consecința, spusă explicit: **media zilelor nu e egală cu scorul lunar** (numitori diferiți).
+
+Culorile urmează convenția gauge-ului (verde ≥ obiectiv real, galben ≥ minim, roșu sub), atât pe
+celulele de obiectiv cât și pe TOTAL, deci ziua slabă și canalul vinovat sar în ochi. Zilele fără
+activitate nu se afișează; weekendurile cu activitate rămân, cu fundal diferit. Panoul apare doar pe
+o lună reală, nu pe interval agregat (nu există zile comune) și nu pe prognoză.
+
+## v2.14.0 - 2026-08-18
+
+### Fix: vehiculele și contractele nu se mai importau — cheia IRIS citită doar din environment
+
+`sync_clients_from_iris()` lua cheia exclusiv cu `os.getenv('IRIS_MAILGUARD_API_KEY')`. Sub systemd
+merge (`EnvironmentFile=/opt/iris-mailguard/.env`), dar orice rulare în afara lui — dev local, script
+manual, cron fără env — vedea variabila goală și se oprea cu `IRIS_MAILGUARD_API_KEY missing`, fără
+nicio eroare vizibilă în UI. Simptomul raportat: „numărul de vehicule nu îl importă, contractele nu
+le importă". Cheia e acum și câmp de settings (`iris_mailguard_api_key`), deci se citește și din
+`.env`; environment-ul rămâne prioritar.
+
+Verificat că feed-ul IRIS livrează datele (probe read-only pe `/clients/contact-list?include=vehicles,contracts`):
+16478 clienți, **10149 cu listă de vehicule** și **11387 cu contracte**. După fix, sync-ul rulat local
+a scris **43699 vehicule / 32267 contracte** pe 12063 clienți — deci codul de import era corect, doar
+nu ajungea să pornească.
+
+Al doilea efect al aceleiași căi: pe return de eroare, `client_assets.last_result` rămânea
+`{"status":"running"}` pentru totdeauna (starea se scria doar pe succes și pe excepție), deci UI-ul
+arăta un sync în curs care se terminase de mult. `sync_clients_guarded` scrie acum rezultatul
+oricare ar fi el.
+
+### Monitor — reclamații: total pe lună + total în lucru
+
+Barele devin **„Total lună"** (reclamații înregistrate în luna curentă) și **„În lucru"** (status CTS
+2, indiferent de lună — e o stare, nu un flux). „Primite azi" / „Rezolvate azi" ies: pe o singură zi
+cifrele sunt aproape mereu 0. „Deschise" (status 1) iese și el — în CTS reclamațiile nu stau în
+starea `new`: pe eșantionul curent sunt **0 rânduri cu status 1** din 134, deci bara ar fi fost
+permanent goală.
+
+### Fix: monitorul punea reclamația pe alt departament decât pagina Reclamații
+
+Monitorul atribuia reclamația **doar** prin `department_id`-ul din CTS (departamentul dominant al
+angajaților mapați pe acel id), în timp ce pagina Reclamații folosește
+`COALESCE(ev.department, dep.department)` — departamentul persoanei EVALUATE, cu `department_id` doar
+ca fallback. De aceea o reclamație înregistrată în CTS pe „Suport 1", dar cu responsabil din
+Comercial, apărea pe cardul Suport 1 și în listă la Comercial. Monitorul folosește acum exact
+aceeași expresie, atât pe grup cât și per departament — comentariul din cod promitea deja asta, SQL-ul
+nu o făcea.
+
+Verificat pe august: totalurile per departament coincid acum cu interogarea de control
+(taxe_drum 10, suport_1 8, suport_2 6, contabilitate 2, recuperare_tva 2).
+
+### Pictograma de productivitate: se scrie obiectivul REAL, nu minimul
+
+Pe arcul gauge-ului era scris pragul MINIM (`staticLabels.labels = [safeMin]`), deși cel urmărit e
+obiectivul real — cel care trebuie atins. Se scrie acum realul. Ambele markere colorate rămân pe arc
+(galben = minim, verde = real), la fel și valorile numerice de sub grafic; doar eticheta de pe arc nu
+se poate dubla, fiindcă la o mărime lizibilă cele două se suprapun (Suport 1: 77.9 vs 82.9).
+
 ## v2.13.0 - 2026-08-18
 
 ### Monitorul de productivitate: apelurile vin din centrală, nu din CTS

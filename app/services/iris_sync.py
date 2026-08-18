@@ -218,6 +218,10 @@ def sync_clients_guarded():
     _write_client_sync_state({"status": "running"})
     try:
         res = sync_clients_from_iris()
+        # Starea trebuie scrisa si pe succes SI pe eroare returnata (nu doar pe excepție): altfel
+        # `client_assets.last_result` rimine "running" pe veci si UI-ul arata un sync in curs care
+        # s-a terminat de mult.
+        _write_client_sync_state(res if isinstance(res, dict) else {"status": "done"})
         return res
     except Exception as e:
         logger.exception("client sync failed")
@@ -413,7 +417,10 @@ def sync_clients_from_iris() -> dict:
     iris_url = settings.iris_api_url.rstrip('/')
     # Use dedicated CARGO360 key
     import os
-    mg_key = os.getenv('IRIS_MAILGUARD_API_KEY', '')
+    # Environment (systemd EnvironmentFile) are prioritate; fallback pe `.env` prin settings, ca
+    # rularile din afara systemd sa nu cada silentios pe "key missing" — simptomul era ca
+    # vehiculele si contractele nu se mai importau deloc, fara nicio eroare vizibila in UI.
+    mg_key = os.getenv('IRIS_MAILGUARD_API_KEY', '') or (settings.iris_mailguard_api_key or '')
     if not mg_key:
         return {"status": "error", "message": "IRIS_MAILGUARD_API_KEY missing"}
 

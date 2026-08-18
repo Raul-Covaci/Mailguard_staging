@@ -11061,11 +11061,12 @@ function ProdGauge({ val, min, max, color, radiusScale, height }) {
         // '28ld 28px Inter,...', pe care canvas-ul ignora, rămânând la implicitul ~10px:
         // de aceea 28px nu se vedea deloc mai mare. Fără prefix, mărimea se aplică efectiv.
         font:           '20px Inter,system-ui,sans-serif',
-        // Doar pragul MINIM scris pe arc. Minimul și realul sunt adesea foarte apropiate
-        // (ex. Suport 1: 77.9 / 82.9), iar la o mărime lizibilă cele două etichete se suprapuneau.
-        // Markerele colorate de pe arc (galben = minim, verde = real) rămân ambele, la fel și
-        // valorile numerice de sub grafic — se pierde doar textul duplicat al realului.
-        labels:         [safeMin],
+        // Doar UN prag scris pe arc: minimul și realul sînt adesea foarte apropiate (ex. Suport 1:
+        // 77.9 / 82.9), iar la o mărime lizibilă cele două etichete se suprapuneau. Se scrie
+        // obiectivul REAL — ăsta e cel care trebuie atins (cerere business owner, 2026-08-18);
+        // înainte era scris minimul, deci pe monitor se citea pragul greșit. Markerele colorate de
+        // pe arc (galben = minim, verde = real) rămân ambele, la fel și valorile de sub grafic.
+        labels:         [safeMax],
         color:          colTx,
         fractionDigits: 1
       },
@@ -11118,7 +11119,7 @@ function ProdGauge({ val, min, max, color, radiusScale, height }) {
   ]);
 }
 
-function ProdDeptCard({ d, isForecast }) {
+function ProdDeptCard({ d, isForecast, dailyMonth }) {
   var [sortKey, setSortKey] = useState('volum_total');
   var [sortDir, setSortDir] = useState('desc');
   var [objOpen, setObjOpen] = useState(false);
@@ -11424,7 +11425,11 @@ function ProdDeptCard({ d, isForecast }) {
           });
         })() : [ h('tr', { key:'no' }, h('td', { style:td, colSpan:colSpan }, h('span', { style:{ color:'var(--t3)' } }, 'Fără activitate măsurabilă în luna selectată.'))) ])
       ]));
-    })() : null
+    })() : null,
+    // Productivitatea pe zile, in cardul departamentului (colapsata implicit). `dailyMonth` vine
+    // doar cand are sens: o singura luna reala, nu interval agregat si nu prognoza.
+    dailyMonth ? h(ProdDeptDailyTable, { key:'daily', dept:d.department, month:dailyMonth,
+      target:{ real:d.obiectiv_real, minim:d.obiectiv_minim, atins:d.obiectiv_atins } }) : null
   ]);
 }
 
@@ -11725,7 +11730,12 @@ function ProductivityReports({ month, dept, rangeMode }) {
       display:'grid', gridTemplateColumns:'repeat(2, minmax(0, 1fr))', gap:16, alignItems:'start',
       opacity: isForecastResp ? 0.92 : 1
     } },
-      filtered.map(function(d){ return h(ProdDeptCard, { key:d.department, d:d, isForecast:isForecastResp }); }))
+      filtered.map(function(d){
+        // Tabelul zilnic sta in cardul fiecarui departament; are sens doar pe O luna reala (pe
+        // interval agregat nu exista zile comune, pe luna viitoare nu exista date).
+        return h(ProdDeptCard, { key:d.department, d:d, isForecast:isForecastResp,
+          dailyMonth: (!isForecastResp && months === 1) ? month : null });
+      }))
   ]);
 }
 
@@ -11739,6 +11749,121 @@ var PROD_CATEGORIE_LABELS = { cargobox:'CargoBox', calibrare:'Calibrare', demont
   // Reclamații: cele două praguri de timp, măsurate din momentul înregistrării reclamației.
   contact:'Contact (preluare)', solutionare:'Soluționare' };
 function prodCategorieLabel(c) { return PROD_CATEGORIE_LABELS[c] || (c ? (c.charAt(0).toUpperCase() + c.slice(1)) : ''); }
+
+// ── Productivitate zilnică (tab Rapoarte) ─────────────────────────────────────
+// DE CE: scorul lunar spune CÎT s-a atins, nu CÎND s-a pierdut. O lună la 94% poate ascunde o zi la
+// 78% — aici se vede ziua și obiectivul care a tras-o în jos, ca să poți inspecta cauza.
+//
+// Colapsat implicit, iar datele se cer la PRIMA deschidere: endpoint-ul recalculează toate
+// obiectivele pe toate zilele lunii, deci nu se plătește dacă nimeni nu deschide panoul.
+//
+// Convenții (aceleași explicate în tooltip-ul din UI):
+//   - ziua unui element = ziua REZOLVĂRII (ca luna în raportul lunar);
+//   - un obiectiv fără nimic măsurabil în ziua respectivă NU intră în media zilei (spre deosebire de
+//     scorul lunar, unde un obiectiv gol contează 100%) — altfel zilele slabe s-ar ascunde;
+//   - de aici: media zilelor NU e egală cu scorul lunar (numitori diferiți).
+function ProdDeptDailyTable({ dept, month, target }) {
+  var [open, setOpen] = useState(false);
+  var [payload, setPayload] = useState(null);   // { month, departments:[unul] }
+  var [err, setErr] = useState(null);
+  var [loading, setLoading] = useState(false);
+
+  // Se cere DOAR departamentul cardului: fiecare card își deschide propriul tabel, deci un
+  // request per card deschis (0.3s) în loc de unul pentru toate șase (1s) la fiecare deschidere.
+  useEffect(function(){
+    if (!open) return;
+    if (payload && payload.month === month) return;
+    if (loading) return;
+    var alive = true;
+    setLoading(true); setErr(null);
+    api('/productivity/daily?month=' + encodeURIComponent(month) + '&department=' + encodeURIComponent(dept))
+      .then(function(r){ if (!alive) return; setPayload(r); setLoading(false); })
+      .catch(function(e){ if (!alive) return; setErr(String((e && e.message) || e)); setLoading(false); });
+    return function(){ alive = false; };
+  }, [open, month, dept]);
+
+  var WD = ['', 'Lu', 'Ma', 'Mi', 'Jo', 'Vi', 'Sâ', 'Du'];
+  var th = { textAlign:'left', padding:'6px 8px', fontSize:10.5, fontWeight:700, color:'var(--t3)',
+             textTransform:'uppercase', letterSpacing:'0.04em', whiteSpace:'nowrap', background:'var(--bg2)',
+             borderBottom:'1px solid var(--bd)' };
+  var thN = Object.assign({}, th, { textAlign:'right' });
+  var td  = { padding:'6px 8px', fontSize:12.5, color:'var(--t2)', borderBottom:'1px solid var(--bd)', whiteSpace:'nowrap' };
+  var tdN = Object.assign({}, td, { textAlign:'right', fontVariantNumeric:'tabular-nums' });
+
+  // Aceeași convenție de culoare ca gauge-ul: verde ≥ obiectiv real, galben ≥ minim, roșu sub.
+  function pctColor(v, t) {
+    if (v == null) return 'var(--t3)';
+    if (!t || t.real == null) return 'var(--tx)';
+    if (v >= t.real) return 'var(--gn)';
+    if (t.minim != null && v >= t.minim) return 'var(--yw)';
+    return 'var(--rd)';
+  }
+
+  var body = null;
+  if (loading) body = h('div', { style:{ padding:'10px 2px', color:'var(--t3)', fontSize:12.5 } }, 'Se încarcă…');
+  else if (err) body = h('div', { style:{ padding:'10px 2px', color:'var(--rd)', fontSize:12.5 } }, 'Eroare: ' + err);
+  else if (payload) {
+    var d = (payload.departments || []).filter(function(x){ return x.department === dept; })[0]
+         || (payload.departments || [])[0];
+    var objs = (d && d.obiective) || [];
+    var zile = ((d && d.zile) || []).filter(function(z){ return z.volum > 0; });
+    body = zile.length === 0
+      ? h('div', { style:{ padding:'10px 2px', fontSize:12.5, color:'var(--t3)' } }, 'Nicio zi cu activitate în luna afișată.')
+      : h('div', { style:{ overflowX:'auto', border:'1px solid var(--bd)', borderRadius:8, marginTop:8 } },
+          h('table', { style:{ width:'100%', borderCollapse:'collapse' } }, [
+            h('thead', { key:'th' }, h('tr', {}, [
+              h('th', { key:'d', style:th }, 'Ziua')
+            ].concat(objs.map(function(o){
+              return h('th', { key:o.key, style:thN,
+                title:'Obiectiv ' + prodTipLabel(o.tip) + (o.categorie ? (' — ' + prodCategorieLabel(o.categorie)) : '')
+                    + ' · limită ' + o.limita_minute + ' ' + (o.unitate === 'secunde' ? 'sec' : 'min')
+                    + ' · pondere ' + o.pondere + '%' },
+                prodTipLabel(o.tip) + (o.categorie ? (' ' + prodCategorieLabel(o.categorie)) : ''));
+            })).concat([
+              h('th', { key:'v', style:thN, title:'Elemente rezolvate în ziua respectivă (toate obiectivele)' }, 'Volum'),
+              h('th', { key:'tp', style:thN, title:'Media ponderată a obiectivelor care au avut activitate în ziua respectivă' }, 'TOTAL')
+            ]))),
+            h('tbody', { key:'tb' }, zile.map(function(z){
+              var byKey = {};
+              (z.obiective || []).forEach(function(o){ byKey[o.key] = o; });
+              var weekend = z.weekday === 6 || z.weekday === 7;
+              return h('tr', { key:z.day, style: weekend ? { background:'color-mix(in srgb, var(--bd) 22%, transparent)' } : null }, [
+                h('td', { key:'d', style:Object.assign({}, td, { color:'var(--tx)', fontWeight:600 }) },
+                  z.day.slice(8) + '.' + z.day.slice(5,7) + ' · ' + WD[z.weekday])
+              ].concat(objs.map(function(o){
+                var c = byKey[o.key];
+                if (!c || c.measurable === 0) {
+                  return h('td', { key:o.key, style:Object.assign({}, tdN, { color:'var(--t3)' }),
+                    title: c && c.total ? (c.total + ' element(e), niciunul măsurabil') : 'nimic rezolvat în ziua asta' },
+                    c && c.total ? ('— (' + c.total + ')') : '—');
+                }
+                return h('td', { key:o.key, style:Object.assign({}, tdN, { color:pctColor(c.achieved, target), fontWeight:600 }),
+                  title: c.in_timp + ' în timp din ' + c.measurable + ' măsurabile (' + c.total + ' în total)' },
+                  [ h('span', { key:'p' }, Number(c.achieved).toFixed(1) + '%'),
+                    h('span', { key:'n', style:{ color:'var(--t3)', fontWeight:400, marginLeft:4, fontSize:10.5 } }, '(' + c.measurable + ')') ]);
+              })).concat([
+                h('td', { key:'v', style:tdN }, z.volum),
+                h('td', { key:'tp', style:Object.assign({}, tdN, { color:pctColor(z.total_pct, target), fontWeight:800 }),
+                  title:'Pondere activă în ziua asta: ' + z.pondere_activa + '%' },
+                  z.total_pct == null ? '—' : (Number(z.total_pct).toFixed(1) + '%'))
+              ]));
+            }))
+          ]));
+  }
+
+  return h('div', { key:'daily', style:{ marginTop:14, borderTop:'1px solid var(--bd)', paddingTop:10 } }, [
+    h('div', { key:'hdr', onClick:function(){ setOpen(!open); },
+      style:{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', userSelect:'none' } }, [
+      h('span', { key:'ch', style:{ display:'inline-block', transition:'transform .15s', transform: open ? 'rotate(90deg)' : 'none', color:'var(--t3)', fontSize:11 } }, '▶'),
+      h('span', { key:'t', style:{ fontSize:13, fontWeight:800, color:'var(--tx)' } }, 'Productivitate zilnică'),
+      h('span', { key:'i', style:{ marginLeft:'auto', fontSize:10.5, color:'var(--t3)', borderBottom:'1px dotted var(--t3)' },
+        title:'Ziua unui element = ziua rezolvării, ca luna în raportul lunar. Un obiectiv fără nimic '
+            + 'măsurabil în ziua respectivă nu intră în media zilei (în scorul lunar, un obiectiv gol '
+            + 'contează 100%) — de aceea media zilelor nu e egală cu scorul lunar.' }, 'cum se calculează?')
+    ]),
+    open ? body : null
+  ]);
+}
 
 function ProdDeptConfigCard({ cfg }) {
   var dept = cfg.department;
@@ -12892,13 +13017,14 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
     { name: 'Apeluri', icon: 'call', accent: 'var(--gn)', azi: true, bars: [
       { label: 'Răspunse', v: ap.azi || 0, c: C_DONE }
     ]},
-    // Reclamații: doar cele două stări deschise (decizie business owner, 2026-08-18).
-    // „Primite azi" / „Rezolvate azi" au fost scoase — pe un monitor de perete conta ce e
-    // nerezolvat ACUM, iar cele două seturi (primite vs rezolvate) nu sunt un flux comparabil.
-    // status CTS: 1 = new (înregistrată, nepreluată), 2 = in progress.
+    // Reclamații: doar două cifre (decizie business owner, 2026-08-18) — cîte s-au înregistrat în
+    // luna curentă și cîte sînt acum în lucru. „Primite azi" / „Rezolvate azi" au fost scoase (pe o
+    // singură zi cifrele sînt aproape mereu 0 și nu sînt un flux comparabil: o reclamație primită
+    // ieri și rezolvată azi apărea doar în a doua). „Deschise" (status CTS 1 = new) nu se afișează:
+    // în CTS reclamațiile nu stau în starea 'new', deci bara ar fi permanent goală.
     { name: 'Reclamații', icon: 'alert', accent: 'var(--rd)', bars: [
-      { label: 'Deschise', v: rc.noi || 0,      c: C_NEW },
-      { label: 'În lucru', v: rc.in_lucru || 0, c: C_WIP }
+      { label: 'Total lună', v: rc.total_luna || 0, c: C_NEW },
+      { label: 'În lucru',   v: rc.in_lucru || 0,   c: C_WIP }
     ]}
   ];
 

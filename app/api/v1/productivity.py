@@ -173,6 +173,23 @@ def get_report(month: Optional[str] = Query(None),
     return {"month": f"{label_from} – {label_to}", "months": months, "departments": aggregated}
 
 
+@router.get("/productivity/daily")
+def get_daily(month: Optional[str] = Query(None),
+              department: Optional[str] = Query(None),
+              db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Productivitate pe ZILE, defalcata pe obiective (tab Rapoarte -> „Productivitate zilnica").
+
+    Aceleasi randuri ca raportul lunar (`breakdown_rows`), grupate pe ziua rezolvarii. Fara
+    `department` -> toate departamentele configurate, ca la /report.
+    """
+    y, m = _parse_month(db, month)
+    depts = [department] if department else _configured_departments(db)
+    return {
+        "month": f"{y:04d}-{m:02d}",
+        "departments": [P.daily_report(db, d, y, m) for d in depts],
+    }
+
+
 @router.get("/productivity/forecast")
 def get_forecast(month: Optional[str] = Query(None),
                  months: int = Query(1, ge=1, le=12),
@@ -899,7 +916,12 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             -- reclamație înregistrată dar încă nepreluată, și una în lucru. `deschise` de mai sus
             -- rămâne suma lor (folosit de blocul `sesizari`), nu se schimbă sensul cheii vechi.
             COUNT(*) FILTER (WHERE noua)     AS noi,
-            COUNT(*) FILTER (WHERE in_lucru) AS in_lucru
+            COUNT(*) FILTER (WHERE in_lucru) AS in_lucru,
+            -- Monitorul arata DOUA cifre (decizie business owner, 2026-08-18): cite reclamatii
+            -- s-au inregistrat in luna curenta si cite sint acum in lucru. "Deschise" (status 1)
+            -- iese din card: in CTS reclamatiile nu stau in 'new' -- pe eșantionul curent sint 0
+            -- randuri cu status 1, deci bara ar fi fost permanent goala.
+            COUNT(*) FILTER (WHERE luna_curenta) AS total_luna
         FROM (
             SELECT qe.entity AS entity,
                    qe.created_at AS creat,
@@ -909,11 +931,28 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    (qe.status IS DISTINCT FROM 3)                               AS deschisa,
                    -- status CTS: 1 = new, 2 = in progress, 3 = solved (vezi migrația 20260813d)
                    (qe.status = 1)                                              AS noua,
-                   (qe.status = 2)                                              AS in_lucru
+                   (qe.status = 2)                                              AS in_lucru,
+                   (date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                      = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))       AS luna_curenta
             FROM cts_quality_evaluation qe
-            -- department_id (CTS) -> slug-ul nostru. LATERAL + LIMIT 1: `cts_dv_employee` are
-            -- rânduri multiple per persoană, iar `department_id` e TEXT acolo și INT aici.
-            JOIN LATERAL (
+            -- ATRIBUIRE = departamentul persoanei EVALUATE (`responsible_id`), cu
+            -- `department_id`-ul din CTS doar ca fallback. Pina la v2.13.0 monitorul folosea NUMAI
+            -- fallback-ul, deci punea reclamatia pe alt departament decit pagina Reclamatii, care
+            -- foloseste `COALESCE(ev.department, dep.department)`: o reclamatie inregistrata in CTS
+            -- pe "Suport 1", dar cu responsabil din Comercial, aparea pe cardul Suport 1 si in
+            -- lista la Comercial. Aceeasi expresie in ambele locuri = aceeasi cifra.
+            LEFT JOIN LATERAL (
+                SELECT e.department
+                FROM cts_dv_employee dv
+                JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+                WHERE dv.admin_id = qe.responsible_id::text
+                ORDER BY e.enabled DESC, e.id
+                LIMIT 1
+            ) ev ON true
+            -- Fallback: departamentul dominant al `department_id`-ului din CTS. LATERAL + LIMIT 1:
+            -- `cts_dv_employee` are rânduri multiple per persoană, iar `department_id` e TEXT acolo
+            -- și INT aici.
+            LEFT JOIN LATERAL (
                 SELECT e.department
                 FROM cts_dv_employee dv
                 JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
@@ -923,7 +962,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                 LIMIT 1
             ) dep ON true
             WHERE qe.deleted_at IS NULL
-              AND dep.department = ANY(:depts)
+              AND COALESCE(ev.department, dep.department) = ANY(:depts)
         ) r
     """)
     try:
@@ -932,7 +971,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         # Monitorul e un ecran de perete: o problemă pe sursa de reclamații nu are voie să
         # doboare tot payload-ul (mail/task/apel rămân valabile). Se raportează 0 și se loghează.
         logger.exception("monitor_live reclamatii (quality evaluation)")
-        recl_row = (0, 0, 0, 0, 0, 0, 0, 0)
+        recl_row = (0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     # Ce s-a rezolvat azi, pe CATEGORIA EMAILULUI (informație / sesizare / reclamație).
     # Atenție la cheia 'reclamatie' de aici: e categoria pusă pe mail de operator, NU o
@@ -1239,19 +1278,32 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    COUNT(*) FILTER (WHERE rezolvat_azi) AS rezolvate_azi,
                    COUNT(*) FILTER (WHERE deschisa)     AS deschise,
                    COUNT(*) FILTER (WHERE noua)         AS noi,
-                   COUNT(*) FILTER (WHERE in_lucru)     AS in_lucru
+                   COUNT(*) FILTER (WHERE in_lucru)     AS in_lucru,
+                   COUNT(*) FILTER (WHERE luna_curenta) AS total_luna
             FROM (
-                SELECT dep.department AS dept,
+                SELECT COALESCE(ev.department, dep.department) AS dept,
                        (DATE(qe.created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS primit_azi,
                        (qe.status = 3
                         AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
                        (qe.status IS DISTINCT FROM 3)                               AS deschisa,
                        (qe.status = 1)                                              AS noua,
-                       (qe.status = 2)                                              AS in_lucru
+                       (qe.status = 2)                                              AS in_lucru,
+                       (date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                          = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))       AS luna_curenta
                 FROM cts_quality_evaluation qe
-                -- department_id (CTS) -> slug-ul nostru, dedus din angajatii mapati. LATERAL +
-                -- LIMIT 1: `cts_dv_employee` are randuri multiple per persoana.
-                JOIN LATERAL (
+                -- Departamentul persoanei EVALUATE (`responsible_id`) — aceeasi regula ca pagina
+                -- Reclamatii; vezi nota de la interogarea de grup.
+                LEFT JOIN LATERAL (
+                    SELECT e.department
+                    FROM cts_dv_employee dv
+                    JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+                    WHERE dv.admin_id = qe.responsible_id::text
+                    ORDER BY e.enabled DESC, e.id
+                    LIMIT 1
+                ) ev ON true
+                -- Fallback: department_id (CTS) -> slug-ul nostru, dedus din angajatii mapati.
+                -- LATERAL + LIMIT 1: `cts_dv_employee` are randuri multiple per persoana.
+                LEFT JOIN LATERAL (
                     SELECT e.department
                     FROM cts_dv_employee dv
                     JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
@@ -1263,12 +1315,12 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                     LIMIT 1
                 ) dep ON true
                 WHERE qe.deleted_at IS NULL
-                  AND dep.department = ANY(:depts)
+                  AND COALESCE(ev.department, dep.department) = ANY(:depts)
             ) s
             GROUP BY 1
-        """, 5)
+        """, 6)
 
-        _z4, _z3, _z2 = (0, 0, 0, 0), (0, 0, 0, 0, 0), (0, 0)
+        _z4, _z3, _z2 = (0, 0, 0, 0), (0, 0, 0, 0, 0, 0), (0, 0)
         per_dept = [
             {
                 "department": d,
@@ -1300,6 +1352,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                     "deschise":      d_recl.get(d, _z3)[2],
                     "noi":           d_recl.get(d, _z3)[3],
                     "in_lucru":      d_recl.get(d, _z3)[4],
+                    "total_luna":    d_recl.get(d, _z3)[5],
                 },
             }
             for d in depts
@@ -1358,6 +1411,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             # Cele doua stari afisate pe monitor: nepreluate + in lucru (suma = `deschise`).
             "noi":           int(recl_row[6] or 0),
             "in_lucru":      int(recl_row[7] or 0),
+            "total_luna":    int(recl_row[8] or 0),
         },
         # SESIZĂRI + RECLAMAȚII, cheile istorice. Partea de SESIZARE rămâne pe categoria
         # emailului (nu există altă sursă), partea de RECLAMAȚIE vine acum din Quality

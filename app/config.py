@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # IRIS Gateway
     iris_api_url: str = "https://iris.cargotrack.ro"
     iris_api_key: str = ""
+    # Cheia dedicata CARGO360 pentru /clients/contact-list. Declarata aici ca sa fie citita si din
+    # `.env` (pydantic), nu doar din environment: sub systemd exista `EnvironmentFile`, dar orice
+    # rulare in afara lui (dev local, script manual, cron fara env) vedea `os.getenv` gol si
+    # sync-ul de clienti/vehicule/contracte se opreste cu "IRIS_MAILGUARD_API_KEY missing".
+    iris_mailguard_api_key: str = ""
 
     # CTS ADMIN (API key generated random; CTS ADMIN trebuie să-l folosească)
     cts_admin_api_key: str = ""
