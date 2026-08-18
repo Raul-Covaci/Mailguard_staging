@@ -325,6 +325,18 @@ function catCell(cat, ai_status, res) {
   return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } }, [catBadge(cat), confPct(res)]);
 }
 
+// Celulă Categorie pentru APELURI. Centrala scrie cîte un rînd per leg (ring paralel, transfer,
+// reapelare): un leg NO ANSWER / BUSY / ANSWERED de 0-1s nu are înregistrare, deci nu poate fi
+// clasificat NICIODATĂ — „neprocesat" sugera o coadă blocată. Aceeași regulă ca
+// `_APEL_REAL_CALL_SQL` din productivity.py, care le scoate și din KPI.
+function callCatCell(c) {
+  var real = c.call_status === 'ANSWERED' && (c.duration_seconds || 0) > 1;
+  if (!c.ai_category && !real) {
+    return h('span', { style: { color: 'var(--t3)', fontSize: 11 }, title: 'Leg de centrală fără conversație (' + (c.call_status || '—') + ', ' + (c.duration_seconds || 0) + 's) — nu se clasifică' }, 'fără conversație');
+  }
+  return catCell(c.ai_category, null, c.ai_result);
+}
+
 // ── Departamente (8) — slug -> etichetă afișată + culoare badge. Sincron cu department_classifier.py ──
 const DEPT_LABELS = {
   suport_1: 'Suport 1', suport_2: 'Suport 2', suport_3: 'Suport 3', taxe_drum: 'Taxe de drum',
@@ -12870,15 +12882,23 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
       { label: 'În lucru',    v: tk.in_progress || 0,   c: C_WIP },
       { label: 'Noi',         v: tk.noi || tk.pending || 0, c: C_NEW }
     ]},
+    // Apeluri: sursa e centrala (While1), aceeași cu pagina Apeluri (v2.12.0). „Răspunse" numără
+    // conversații reale, nu legs de ring/transfer de 0-1s. „Pierdute" = apeluri la care nimeni
+    // n-a răspuns și de la care nu s-a mai prins nimic în ±15 min — nu orice rând 'NO ANSWER'
+    // (centrala sună în paralel, deci legs nepreluate apar și la apelurile preluate).
+    // Doar „Răspunse" pe card: apelurile PIERDUTE nu se pot împărți pe departamente (centrala nu
+    // scrie agent pe un apel pe care nu l-a preluat nimeni — 11% acoperire), deci se afișează o
+    // singură dată, în capul monitorului, ca cifră de firmă.
     { name: 'Apeluri', icon: 'call', accent: 'var(--gn)', azi: true, bars: [
-      { label: 'Total azi',   v: ap.azi || 0,           c: C_DONE }
+      { label: 'Răspunse', v: ap.azi || 0, c: C_DONE }
     ]},
-    // „Deschise" e ancora: primite_azi și rezolvate_azi sunt seturi diferite (o reclamație
-    // primită ieri și rezolvată azi apare doar la a doua), deci singure pot arăta 0/1.
+    // Reclamații: doar cele două stări deschise (decizie business owner, 2026-08-18).
+    // „Primite azi" / „Rezolvate azi" au fost scoase — pe un monitor de perete conta ce e
+    // nerezolvat ACUM, iar cele două seturi (primite vs rezolvate) nu sunt un flux comparabil.
+    // status CTS: 1 = new (înregistrată, nepreluată), 2 = in progress.
     { name: 'Reclamații', icon: 'alert', accent: 'var(--rd)', bars: [
-      { label: 'Primite azi',   v: rc.primite_azi || 0,   c: C_NEW },
-      { label: 'Rezolvate azi', v: rc.rezolvate_azi || 0, c: C_DONE },
-      { label: 'Deschise',      v: rc.deschise || 0,      c: C_WIP }
+      { label: 'Deschise', v: rc.noi || 0,      c: C_NEW },
+      { label: 'În lucru', v: rc.in_lucru || 0, c: C_WIP }
     ]}
   ];
 
@@ -12891,7 +12911,8 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   // Ritmul se raportează la VOLUMUL INTRAT azi (intrate_azi), nu la câte au rămas în starea
   // 'new'. Barele „Noi" arată restanța neatinsă; numitorul de aici trebuie să fie tot ce a
   // sosit azi, altfel ritmul iese absurd (166 rezolvate / 1 nou = 16600%).
-  var totalIntratAzi = (em.intrate_azi || 0) + (tk.intrate_azi || 0) + (ap.azi || 0);
+  // Apelurile intrate = răspunse + pierdute: un apel pierdut a sosit, chiar dacă n-a fost tratat.
+  var totalIntratAzi = (em.intrate_azi || 0) + (tk.intrate_azi || 0) + (ap.azi || 0) + (ap.pierdute_azi || 0);
   // Ritm = rezolvat azi / intrat azi. Peste 100% înseamnă că se lichidează și restanțe din
   // zilele trecute — real, dar valorile brute explodează (Suport 3 a ieșit 1400% pe 03.08),
   // ceea ce e zgomot pe un monitor de perete. Plafonăm afișarea la 999% și marcăm verde orice
@@ -13067,6 +13088,15 @@ function ProductivityDashboard({ group, refreshMin }) {
     h('div', { key:'l', style:{ display:'flex', alignItems:'center', gap:10 } }, [
       h('span', { key:'ti', style:{ fontWeight:700, fontSize:14, color:'var(--tx)' } }, 'Monitor Productivitate — ' + label),
       data ? h('span', { key:'mo', style:{ fontSize:11, color:'var(--t3)', background:'var(--bg3)', padding:'2px 9px', borderRadius:20 } }, data.month || '') : null,
+      // Apeluri pierdute azi — cifră de firmă, nu de departament (vezi MonitorDeptCard).
+      (live && live.apeluri && live.apeluri.pierdute_azi_total != null)
+        ? h('span', { key:'lost', title:'Apeluri primite azi la care nu a răspuns nimeni și de la care nu s-a mai prins nimic în ±15 min. Nu se pot împărți pe departamente: centrala nu înregistrează agent pe un apel nepreluat.',
+            style:{ display:'inline-flex', alignItems:'center', gap:5, fontSize:11, fontWeight:700,
+              color: live.apeluri.pierdute_azi_total > 0 ? 'var(--rd)' : 'var(--t3)',
+              border:'1px solid var(--bd)', borderRadius:20, padding:'2px 9px', background:'var(--bg3)' } },
+            [ h('span', { key:'i', style:{ display:'flex' } }, h(MonitorIcon, { name:'call', size:12 })),
+              h('span', { key:'t' }, 'Pierdute azi: ' + (live.apeluri.pierdute_azi_total || 0)) ])
+        : null,
       h('span', { key:'live', style:{ display:'inline-flex', alignItems:'center', gap:6, fontSize:10, fontWeight:700, letterSpacing:'0.1em',
         color: stale ? 'var(--yw)' : 'var(--gn)', border:'1px solid var(--bd)', borderRadius:20, padding:'2px 9px', background:'var(--bg3)' } }, [
         h('span', { key:'dot', className: stale ? '' : 'mg-beat', style:{ width:7, height:7, borderRadius:'50%', background: stale ? 'var(--yw)' : 'var(--gn)', display:'inline-block' } }),
@@ -14946,7 +14976,7 @@ function CallDetail({ callId, onClose, allIds, currentIndex, onNext, onPrev }) {
             metaField('Direcție', directionBadge(call.direction)),
             metaField('Client', clientLine),
             metaField('Durată', durationLabel(call.duration_seconds)),
-            metaField('Categorie', catCell(call.ai_category, null, call.ai_result)),
+            metaField('Categorie', callCatCell(call)),
             metaField('Stil', toneBadge(call.ai_tone) || h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
             metaField('Agent', assigneeCell(call.ai_assignee, call.ai_assignee_result)),
             metaField('Status', h('span', { style: { fontSize: 12, color: s.col } }, s.txt)),
@@ -15092,7 +15122,7 @@ function ApelPage({ setTopbarRight }) {
             c.operator_name || assigneeCell(c.ai_assignee, null)),
           h('td', { key: 'dep' }, c.operator_department ? deptBadge(c.operator_department) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
           h('td', { key: 'dur', style: { fontSize: 12, color: 'var(--t2)' } }, durationLabel(c.duration_seconds)),
-          h('td', { key: 'cat', style: { fontSize: 12, whiteSpace: 'nowrap' } }, catCell(c.ai_category, null, c.ai_result)),
+          h('td', { key: 'cat', style: { fontSize: 12, whiteSpace: 'nowrap' } }, callCatCell(c)),
           h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, callStatusBadge(c))
         ]); }))
       ])

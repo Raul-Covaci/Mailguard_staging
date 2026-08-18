@@ -738,10 +738,8 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         JOIN employee_department_mapping edm
           ON d.closed_by_employee_id = edm.id AND edm.department = ANY(:depts)
     """
-    _dep_call = """
-        JOIN employee_department_mapping edm
-          ON lower(c.cts_assignee_email) = lower(edm.email) AND edm.department = ANY(:depts)
-    """
+    # Apelurile nu mai vin din CTS (v2.12.0): atribuirea pe departament se face cu
+    # `P._APEL_AGENT_JOIN` (agentul din centrală), deci join-ul pe assignee-ul CTS a dispărut.
 
     # emailuri (cts_ground_truth) — "azi" în fus local
     # FEREASTRA: toate contoarele de stare deschisă („în lucru", „noi") se raportează la ce a
@@ -786,19 +784,43 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         WHERE {_EFF_DEPT_TASK} = ANY(:depts)
     """), _p).fetchone()
 
-    # apeluri azi + cele încă neînchise (status 'new' / 'in progress')
+    # APELURI AZI — sursa e `calls` (While1), aceeași pe care o arată pagina Apeluri și canalul
+    # „Apeluri" din Productivitate (v2.12.0). Până aici se citea din `cts_calls_ground_truth`
+    # (Apeluri CTS): alt set de date — doar apelurile care au ajuns tichet în CTS — și alt ciclu de
+    # viață (new → in progress → solved), deci monitorul și raportul lunar spuneau cifre diferite
+    # pentru aceeași zi.
+    #
+    # Ce se poate spune și ce NU, din centrală:
+    #   - RĂSPUNS / PIERDUT: da. Un rând CDR apare abia după ce apelul s-a încheiat.
+    #   - `in_curs`: NU există. Un apel în desfășurare nu e încă în CDR, deci cheia rămâne în
+    #     răspuns (compatibilitate) dar e mereu 0 — nu mai e o restanță „neînchisă" ca în CTS.
+    # Filtrele de leg (apel real / pierdut) sunt definițiile unice din productivity.py.
     call_row = db.execute(text(f"""
+        {P._APEL_AGENT_CTE}
         SELECT
-            COUNT(*) FILTER (WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS azi,
-            COUNT(*) FILTER (WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
-                             AND lower(c.cts_status) IN ('solved','closed'))                    AS rezolvate_azi,
-            -- doar apelurile de AZI încă neînchise; fără filtrul pe zi ar aduna
-            -- restanțe istorice (358 apeluri vechi niciodată închise), nu apeluri în curs
-            COUNT(*) FILTER (WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
-                             AND lower(c.cts_status) IN ('new','in progress'))                   AS in_curs
-        FROM cts_calls_ground_truth c
-        {_dep_call}
+            COUNT(*) FILTER (WHERE {P._APEL_REAL_CALL_SQL})                              AS azi,
+            COUNT(*) FILTER (WHERE {P._APEL_UNANSWERED_SQL} AND {P._APEL_LOST_CALL_SQL}) AS pierdute_azi
+        FROM calls c
+        {P._APEL_AGENT_JOIN}
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+          AND edm.department = ANY(:depts)
     """), _p).fetchone()
+
+    # APELURI PIERDUTE, LA NIVEL DE FIRMĂ. Nu se pot împărți pe departamente: un apel pierdut n-a
+    # fost preluat de nimeni, deci centrala nu scrie agent pe el — pe august 2026, din 666 apeluri
+    # efectiv pierdute doar 72 (11%) au `agent_extension`. Restul au doar linia apelată
+    # (`callee_number`: 0374430060 linia principală, 022022292 linia MD), iar linia e a firmei, nu
+    # a unui departament. De aceea cifra asta se afișează o singură dată, în capul monitorului, și
+    # NU pe cardurile per departament — acolo ar arăta 11% din realitate.
+    lost_row = db.execute(text(f"""
+        SELECT COUNT(*)
+        FROM calls c
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_UNANSWERED_SQL}
+          AND {P._APEL_LOST_CALL_SQL}
+          AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+    """)).fetchone()
 
     # SESIZĂRI — categorie de email, nu există tabelă dedicată. Același COALESCE ca în
     # productivity._fetch_email_rows (ground truth primează, ai_category e fallback pentru ce
@@ -837,14 +859,22 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         ) s
     """), _p).fetchone()
 
-    # sesizări/reclamații venite pe telefon — aceleași categorii pe apeluri
+    # Sesizări/reclamații venite pe telefon — aceleași categorii, dar pe sursa Apeluri (`calls`),
+    # ca restul contoarelor de apel. Categoria e cea pusă de AI pe transcript (`ai_category`);
+    # varianta anterioară citea `cts_calls_ground_truth.cts_category` (încadrarea omului în CTS),
+    # care e mai bună ca adevăr dar apare abia după ce apelul devine tichet — deci pe monitorul de
+    # AZI arăta sistematic mai puțin decât lista de apeluri.
     sesiz_call = db.execute(text(f"""
+        {P._APEL_AGENT_CTE}
         SELECT
-            COUNT(*) FILTER (WHERE lower(cts_category) = 'sesizare')   AS sesizari_azi,
-            COUNT(*) FILTER (WHERE lower(cts_category) = 'reclamatie') AS reclamatii_azi
-        FROM cts_calls_ground_truth c
-        {_dep_call}
-        WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
+            COUNT(*) FILTER (WHERE lower(c.ai_category) = 'sesizare')   AS sesizari_azi,
+            COUNT(*) FILTER (WHERE lower(c.ai_category) = 'reclamatie') AS reclamatii_azi
+        FROM calls c
+        {P._APEL_AGENT_JOIN}
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_REAL_CALL_SQL}
+          AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+          AND edm.department = ANY(:depts)
     """), _p).fetchone()
 
     # RECLAMAȚII (agregat pe grup) — sursa e modulul Quality Evaluation din CTS
@@ -864,14 +894,22 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             COUNT(*) FILTER (WHERE deschisa)                                    AS deschise,
             COUNT(*) FILTER (WHERE deschisa AND NOT primit_azi)                 AS restante,
             COUNT(*) FILTER (WHERE deschisa AND creat < NOW() - INTERVAL '7 days') AS peste_7z,
-            COUNT(*) FILTER (WHERE primit_azi AND entity = 'client_call_log')   AS apel_azi
+            COUNT(*) FILTER (WHERE primit_azi AND entity = 'client_call_log')   AS apel_azi,
+            -- Cele două stări pe care le arată monitorul (decizie business owner, 2026-08-18):
+            -- reclamație înregistrată dar încă nepreluată, și una în lucru. `deschise` de mai sus
+            -- rămâne suma lor (folosit de blocul `sesizari`), nu se schimbă sensul cheii vechi.
+            COUNT(*) FILTER (WHERE noua)     AS noi,
+            COUNT(*) FILTER (WHERE in_lucru) AS in_lucru
         FROM (
             SELECT qe.entity AS entity,
                    qe.created_at AS creat,
                    (DATE(qe.created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS primit_azi,
                    (qe.status = 3
                     AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
-                   (qe.status IS DISTINCT FROM 3)                               AS deschisa
+                   (qe.status IS DISTINCT FROM 3)                               AS deschisa,
+                   -- status CTS: 1 = new, 2 = in progress, 3 = solved (vezi migrația 20260813d)
+                   (qe.status = 1)                                              AS noua,
+                   (qe.status = 2)                                              AS in_lucru
             FROM cts_quality_evaluation qe
             -- department_id (CTS) -> slug-ul nostru. LATERAL + LIMIT 1: `cts_dv_employee` are
             -- rânduri multiple per persoană, iar `department_id` e TEXT acolo și INT aici.
@@ -894,7 +932,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         # Monitorul e un ecran de perete: o problemă pe sursa de reclamații nu are voie să
         # doboare tot payload-ul (mail/task/apel rămân valabile). Se raportează 0 și se loghează.
         logger.exception("monitor_live reclamatii (quality evaluation)")
-        recl_row = (0, 0, 0, 0, 0, 0)
+        recl_row = (0, 0, 0, 0, 0, 0, 0, 0)
 
     # Ce s-a rezolvat azi, pe CATEGORIA EMAILULUI (informație / sesizare / reclamație).
     # Atenție la cheia 'reclamatie' de aici: e categoria pusă pe mail de operator, NU o
@@ -947,11 +985,16 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
           AND {_EFF_DEPT_TASK} = ANY(:depts)
         GROUP BY 1
     """)
+    # Apeluri pe oră — tot din `calls` (While1), ca și contoarele de sus.
     h_call = _hourly(f"""
-        SELECT EXTRACT(hour FROM c.cts_started_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM cts_calls_ground_truth c
-        {_dep_call}
-        WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
+        {P._APEL_AGENT_CTE}
+        SELECT EXTRACT(hour FROM c.started_at)::int AS h, COUNT(*)
+        FROM calls c
+        {P._APEL_AGENT_JOIN}
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_REAL_CALL_SQL}
+          AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+          AND edm.department = ANY(:depts)
         GROUP BY 1
     """)
     h_dev = _hourly(f"""
@@ -989,21 +1032,22 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
           AND {_EFF_DEPT_TASK} = ANY(:depts)
         GROUP BY 1
     """)
-    # Apelurile: "intrate" = când a început apelul. Pentru "rezolvate" folosim
-    # momentul încheierii = start + durată; `changed_at` este NULL pe toate
-    # rândurile de apel, deci nu poate servi ca timp de închidere.
+    # Apelurile: "intrate" = când a început apelul; "rezolvate" = când s-a încheiat conversația
+    # (start + durată). În centrală un apel răspuns E rezolvat — nu există stare de „ticket
+    # deschis", deci cele două serii diferă doar prin ora de încadrare, nu prin mulțime.
     h_call_new = h_call
     h_call_done = _hourly(f"""
-        SELECT EXTRACT(hour FROM ((c.cts_started_at
-                 + make_interval(secs => COALESCE(c.cts_duration_seconds, 0)))
-                 AT TIME ZONE '{_TZ}'))::int AS h,
+        {P._APEL_AGENT_CTE}
+        SELECT EXTRACT(hour FROM (c.started_at
+                 + make_interval(secs => COALESCE(c.duration_seconds, 0))))::int AS h,
                COUNT(*)
-        FROM cts_calls_ground_truth c
-        {_dep_call}
-        WHERE lower(c.cts_status) IN ('solved','closed')
-          AND DATE((c.cts_started_at
-                 + make_interval(secs => COALESCE(c.cts_duration_seconds, 0)))
-                 AT TIME ZONE '{_TZ}') = CURRENT_DATE
+        FROM calls c
+        {P._APEL_AGENT_JOIN}
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_REAL_CALL_SQL}
+          AND (c.started_at + make_interval(secs => COALESCE(c.duration_seconds, 0)))::date
+              = {P._APEL_TODAY_RO_SQL}
+          AND edm.department = ANY(:depts)
         GROUP BY 1
     """)
     # ── ÎNCĂ DESCHISE, pe ora SOSIRII ──────────────────────────────────────
@@ -1033,12 +1077,19 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
           AND {_EFF_DEPT_TASK} = ANY(:depts)
         GROUP BY 1
     """)
+    # „Încă deschise" pe canalul apeluri = APELURI PIERDUTE la ora respectivă. Un apel nu rămâne
+    # deschis (vezi h_call_done), dar unul pierdut e exact echivalentul: a intrat și n-a fost
+    # tratat. Fără asta, bara portocalie a apelurilor ar fi mereu 0 pe monitor.
     h_call_open = _hourly(f"""
-        SELECT EXTRACT(hour FROM c.cts_started_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM cts_calls_ground_truth c
-        {_dep_call}
-        WHERE lower(c.cts_status) NOT IN ('solved','closed')
-          AND DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
+        {P._APEL_AGENT_CTE}
+        SELECT EXTRACT(hour FROM c.started_at)::int AS h, COUNT(*)
+        FROM calls c
+        {P._APEL_AGENT_JOIN}
+        WHERE c.direction = 'inbound'
+          AND {P._APEL_UNANSWERED_SQL}
+          AND {P._APEL_LOST_CALL_SQL}
+          AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+          AND edm.department = ANY(:depts)
         GROUP BY 1
     """)
     h_dev_open = _hourly(f"""
@@ -1147,15 +1198,20 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             GROUP BY 1
         """, 4)
 
+        # Apeluri per departament — aceeași sursă (`calls`) și exact aceleași filtre ca `call_row`,
+        # deci suma cardurilor = contorul de grup. Atribuirea e a agentului din centrală
+        # (`_APEL_AGENT_JOIN`): un leg fără agent înregistrat nu se poate pune pe niciun
+        # departament, deci nu apare nici în total, nici în carduri.
         d_call = _by_dept(f"""
+            {P._APEL_AGENT_CTE}
             SELECT edm.department AS dept,
-                   COUNT(*) FILTER (WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS azi,
-                   COUNT(*) FILTER (WHERE DATE(c.cts_started_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
-                                    AND lower(c.cts_status) IN ('solved','closed'))                    AS rezolvate_azi
-            FROM cts_calls_ground_truth c
-            JOIN employee_department_mapping edm
-              ON lower(c.cts_assignee_email) = lower(edm.email)
-            WHERE edm.department = ANY(:depts)
+                   COUNT(*) FILTER (WHERE {P._APEL_REAL_CALL_SQL})                              AS azi,
+                   COUNT(*) FILTER (WHERE {P._APEL_UNANSWERED_SQL} AND {P._APEL_LOST_CALL_SQL}) AS pierdute_azi
+            FROM calls c
+            {P._APEL_AGENT_JOIN}
+            WHERE c.direction = 'inbound'
+              AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
+              AND edm.department = ANY(:depts)
             GROUP BY 1
         """, 2)
 
@@ -1181,13 +1237,17 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             SELECT dept,
                    COUNT(*) FILTER (WHERE primit_azi)   AS primite_azi,
                    COUNT(*) FILTER (WHERE rezolvat_azi) AS rezolvate_azi,
-                   COUNT(*) FILTER (WHERE deschisa)     AS deschise
+                   COUNT(*) FILTER (WHERE deschisa)     AS deschise,
+                   COUNT(*) FILTER (WHERE noua)         AS noi,
+                   COUNT(*) FILTER (WHERE in_lucru)     AS in_lucru
             FROM (
                 SELECT dep.department AS dept,
                        (DATE(qe.created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS primit_azi,
                        (qe.status = 3
                         AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
-                       (qe.status IS DISTINCT FROM 3)                               AS deschisa
+                       (qe.status IS DISTINCT FROM 3)                               AS deschisa,
+                       (qe.status = 1)                                              AS noua,
+                       (qe.status = 2)                                              AS in_lucru
                 FROM cts_quality_evaluation qe
                 -- department_id (CTS) -> slug-ul nostru, dedus din angajatii mapati. LATERAL +
                 -- LIMIT 1: `cts_dv_employee` are randuri multiple per persoana.
@@ -1206,9 +1266,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                   AND dep.department = ANY(:depts)
             ) s
             GROUP BY 1
-        """, 3)
+        """, 5)
 
-        _z4, _z3, _z2 = (0, 0, 0, 0), (0, 0, 0), (0, 0)
+        _z4, _z3, _z2 = (0, 0, 0, 0), (0, 0, 0, 0, 0), (0, 0)
         per_dept = [
             {
                 "department": d,
@@ -1229,12 +1289,17 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                 },
                 "apeluri": {
                     "azi":           d_call.get(d, _z2)[0],
-                    "rezolvate_azi": d_call.get(d, _z2)[1],
+                    # In centrala un apel raspuns E incheiat: `rezolvate_azi` == `azi`, pastrat
+                    # pentru consumatorii vechi. Noutatea utila e `pierdute_azi`.
+                    "rezolvate_azi": d_call.get(d, _z2)[0],
+                    "pierdute_azi":  d_call.get(d, _z2)[1],
                 },
                 "reclamatii": {
                     "primite_azi":   d_recl.get(d, _z3)[0],
                     "rezolvate_azi": d_recl.get(d, _z3)[1],
                     "deschise":      d_recl.get(d, _z3)[2],
+                    "noi":           d_recl.get(d, _z3)[3],
+                    "in_lucru":      d_recl.get(d, _z3)[4],
                 },
             }
             for d in depts
@@ -1266,8 +1331,16 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         },
         "apeluri": {
             "azi":           int(call_row[0] or 0),
-            "rezolvate_azi": int(call_row[1] or 0),
-            "in_curs":       int(call_row[2] or 0),
+            # Un apel raspuns e incheiat in momentul in care apare in CDR, deci "rezolvate" e
+            # acelasi set ca "azi" -- cheia rimine pentru compatibilitate.
+            "rezolvate_azi": int(call_row[0] or 0),
+            # Subsetul atribuibil pe departamentele grupului (agentul pe care a sunat centrala).
+            "pierdute_azi":  int(call_row[1] or 0),
+            # Toate apelurile pierdute ale firmei azi — cifra reala, neatribuibila pe departament
+            # (vezi nota de la `lost_row`). Monitorul o arata o singura data, in cap.
+            "pierdute_azi_total": int(lost_row[0] or 0),
+            # `in_curs` nu exista in While1: un apel in desfasurare nu e inca in CDR. Ramine 0.
+            "in_curs":       0,
         },
         "device_ops": {
             "rezolvate_azi": int(dev_row[0] or 0),
@@ -1282,6 +1355,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             "restante":      int(recl_row[3] or 0),
             "peste_7z":      int(recl_row[4] or 0),
             "apel_azi":      int(recl_row[5] or 0),
+            # Cele doua stari afisate pe monitor: nepreluate + in lucru (suma = `deschise`).
+            "noi":           int(recl_row[6] or 0),
+            "in_lucru":      int(recl_row[7] or 0),
         },
         # SESIZĂRI + RECLAMAȚII, cheile istorice. Partea de SESIZARE rămâne pe categoria
         # emailului (nu există altă sursă), partea de RECLAMAȚIE vine acum din Quality

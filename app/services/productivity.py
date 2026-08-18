@@ -901,6 +901,51 @@ _APEL_AGENT_JOIN = r"""
 """
 _APEL_MINS_SQL = "COALESCE(c.ring_seconds, g.cts_response_seconds)"
 
+# Un rind din `calls` NU e un apel: centrala scrie cite un rind per LEG (ring paralel pe mai multe
+# aparate, transfer, reapelare imediata). Pe august 2026, din 4354 randuri 'inbound': 2199
+# 'NO ANSWER' de 0-1s, 16 'BUSY' si 12 'ANSWERED' de 0-1s => 2227 (51%) nu sint conversatii.
+# Caz real (10.08, +37369841796, acelasi agent): 12:02:38 ANSWERED 1s, 12:03:36 ANSWERED 213s,
+# 12:03:54 NO ANSWER 0s -- un singur apel vorbit, trei randuri in MG, doua aparind "neprocesate".
+#
+# De ce conteaza pentru SCOR, nu doar pentru volum: un leg fara conversatie nu are timp de raspuns
+# real, dar `backfill_ring_seconds` completeaza `ring_seconds` pe TOT intervalul (nu doar pe apelurile
+# raspunse), deci legs-urile moarte devin "masurabile" cu ~0s -- adica "on time" gratuit care umfla
+# procentul departamentului.
+#
+# Verificat pe august 2026 dupa filtrul de mai jos: 0 legs suprapuse din 2127 randuri si doar 14
+# perechi la sub 120s intr-o luna intreaga (reapelari reale, nu duplicate) => nu e nevoie de
+# deduplicare pe `linkedid`; filtrul singur elimina dublurile semnalate.
+_APEL_REAL_CALL_SQL = "c.call_status = 'ANSWERED' AND COALESCE(c.duration_seconds, 0) > 1"
+
+# `calls.started_at` e `timestamp WITHOUT time zone` si contine ora LOCALA RO exact cum o scrie
+# centrala (While1 `time`; verificat: call_id 1346015 e 12:02:38 in centrala si 12:02:38 in DB).
+# Deci NU se converteste: un `AT TIME ZONE 'Europe/Bucharest'` peste el il muta cu 3h si, pe un
+# Postgres cu sesiunea pe UTC, schimba si ziua apelurilor din primele ore ale dimineții. Pagina
+# Apeluri filtreaza deja direct pe `c.started_at`, deci asa cele doua pagini spun acelasi lucru.
+_APEL_DAY_SQL = "c.started_at::date"
+
+# „Azi" pentru apeluri, independent de `TimeZone`-ul sesiunii Postgres: `started_at` e ora locala
+# RO, deci ziua curenta trebuie citita si ea in RO. Cu `CURRENT_DATE` pe un server cu sesiunea pe
+# UTC, intre 00:00 si 03:00 RO monitorul ar arata inca ziua precedenta.
+_APEL_TODAY_RO_SQL = "(now() AT TIME ZONE 'Europe/Bucharest')::date"
+
+# APEL PIERDUT. NU e "orice rind NO ANSWER": centrala suna in paralel pe mai multe aparate, deci
+# leg-urile nepreluate apar 'NO ANSWER' chiar si cind apelul a fost de fapt raspuns pe alt aparat.
+# Pe august 2026: 2215 randuri NO ANSWER/BUSY, dar doar 659 apeluri efectiv pierdute.
+# Definitie: un leg neraspuns pentru care acelasi numar NU are nici un apel raspuns in +/-15 min.
+# Fereastra acopera si reapelarea imediata a clientului (cazul obisnuit: suna, nu prinde, suna iar).
+_APEL_LOST_CALL_SQL = """NOT EXISTS (
+        SELECT 1 FROM calls a
+        WHERE a.direction = 'inbound'
+          AND a.caller_number = c.caller_number
+          AND a.call_status = 'ANSWERED' AND COALESCE(a.duration_seconds, 0) > 1
+          AND a.started_at BETWEEN c.started_at - INTERVAL '15 minutes'
+                               AND c.started_at + INTERVAL '15 minutes'
+    )"""
+
+# Leg neraspuns (inclusiv BUSY) — complementul lui `_APEL_REAL_CALL_SQL` pe acelasi rind.
+_APEL_UNANSWERED_SQL = "NOT (c.call_status = 'ANSWERED' AND COALESCE(c.duration_seconds, 0) > 1)"
+
 # Varianta cu LEFT JOIN pe angajat, pentru LISTE (pagina Apeluri), nu pentru calcul: acolo un apel
 # neatribuibil trebuie sa ramina vizibil, cu operator gol, nu sa dispara din tabel. Derivata din
 # aceeasi constanta ca sa nu existe doua reguli de atribuire care pot diverge in timp.
@@ -917,7 +962,9 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
     """Apeluri PRIMITE ale operatorilor dept-ului -- (op_id, mins), unde `mins` e de fapt SECUNDE
     (timpul pana la raspuns).
 
-    Sursa e `calls` (While1); vezi nota de mai sus pentru directie, atribuire si masurabilitate.
+    Sursa e `calls` (While1) — aceeasi pe care o arata pagina Apeluri; vezi nota de mai sus pentru
+    directie, atribuire si masurabilitate. Se numara doar conversatiile reale
+    (`_APEL_REAL_CALL_SQL`): legs-urile de ring/transfer de 0-1s nu sint apeluri.
     Ziua trebuie sa fie una in care departamentul era activ -- filtru hibrid:
     pontaj (department_attendance) > program (department_schedule) > backward compat.
     Daca departamentul nu are niciun program configurat (department_schedule gol): includem tot."""
@@ -929,10 +976,10 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
             {_APEL_AGENT_JOIN}
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
-                AND da.work_date = (c.started_at AT TIME ZONE 'Europe/Bucharest')::date
+                AND da.work_date = {_APEL_DAY_SQL}
             LEFT JOIN department_schedule ds
                 ON ds.department = edm.department
-                AND ds.weekday = EXTRACT(ISODOW FROM (c.started_at AT TIME ZONE 'Europe/Bucharest'))::int
+                AND ds.weekday = EXTRACT(ISODOW FROM c.started_at)::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
@@ -940,7 +987,8 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
             ) dsc ON dsc.department = edm.department
             WHERE edm.department=:d
               AND c.direction = 'inbound'
-              AND date_trunc('month', c.started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+              AND {_APEL_REAL_CALL_SQL}
+              AND date_trunc('month', c.started_at)::date = :first
               AND (
                 CASE
                   WHEN da.work_date IS NOT NULL THEN da.present = true
@@ -1058,6 +1106,18 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
             return None
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=_TZ_UTC)
+        return ts.astimezone(_TZ_RO).isoformat()
+
+    def _iso_ro_naive(ts):
+        """Pentru `calls.started_at`: naiv, DEJA in ora locala RO (vezi _APEL_DAY_SQL).
+
+        `_iso` l-ar marca UTC si l-ar muta cu 3h, deci acelasi apel apărea la 12:02 pe pagina
+        Apeluri si la 15:02 in lista din Productivitate.
+        """
+        if ts is None:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_TZ_RO)
         return ts.astimezone(_TZ_RO).isoformat()
 
     out = []
@@ -1315,7 +1375,8 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 LEFT JOIN clients cl ON cl.id = c.client_id
                 WHERE edm.department=:d
                   AND c.direction = 'inbound'
-                  AND date_trunc('month', c.started_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+                  AND {_APEL_REAL_CALL_SQL}
+                  AND date_trunc('month', c.started_at)::date = :first
             """),
             {"d": department, "first": first},
         ).fetchall()
@@ -1325,11 +1386,13 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 "id": r.row_id, "op_id": r.op_id, "solved_by": r.op_name,
                 "client": r.client, "subiect": r.subiect, "categorie": r.categorie,
                 "telefon": r.telefon or None,
-                # Starea apelului din centrala: un 'NO ANSWER' apare in lista (a intrat, e volum)
-                # dar nu are timp de raspuns, deci iese 'nemasurat' -- fara coloana asta ar parea
-                # o eroare de calcul.
+                # Starea apelului din centrala. Lista arata acum doar conversatii reale
+                # (`_APEL_REAL_CALL_SQL`), deci e mereu 'ANSWERED'; coloana rimine pentru ca un
+                # apel raspuns fara timp de raspuns cunoscut (ring_seconds NULL, fara rand CTS)
+                # iese tot 'nemasurat' si altfel ar parea o eroare de calcul.
                 "call_status": r.call_status,
-                "created_at": _iso(r.p_start), "solved_at": _iso(r.p_solved or r.p_start),
+                "created_at": _iso_ro_naive(r.p_start),
+                "solved_at": _iso_ro_naive(r.p_solved or r.p_start),
                 "durata": round(secs, 1) if secs is not None else None,
                 "status": _bd_status(secs, limita, allow_zero=True),
             })
@@ -2874,17 +2937,17 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
         text(f"""
             {_APEL_AGENT_CTE}
             SELECT edm.id AS op_id,
-                   (c.started_at AT TIME ZONE 'Europe/Bucharest')::date AS call_day,
+                   {_APEL_DAY_SQL} AS call_day,
                    {_APEL_MINS_SQL} AS secs,
                    c.duration_seconds AS dur_secs
             FROM calls c
             {_APEL_AGENT_JOIN}
             LEFT JOIN department_attendance da
                 ON da.department = edm.department
-                AND da.work_date = (c.started_at AT TIME ZONE 'Europe/Bucharest')::date
+                AND da.work_date = {_APEL_DAY_SQL}
             LEFT JOIN department_schedule ds
                 ON ds.department = edm.department
-                AND ds.weekday = EXTRACT(ISODOW FROM (c.started_at AT TIME ZONE 'Europe/Bucharest'))::int
+                AND ds.weekday = EXTRACT(ISODOW FROM c.started_at)::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
@@ -2892,8 +2955,9 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             ) dsc ON dsc.department = edm.department
             WHERE edm.department = ANY(:depts)
               AND c.direction = 'inbound'
+              AND {_APEL_REAL_CALL_SQL}
               """ + apel_uid_filter + f"""
-              AND (c.started_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
+              AND {_APEL_DAY_SQL} BETWEEN :df AND :dt
               AND (
                 CASE
                   WHEN da.work_date IS NOT NULL THEN da.present = true
