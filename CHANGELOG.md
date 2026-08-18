@@ -8,7 +8,117 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
-## v2.11.1 - 2026-08-18
+## v2.13.1 - 2026-08-18
+
+### Prompt V6: iris_reasoning condensat la rezumat acționabil 2-3 rânduri
+
+Câmpul `iris_reasoning` afișat în UI sub "Raționament complet AI" conținea anterior
+justificarea tehnică a scorului (calcule, ponderi, săptămâni). Înlocuit cu un rezumat
+orientat pe acțiune: starea curentă a clientului + trendul față de luna anterioară +
+cel mai important risc sau oportunitate imediată.
+
+## v2.13.0 - 2026-08-18
+
+### Monitorul de productivitate: apelurile vin din centrală, nu din CTS
+
+Cardurile per departament citeau apelurile din `cts_calls_ground_truth` (Apeluri CTS) — alt set de
+date (doar apelurile ajunse tichet în CTS) și alt ciclu de viață (new → in progress → solved) decât
+canalul „Apeluri" din raportul lunar. Monitorul și raportul spuneau cifre diferite pentru aceeași
+zi. Toate interogările de apel din `/productivity/monitor/live` trec pe `calls` (While1), cu
+aceleași definiții de leg ca raportul: contorul de grup, cardurile per departament, cele trei serii
+orare și sesizările/reclamațiile venite pe telefon.
+
+Ce nu se poate lua din centrală: **`in_curs`**. Un apel în desfășurare nu e încă în CDR — rândul
+apare abia după ce s-a încheiat. Cheia rămâne în răspuns pentru compatibilitate, dar e mereu 0;
+înainte număra tichete CTS neînchise, ceea ce pe un monitor „AZI" era restanță, nu apeluri în curs.
+
+Categoria pentru „sesizări venite pe telefon" devine `calls.ai_category` (încadrarea AI a
+transcriptului) în loc de `cts_calls_ground_truth.cts_category` (încadrarea omului în CTS): a doua
+e mai bună ca adevăr, dar apare abia după ce apelul devine tichet, deci pe monitorul zilei curente
+arăta sistematic mai puțin decât lista de apeluri.
+
+### Apeluri pierdute — numărate corect, nu ca „rânduri NO ANSWER"
+
+Cardul de apeluri arată **Răspunse** (conversații reale), iar apelurile **pierdute** apar o singură
+dată, ca cifră de firmă, în capul monitorului. Nu se pot împărți pe departamente: centrala nu scrie
+agent pe un apel nepreluat — din 666 apeluri pierdute în august, doar 72 (11%) au `agent_extension`;
+restul au doar linia apelată (`callee_number`), iar linia e a firmei. Pe 10.08: 84 pierdute real,
+din care doar 25 atribuibile — o bară per departament ar fi arătat 30% din realitate. API-ul întoarce
+ambele: `pierdute_azi` (subsetul atribuit grupului) și `pierdute_azi_total` (firma).
+
+Un apel pierdut NU e orice rând `NO ANSWER`: centrala sună în paralel pe mai multe aparate, deci legs-urile nepreluate apar
+`NO ANSWER` chiar și când apelul a fost preluat pe alt aparat. Pe august 2026 sunt **2215 rânduri
+NO ANSWER/BUSY, dar doar 659 apeluri efectiv pierdute** — definiția folosită
+(`_APEL_LOST_CALL_SQL`): un leg nerăspuns de la un număr care nu are nici un apel răspuns în
+±15 minute (fereastra acoperă și reapelarea imediată a clientului).
+
+Verificat pe 10.08: 277 apeluri răspunse și 22 pierdute pe grupul Operațional, distribuite pe orele
+8–20 locale. Seria orară „încă deschise" a canalului apel devine numărul de apeluri pierdute la ora
+respectivă — un apel răspuns e încheiat, deci altfel bara ar fi fost mereu 0. „Intrate azi" (numitorul
+indicatorului Ritm) include acum și pierdutele: un apel pierdut a sosit, chiar dacă n-a fost tratat.
+
+Ziua se citește cu `(now() AT TIME ZONE 'Europe/Bucharest')::date`, nu `CURRENT_DATE`: pe un
+Postgres cu sesiunea pe UTC, între 00:00 și 03:00 RO monitorul ar arăta încă ziua precedentă.
+
+### Reclamații pe monitor: doar „Deschise" și „În lucru"
+
+Cerere business owner. Barele „Primite azi" / „Rezolvate azi" / „Deschise" devin **„Deschise"**
+(status CTS 1 = înregistrată, nepreluată) și **„În lucru"** (status 2). Pe un monitor de perete
+contează ce e nerezolvat acum; „primite azi" și „rezolvate azi" sunt seturi diferite, nu un flux —
+o reclamație primită ieri și rezolvată azi apărea doar în a doua bară.
+
+Cheia veche `deschise` din API rămâne cu sensul ei (toate cele nerezolvate, adică suma celor două),
+fiindcă o folosește blocul `sesizari`; s-au adăugat aditiv `noi` și `in_lucru`, atât pe grup cât și
+per departament.
+
+## v2.12.0 - 2026-08-18
+
+### Apeluri în Productivitate: legs-urile de centrală nu mai sînt apeluri
+
+Canalul „Apeluri" din Productivitate ia datele din `calls` (While1) — aceeași sursă ca pagina
+Apeluri — dar număra fiecare **leg** de centrală ca apel separat. Centrala scrie cîte un rînd per
+leg: ring paralel pe mai multe aparate, transfer, reapelare imediată. Pe august 2026, din 4354
+rînduri `inbound`: **2199 `NO ANSWER` de 0-1s, 16 `BUSY`, 12 `ANSWERED` de 0-1s — 2227 (51%) care
+nu sînt conversații**.
+
+Caz real semnalat (10.08, +37369841796, același agent):
+```
+12:02:38  ANSWERED   1s   ← leg, apărea ca apel „procesat"
+12:03:36  ANSWERED 213s   ← apelul real
+12:03:54  NO ANSWER  0s   ← leg, apărea „neprocesat"
+```
+
+Se numără acum doar conversațiile reale (`_APEL_REAL_CALL_SQL`: `ANSWERED` și durată > 1s), în
+toate cele trei locuri care citeau `calls`: raportul lunar (`_fetch_apel_rows`), lista din modal
+(`breakdown_rows`) și analytics/monitorul de departament. Efect pe august: volumul Suport 1 scade
+3159 → 1777, Suport 2 325 → 177.
+
+Nu s-a adăugat deduplicare pe `linkedid`: verificat pe august, după filtru rămîn **0 legs
+suprapuse din 2127** și doar 14 perechi la sub 120s într-o lună întreagă — reapelări reale.
+
+**De ce atingea și scorul, nu doar volumul:** `backfill_ring_seconds` completează `ring_seconds` pe
+tot intervalul, nu doar pe apelurile răspunse, deci un leg mort devine „măsurabil" cu ~0s — un
+„on time" gratuit. Local (unde `ring_seconds` e încă NULL) procentul nu se mișcă, dar măsurabilele
+Suport 1 scad 1184 → 1024, deci pe staging, unde backfill-ul a rulat, procentul era umflat.
+
+### Fix: ora apelurilor era cu 3h în față în Productivitate
+
+`calls.started_at` e `timestamp WITHOUT time zone` și conține ora **locală RO**, exact cum o scrie
+centrala (verificat: `call_id` 1346015 e 12:02:38 în centrală și 12:02:38 în DB). Productivitatea îl
+trata ca UTC: `AT TIME ZONE 'Europe/Bucharest'` în SQL și `_iso()` la afișare, deci același apel
+apărea la 12:02 pe pagina Apeluri și la 15:02 în lista din Productivitate. În plus, pe un Postgres
+cu sesiunea pe UTC, `(started_at AT TIME ZONE 'Europe/Bucharest')::date` mută ziua apelurilor din
+primele ore ale dimineții. Filtrele folosesc acum direct `c.started_at`, ca pagina Apeluri.
+
+### Apeluri: „fără conversație" în loc de „neprocesat"
+
+Un leg fără înregistrare (`audio_status='no_recording'`) nu poate fi clasificat niciodată, deci
+coloana Categorie afișa „neprocesat" la 2222 de rînduri pe august — părea o coadă blocată. Nu e:
+niciun worker nu selectează `queue_status='queued_ingest'` pe apeluri (audio-ul merge după
+`audio_status='pending'`), deci rîndurile nu erau în așteptare, ci terminale. Eticheta devine
+„fără conversație", cu detaliul stării din centrală în tooltip.
+
+## v2.11.0 - 2026-08-18
 
 ### Prompt V6: iris_reasoning condensat la rezumat acționabil 2-3 rânduri
 
