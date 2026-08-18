@@ -8,6 +8,14 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.16.0 - 2026-08-18
+
+Merge al celor două linii de lucru paralele de pe 18.08: productivitatea (monitor pe `calls`,
+apeluri pierdute, reclamații total lună / în lucru, productivitate zilnică — v2.12.0…v2.15.1) și
+satisfacția (`iris_reasoning` condensat + sinteza lunară AI — v2.13.1, v2.13.2). Ambele seturi de
+modificări sunt în arbore; nu s-a rescris nimic din niciuna. Numerotarea entry-urilor de mai jos
+rămâne cea din momentul scrierii, deci nu e strict crescătoare în timp.
+
 ## v2.15.1 - 2026-08-18
 
 Tabelul „Productivitate zilnică" trece din card separat (unul mare, cu toate departamentele) în
@@ -96,6 +104,22 @@ Pe arcul gauge-ului era scris pragul MINIM (`staticLabels.labels = [safeMin]`), 
 obiectivul real — cel care trebuie atins. Se scrie acum realul. Ambele markere colorate rămân pe arc
 (galben = minim, verde = real), la fel și valorile numerice de sub grafic; doar eticheta de pe arc nu
 se poate dubla, fiindcă la o mărime lizibilă cele două se suprapun (Suport 1: 77.9 vs 82.9).
+## v2.13.2 - 2026-08-18
+
+### PATCH — Sinteză lunară AI pentru iris_reasoning
+
+- **satisfaction_engine.py**: adăugat apel AI secundar după scorarea săptămânilor pentru .
+  Generează un rezumat lunar de max 3 propoziții (stare + trend + risc principal) folosind reasoning-urile săptămânale.
+  Fallback la textul programatic dacă apelul IRIS eșuează sau AI nu e configurat.
+
+## v2.13.1 - 2026-08-18
+
+### Prompt V6: iris_reasoning condensat la rezumat acționabil 2-3 rânduri
+
+Câmpul `iris_reasoning` afișat în UI sub "Raționament complet AI" conținea anterior
+justificarea tehnică a scorului (calcule, ponderi, săptămâni). Înlocuit cu un rezumat
+orientat pe acțiune: starea curentă a clientului + trendul față de luna anterioară +
+cel mai important risc sau oportunitate imediată.
 
 ## v2.13.0 - 2026-08-18
 
@@ -200,67 +224,12 @@ niciun worker nu selectează `queue_status='queued_ingest'` pe apeluri (audio-ul
 
 ## v2.11.0 - 2026-08-18
 
-### Satisfacție clienți: promptul V6 și traiectoria continuă
+### Prompt V6: iris_reasoning condensat la rezumat acționabil 2-3 rânduri
 
-**Promptul de încadrare trece de la V4 la V6** (`app/services/prompts/satisfaction_trajectory_v6.txt`).
-Fișierul rulat pe staging era V4, nu V5 — cheia `settings.satisfaction.v4` din DB avea
-`prompt_version: "V4"` — deci V6 aduce dintr-o dată și regula V5 (punctul de start), și cele
-trei niveluri de mulțumire cerute acum:
-
-- **Principiul 17 (era V5)** — o lună nu mai repornește mecanic de la neutru. Dacă există o
-  stare finală cunoscută dintr-o lună anterioară, aceea e punctul de start; fără istoric,
-  start neutru (~50). Punctul folosit se scrie explicit în raport.
-- **Principiul 18 (nou, V6)** — nicio bandă superioară interzisă pentru un client care a avut o
-  problemă rezolvată bine. Trei niveluri distincte de gratitudine, fără plafon între ele:
-  (a) mulțumirea de curtoazie la o plată/factură **nu se scorează deloc**; (b) mulțumirea pentru
-  remedierea confirmată a unei probleme e o **recuperare reală**; (c) mulțumirea despre
-  colaborare în general sau o recomandare e semnal **și mai puternic** — poate duce singură în
-  Foarte satisfăcut/Ambasador. Notele din taxonomie (`confirmare_rezolvare_multumire`,
-  `multumire_generala`, `recomandare`) și secțiunea „Starea finală" au fost aliniate la asta.
-
-### Motorul: traiectoria nu se mai resetează săptămânal
-
-Promptul cerea continuitate, dar codul o rupea în două locuri — ambele plafonau exact
-recuperările pe care V6 le interzice să fie plafonate:
-
-- **Fiecare săptămână pornea de la zero.** Se făcea 1 apel IRIS per săptămână ISO, fără să i se
-  spună în ce stare era clientul înainte. Acum fiecare apel primește `stare_initiala`: prima
-  săptămână din ultima lună cu scor din `client_satisfaction_snapshots` (căutare înapoi max. 3
-  luni), restul din starea săptămânii precedente. O săptămână fără scor (N/A sau IRIS eșuat) nu
-  rupe lanțul.
-- **Scorul lunii era media ponderată pe interacțiuni.** O lună care începe cu o criză (30) și se
-  termină cu reconciliere confirmată (92) ieșea 59 — „Neutru", deși clientul se declarase
-  mulțumit. Scorul lunar e acum **starea finală a ultimei săptămâni scorate**, conform
-  principiului 1 (recența decide). Media ponderată rămâne calculată și expusă în breakdown
-  (`month_avg_detail.weighted_avg_pct`) pentru comparație.
-
-### Modelul: Haiku 4.5 → Sonnet 4.6
-
-Apelul de satisfacție nu trimitea `model_hint`, deci cădea pe implicitul gateway-ului IRIS —
-**Claude Haiku 4.5** (verificat în `ai_call_log`: 318 apeluri `satisfaction_v4_trajectory`, toate
-`claude-haiku-4-5-20251001`). Distincțiile din V6 (trei niveluri de gratitudine, curtoazie vs.
-conținut evaluativ, plafon interzis) sunt exact genul de nuanță pe care un model mic o ratează —
-și explică de ce același prompt rulat în altă aplicație dădea scoruri mai mari. Trece pe
-`claude-sonnet-4-6`. Cost măsurat: ~$0,011/apel pe Haiku, ~$0,05/apel estimat pe Sonnet; la ~55
-clienți × ~4 săptămâni ≈ $11/lună în loc de $2,3.
-
-Task-ul raportat la IRIS devine `cargo360:satisfaction_v6_trajectory`, `scoring_mode` devine
-`v6_trajectory` (UI-ul acceptă acum orice `v<N>_trajectory`, nu doar `v4`).
-
-Migrația `20260818_satisfaction_v6.sql` (fără DDL) adaugă cheia `settings.satisfaction.v6`, cu
-revert fără redeploy: `month_aggregation="weighted_avg_weeks"` readuce media V4,
-`carry_start_state=false` readuce startul de la neutru, `model_hint` readuce Haiku.
-
-### O singură versiune de încadrare
-
-Decizie: se rulează DOAR promptul V6. În consecință, din `satisfaction_engine.py` au fost șterse
-motoarele care nu mai erau chemate de nimeni — v1/v2 pe 4 piloni (Emoție/Efort/Operațional/Relație,
-cu decay 45 zile) și v3 „AI holistic" cu boost +15 și podea 60 — împreună cu prompturile lor
-(`SATISFACTION_SYSTEM`, `_V4_CONTEXT_SYSTEM`, `_V4_RECOVERY_SYSTEM`, `_V4_RECONTACT_SYSTEM`) și cu
-promptul V4. Fișierul scade de la 2003 la ~1080 de linii. Motiv: cât timp coexistau, scorul unui
-client depindea de ce cale îl calculase, iar podeaua de 60 din v3 era exact plafonarea pe care V6 o
-interzice. Simbolurile s-au redenumit (`compute_satisfaction_v6`, `_load_v6_config`, `_V6_DEFAULTS`),
-iar migrația șterge cheia moartă `settings.satisfaction.v4`.
+Câmpul `iris_reasoning` afișat în UI sub "Raționament complet AI" conținea anterior
+justificarea tehnică a scorului (calcule, ponderi, săptămâni). Înlocuit cu un rezumat
+orientat pe acțiune: starea curentă a clientului + trendul față de luna anterioară +
+cel mai important risc sau oportunitate imediată.
 
 ## v2.10.0 - 2026-08-14
 

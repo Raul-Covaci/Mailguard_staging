@@ -1023,6 +1023,45 @@ def compute_satisfaction_v6(
         )
     reasoning = (head + " | ".join(parts))[:1200]
 
+    # Sinteză lunară AI — apel suplimentar după scorarea săptămânilor.
+    # Primește scorurile + reasoning-urile săptămânale și returnează un rezumat acționabil
+    # max 3 propoziții pentru iris_reasoning afișat în UI.
+    # Dacă apelul eșuează sau AI nu e configurat, rămâne reasoning-ul programatic (fallback).
+    _summary_system = (
+        "Ești un analist de satisfacție clienți B2B. Primești scorurile săptămânale ale unui client "
+        "și raționamentele lor pentru o lună. Generează un rezumat lunar de maxim 3 propoziții, "
+        "orientat pe acțiune:\n"
+        "1. Starea generală a clientului în această lună și principalele probleme sau aspecte pozitive identificate.\n"
+        "2. Trendul față de startul lunii sau față de luna anterioară dacă există.\n"
+        "3. Cel mai important risc sau oportunitate de acțiune imediată pentru echipă.\n"
+        "NU include calcule, ponderi, numere de apeluri sau explicații metodologice. "
+        'Răspunde JSON: {"iris_reasoning": "<rezumat>"}'
+    )
+    _summary_payload = {
+        "scor_final_luna": month_pct,
+        "scor_start_luna": month_start_state,
+        "sursa_start": start_source,
+        "saptamani": [
+            {
+                "saptamana": r["week_key"],
+                "scor": r.get("satisfaction_pct"),
+                "n_interactiuni": r.get("n_interactions"),
+                "reasoning": (r.get("iris_reasoning") or "")[:300],
+            }
+            for r in weekly_rows
+        ],
+        "riscuri_reputatie": all_rep[:5],
+        "riscuri_escaladare": all_esc[:3],
+    }
+    _summary_resp = _iris_call(_summary_system, _summary_payload, max_tokens=400)
+    if (
+        _summary_resp
+        and isinstance(_summary_resp.get("iris_reasoning"), str)
+        and _summary_resp["iris_reasoning"].strip()
+    ):
+        reasoning = _summary_resp["iris_reasoning"].strip()
+        iris_calls += 1
+
     # categorie din scorul mediu
     if month_pct >= 90:
         category = "Ambasador"

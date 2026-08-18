@@ -180,7 +180,7 @@ După analiza mentală după regulile de mai sus, returnează STRICT un singur o
     "episodes": <int sau null>,
     "basis": <string scurt>
   },
-  "reasoning": <string 3-5 propoziții — de ce a ieșit această stare>,
+  "reasoning": <string maxim 3 propoziții, orientat pe acțiune: (1) starea curentă a clientului și ce a generat-o; (2) trendul față de luna anterioară (îmbunătățire/deteriorare/stabil) dacă există istoric; (3) cel mai important risc sau oportunitate de acțiune imediată. NU include detalii de calcul, ponderi, numere de apeluri sau explicații metodologice.>,
   "suggestions": [<3-5 stringuri concrete pentru echipă>]
 }
 
