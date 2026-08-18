@@ -3509,7 +3509,7 @@ function ClientSatV4({ satHistory, assetEmpty }) {
       h('div', { style: { height: 6, borderRadius: 3, width: Math.min(pct, 100) + '%', background: col, transition: 'width .4s' } }));
   }
 
-  var isTrajectory = !!(bd && (bd.single_kpi === 'iris_stare_finala' || String(bd.scoring_mode || '').indexOf('v4_trajectory') === 0));
+  var isTrajectory = !!(bd && (bd.single_kpi === 'iris_stare_finala' || /^v[0-9]+_trajectory/.test(String(bd.scoring_mode || ''))));
 
   function grainBtn(key, label) {
     var on = chartGrain === key;
@@ -15901,7 +15901,7 @@ function SatisfactieDashboard({ onNavigateClient }) {
     var trend_assessment = (bd.trajectory_shape) || (ih && ih.trend_assessment);
     var red_flags = bd.red_flags_active || [];
     var scoringMode = bd.scoring_mode;
-    var isTrajectoryBd = bd.single_kpi === 'iris_stare_finala' || String(scoringMode || '').indexOf('v4_trajectory') === 0;
+    var isTrajectoryBd = bd.single_kpi === 'iris_stare_finala' || /^v[0-9]+_trajectory/.test(String(scoringMode || ''));
     var allFactors = isTrajectoryBd ? [] : ['emotion', 'effort', 'operational', 'relationship'].filter(function(fk) { return bd[fk] && bd[fk].data_points && bd[fk].data_points > 0; });
     var excludedCount = isTrajectoryBd ? 0 : (4 - allFactors.length);
     return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '12px 14px 10px', background: 'var(--bg2)', borderRadius: 6, marginTop: 2 } }, [

@@ -804,8 +804,8 @@ def client_satisfaction_history(client_id: int, db: Session = Depends(get_db)):
 
 @router.post("/clients/{client_id}/estimate-satisfaction")
 def estimate_satisfaction(client_id: int, month: str = None, db: Session = Depends(get_db)):
-    """Motor v4 — per lună calendaristică: Emoție(70%, penalizări categorie + reveniri IRIS)
-    + Context IRIS(30%), apoi restituire ≤50%. Param opțional `month=YYYY-MM` (default: luna curentă)."""
+    """Motor V6 — traiectorie IRIS pe săptămâni înlănțuite, scor lunar = starea finală a
+    ultimei săptămâni scorate. Param opțional `month=YYYY-MM` (default: luna curentă)."""
     row = db.execute(text("""
         SELECT id, iris_client_id, name FROM clients WHERE id = :cid AND is_active = true
     """), {"cid": client_id}).fetchone()
@@ -829,7 +829,7 @@ def estimate_satisfaction(client_id: int, month: str = None, db: Session = Depen
     )
     try:
         cur = conn.cursor()
-        result = satisfaction_engine.compute_satisfaction_v4(client_id, iris_client_id, cur, start, end)
+        result = satisfaction_engine.compute_satisfaction_v6(client_id, iris_client_id, cur, start, end)
     finally:
         conn.close()
 
@@ -876,7 +876,7 @@ def estimate_satisfaction(client_id: int, month: str = None, db: Session = Depen
         "config_used": result.get("config_used", {}),
         "computed_at": result.get("computed_at"),
         "emails_analyzed": total_interactions,
-        "iris_holistic_applied": breakdown.get("scoring_mode") == "v4",
+        "iris_holistic_applied": str(breakdown.get("scoring_mode") or "").startswith("v6_trajectory"),
     }
 
 

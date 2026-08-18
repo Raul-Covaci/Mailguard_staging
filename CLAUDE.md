@@ -40,6 +40,24 @@ această gardă înainte de a apela furnizorul real de email (SMTP/O365/etc).
 
 ---
 
+## 🔴 SATISFACȚIE CLIENȚI — motor curent: traiectorie V6 (2026-08-18)
+
+Motorul activ NU mai e cel cu 5 factori de mai jos (rămas ca istoric) — e traiectoria IRIS:
+
+- Prompt: `app/services/prompts/satisfaction_trajectory_v6.txt` — **singurul**; V4 și motoarele vechi (v1/v2 piloni, v3 holistic) au fost șterse.
+- Cod: `compute_satisfaction_v6()` din `app/services/satisfaction_engine.py`.
+- 1 apel IRIS per **săptămână ISO** cu interacțiuni; fiecare apel primește `stare_initiala`
+  (prima săptămână = ultima lună cu scor din `client_satisfaction_snapshots`, restul = săptămâna
+  precedentă). Scor lunar = **starea finală a ultimei săptămâni scorate** (nu media).
+- **Model: `claude-sonnet-4-6`** (până la V6 se folosea implicitul gateway-ului = Claude Haiku 4.5).
+  Se schimbă din `settings.satisfaction.v6` → `model_hint`, fără redeploy.
+- Config/revert (fără redeploy), cheia `settings.satisfaction.v6`:
+  `month_aggregation` (`last_week_final` | `weighted_avg_weeks`), `carry_start_state`,
+  `start_lookback_months`, `model_hint`, `prompt_version`.
+- Sursa datelor: `cts_ground_truth` (mailuri) + `cts_calls_ground_truth` (apeluri), lună calendaristică.
+
+---
+
 ## 🔴 SATISFACȚIE CLIENȚI — Implementare completă (2026-07-15)
 
 ### Motor de scor (`app/services/satisfaction_engine.py`)

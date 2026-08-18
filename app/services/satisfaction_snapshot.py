@@ -26,7 +26,7 @@ logger = logging.getLogger("mailguard.satisfaction_snapshot")
 BATCH_SIZE = 1  # flush imediat — UI vede fiecare client după IRIS
 
 # Rate-limit apeluri IRIS AI: pauză între clienți ca să nu bombardăm gateway-ul
-# (fiecare client cu activitate face 1 apel IRIS in compute_satisfaction_v4 / traiectorie V4).
+# (fiecare client cu activitate face 1 apel IRIS in compute_satisfaction_v6 / traiectorie V4).
 AI_CALL_SPACING_SECONDS = 0.3
 
 
@@ -199,10 +199,10 @@ def run_monthly_snapshot(
 
                 if has_act:
                     # v4: fereastră strict calendaristică [start, end)
-                    result = satisfaction_engine.compute_satisfaction_v4(client_id, iris_client_id, cur, start, end)
+                    result = satisfaction_engine.compute_satisfaction_v6(client_id, iris_client_id, cur, start, end)
                     mode = (result.get("breakdown") or {}).get("scoring_mode") or ""
-                    # v4_trajectory = IRIS week+month (fără cache); legacy v4 = 2-3 apeluri
-                    if mode in ("v4", "v4_trajectory", "v4_trajectory_na") or str(mode).startswith("v4_trajectory"):
+                    # v6_trajectory = IRIS pe săptămâni înlănțuite, fără cache (singurul motor)
+                    if str(mode).startswith("v6_trajectory"):
                         n_calls = int((result.get("breakdown") or {}).get("iris_calls") or 1)
                         stats["ai_calls"] = stats.get("ai_calls", 0) + n_calls
                         # Rate-limit: pauză după fiecare client (apelurile intra-client au deja spacing în engine)
