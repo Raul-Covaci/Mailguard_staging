@@ -8,6 +8,14 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.16.1 - 2026-08-18
+
+### PATCH — Fix model_hint lipsă la sinteza lunară satisfacție
+
+- **satisfaction_engine.py**: apelul AI de sinteză lunară ( pentru )
+  nu primea , deci folosea modelul implicit al gateway-ului (Haiku) în loc de Sonnet.
+  Fix: pasează același  din  ca la apelurile săptămânale (linia 907).
+
 ## v2.16.0 - 2026-08-18
 
 Merge al celor două linii de lucru paralele de pe 18.08: productivitatea (monitor pe `calls`,

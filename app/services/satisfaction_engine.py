@@ -1053,7 +1053,8 @@ def compute_satisfaction_v6(
         "riscuri_reputatie": all_rep[:5],
         "riscuri_escaladare": all_esc[:3],
     }
-    _summary_resp = _iris_call(_summary_system, _summary_payload, max_tokens=400)
+    _summary_resp = _iris_call(_summary_system, _summary_payload, max_tokens=400,
+                               model_hint=str(cfg.get("model_hint") or "") or None)
     if (
         _summary_resp
         and isinstance(_summary_resp.get("iris_reasoning"), str)
