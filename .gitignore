@@ -95,7 +95,6 @@ deploy_t4.sh
 .iris_last_sync
 .design_lint_baseline*
 OUTBOX_*
-CLAUDE.md
 CLAUDE-HISTORY.md
 .claude/
 .lint/
