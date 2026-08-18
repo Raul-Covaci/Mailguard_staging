@@ -8,6 +8,14 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.13.2 - 2026-08-18
+
+### PATCH — Sinteză lunară AI pentru iris_reasoning
+
+- **satisfaction_engine.py**: adăugat apel AI secundar după scorarea săptămânilor pentru .
+  Generează un rezumat lunar de max 3 propoziții (stare + trend + risc principal) folosind reasoning-urile săptămânale.
+  Fallback la textul programatic dacă apelul IRIS eșuează sau AI nu e configurat.
+
 ## v2.13.1 - 2026-08-18
 
 ### Prompt V6: iris_reasoning condensat la rezumat acționabil 2-3 rânduri
