@@ -921,6 +921,328 @@ function CtsTrainingPanel() {
   ]);
 }
 
+// ── „Raport departamente" (tab în modulul Mail-uri CTS) — 2026-08-19 ────────────
+// Trei unghiuri peste ACELAȘI lanț de departamente prin care trece un mail:
+//   1. de câte ori a fost mutat până s-a închis (0 / 1 / 2 / 3+),
+//   2. cine inițiază mutările (de pe ce departament pleacă mailul),
+//   3. cine e doar intermediar (nici primul alocat, nici cel care închide).
+// Fiecare linie/bară e „clicabilă" → tabelul de cazuri concrete de dedesubt (drill-down).
+// Sursa: /cts-training/dept-report (+ /cases), tabela cts_department_moves.
+function CtsDeptReport() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [dept, setDept] = useState('');
+  const [onlySolved, setOnlySolved] = useState(false);
+  // drill = ce s-a apăsat: { kind: 'moves'|'from'|'mid', value, label }
+  const [drill, setDrill] = useState(null);
+  const [cases, setCases] = useState({ items: [], total: 0, page: 1, page_size: 50 });
+  const [casesLoading, setCasesLoading] = useState(false);
+  const [casePage, setCasePage] = useState(1);
+  const [selectedId, setSelectedId] = useState(null);
+
+  function baseQs() {
+    var qs = [];
+    if (dateFrom) qs.push('date_from=' + encodeURIComponent(dateFrom));
+    if (dateTo) qs.push('date_to=' + encodeURIComponent(dateTo));
+    if (dept) qs.push('department=' + encodeURIComponent(dept));
+    if (onlySolved) qs.push('only_solved=1');
+    return qs;
+  }
+
+  function load() {
+    setLoading(true);
+    var qs = baseQs();
+    api('/cts-training/dept-report' + (qs.length ? '?' + qs.join('&') : ''))
+      .then(function(d){ setData(d); setLoading(false); })
+      .catch(function(){ setLoading(false); });
+  }
+
+  function loadCases() {
+    if (!drill) { setCases({ items: [], total: 0, page: 1, page_size: 50 }); return; }
+    setCasesLoading(true);
+    var qs = baseQs().concat(['page=' + casePage, 'page_size=50']);
+    if (drill.kind === 'moves') qs.push('min_moves=' + drill.value);
+    else if (drill.kind === 'from') { qs.push('min_moves=1'); qs.push('dept_from=' + encodeURIComponent(drill.value)); }
+    else if (drill.kind === 'mid') { qs.push('min_moves=1'); qs.push('dept_mid=' + encodeURIComponent(drill.value)); }
+    api('/cts-training/dept-report/cases?' + qs.join('&'))
+      .then(function(d){ setCases(d); setCasesLoading(false); })
+      .catch(function(){ setCasesLoading(false); });
+  }
+
+  useEffect(function(){ load(); setCasePage(1); }, [dateFrom, dateTo, dept, onlySolved]);
+  useEffect(function(){ setCasePage(1); }, [drill]);
+  useEffect(function(){ loadCases(); }, [drill, casePage, dateFrom, dateTo, dept, onlySolved]);
+
+  function card(title, val, sub, color) {
+    return h('div', { className: 'card', style: { flex: '1 1 160px', minWidth: 150, padding: '12px 15px', borderTop: '3px solid ' + (color || '#30363d') } }, [
+      h('div', { key: 't', style: { fontSize: 10, color: 'var(--t3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' } }, title),
+      h('div', { key: 'v', style: { fontSize: 24, fontWeight: 800, lineHeight: 1.15, marginTop: 5 } }, val),
+      sub ? h('div', { key: 's', style: { fontSize: 11, color: 'var(--t3)', marginTop: 3 } }, sub) : null
+    ]);
+  }
+
+  function secHdr(key, title, color, note) {
+    return h('div', { key: key, style: { marginTop: 20, marginBottom: 6, borderLeft: '3px solid ' + color, paddingLeft: 10 } }, [
+      h('div', { key: 't', style: { fontSize: 14, fontWeight: 700 } }, title),
+      note ? h('div', { key: 'n', style: { fontSize: 12, color: 'var(--t3)', marginTop: 2 } }, note) : null
+    ]);
+  }
+
+  // Tabel compact (partea de 30% dintr-un card de statistică): 3 coloane, rânduri clicabile.
+  // Ține loc de „legendă cu cifre" lângă grafic — de aia e strâns: dot color + etichetă + 2 numere.
+  function miniTable(head, rows, emptyTxt) {
+    var bb = '1px solid ' + hexA('#888888', 0.14);
+    var th = { fontSize: 9.5, fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.04em', padding: '5px 6px', textAlign: 'left', borderBottom: '1px solid var(--bd)', whiteSpace: 'nowrap' };
+    var thR = Object.assign({}, th, { textAlign: 'right' });
+    var td = { padding: '5px 6px', borderBottom: bb };
+    var tdR = Object.assign({}, td, { textAlign: 'right', fontVariantNumeric: 'tabular-nums' });
+    return h('div', { style: { border: '1px solid var(--bd)', borderRadius: 8, overflow: 'auto', maxHeight: 300 } },
+      h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 11.5 } }, [
+        h('thead', { key: 'h' }, h('tr', null, [
+          h('th', { key: 'a', style: th }, head[0]),
+          h('th', { key: 'b', style: thR }, head[1]),
+          h('th', { key: 'c', style: thR }, head[2])
+        ])),
+        h('tbody', { key: 'b' }, rows.length ? rows.map(function(r, i){
+          return h('tr', { key: i, title: r.title || '', onClick: r.onPick || null,
+            style: { background: r.active ? hexA('#3b82f6', 0.12) : 'transparent', cursor: r.onPick ? 'pointer' : 'default' } }, [
+            h('td', { key: 'a', style: td }, h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } }, [
+              r.color ? h('span', { key: 'dot', style: { width: 8, height: 8, borderRadius: 2, background: r.color, flexShrink: 0 } }) : null,
+              h('span', { key: 'l', style: { color: 'var(--tx)', fontWeight: 600, whiteSpace: 'nowrap' } }, r.label)
+            ])),
+            h('td', { key: 'b', style: Object.assign({ fontWeight: 700 }, tdR) }, (r.value || 0).toLocaleString('ro-RO')),
+            h('td', { key: 'c', style: Object.assign({ color: 'var(--t2)' }, tdR) }, (r.pct != null ? r.pct + '%' : '—'))
+          ]);
+        }) : h('tr', { key: 'e' }, h('td', { colSpan: 3, style: { padding: '16px 8px', textAlign: 'center', color: 'var(--t3)', fontSize: 11, lineHeight: 1.5 } }, emptyTxt)))
+      ]));
+  }
+
+  // Card de statistică: antet + [tabel 30% | grafic 70%]. Un INDICE pe rând, pe toată
+  // lățimea paginii (3 carduri pe același rând ieșeau înghesuite).
+  function statPanel(key, num, title, note, color, tableNode, chartNode) {
+    return h('div', { key: key, className: 'card', style: { width: '100%', marginTop: 12, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 11, borderTop: '3px solid ' + color } }, [
+      h('div', { key: 'hd' }, [
+        h('div', { key: 't', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
+          h('span', { key: 'n', style: { fontSize: 10, fontWeight: 800, color: '#fff', background: color, borderRadius: 5, padding: '3px 8px', letterSpacing: '.04em' } }, 'INDICE ' + num),
+          h('span', { key: 'l', style: { fontSize: 14, fontWeight: 700 } }, title)
+        ]),
+        h('div', { key: 'n2', style: { fontSize: 12, color: 'var(--t3)', marginTop: 4, lineHeight: 1.5 } }, note)
+      ]),
+      h('div', { key: 'bd', style: { display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' } }, [
+        h('div', { key: 'tb', style: { flex: '0 0 30%', maxWidth: '30%', minWidth: 260 } }, tableNode),
+        h('div', { key: 'ch', style: { flex: '1 1 60%', minWidth: 320 } }, chartNode)
+      ])
+    ]);
+  }
+
+  var d = data || {};
+  var tot = d.totals || {};
+  var dist = d.distribution || [];
+  var inits = d.initiators || [];
+  var mids = d.intermediaries || [];
+  var pairs = d.pairs || [];
+  var cov = d.coverage || {};
+
+  var deptOpts = [h('option', { key: '', value: '' }, '— toate departamentele —')].concat(
+    DEPT_SLUGS.map(function(s){ return h('option', { key: s, value: s }, DEPT_LABELS[s]); }));
+
+  var filters = h('div', { key: 'flt', style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 } }, [
+    h('input', { key: 'df', type: 'date', className: 'btn secondary', style: { padding: '5px 8px', fontFamily: 'inherit', fontSize: 13, minWidth: 130 }, value: dateFrom, title: 'De la data intrării mailului', onChange: function(e){ setDateFrom(e.target.value); } }),
+    h('span', { key: 'dash', style: { fontSize: 13, color: 'var(--t3)' } }, '—'),
+    h('input', { key: 'dt', type: 'date', className: 'btn secondary', style: { padding: '5px 8px', fontFamily: 'inherit', fontSize: 13, minWidth: 130 }, value: dateTo, title: 'Până la data', onChange: function(e){ setDateTo(e.target.value); } }),
+    h('span', { key: 'sep', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
+    h('span', { key: 'dl', style: { fontSize: 12, color: 'var(--t3)' } }, 'A trecut prin:'),
+    h('select', { key: 'dp', className: 'btn secondary', style: { padding: '6px 10px' }, value: dept, onChange: function(e){ setDept(e.target.value); } }, deptOpts),
+    h('label', { key: 'os', style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }, title: 'Doar mailurile închise în CTS (status solved)' }, [
+      h('input', { key: 'i', type: 'checkbox', checked: onlySolved, onChange: function(e){ setOnlySolved(e.target.checked); } }),
+      'Doar mailuri închise'
+    ]),
+    (dateFrom || dateTo || dept || onlySolved) ? h('button', { key: 'clr', className: 'btn secondary', style: { fontSize: 12, padding: '5px 10px', color: 'var(--rd)' }, onClick: function(){ setDateFrom(''); setDateTo(''); setDept(''); setOnlySolved(false); } }, 'Reset filtre') : null,
+    h('div', { key: 'sp', style: { flex: 1 } }),
+    h('button', { key: 'hlp', className: 'btn secondary', style: { fontSize: 12, padding: '5px 10px' }, onClick: function(){
+      window.Swal && window.Swal.fire({
+        title: 'Cum se citește raportul',
+        html: '<div style="text-align:left;font-size:13px;line-height:1.6">'
+          + '<b>Statistica 1 — mutări per mail.</b> De câte ori a schimbat mailul departamentul, de la intrare până la închidere. „0 mutări" = l-a rezolvat departamentul pe care a intrat.<br><br>'
+          + '<b>Statistica 2 — cine mută.</b> La fiecare mutare se numără departamentul de pe care <i>pleacă</i> mailul (ex. Suport 1 a mutat 620 de mailuri către alt departament).<br><br>'
+          + '<b>Statistica 3 — intermediari.</b> Departamentele prin care mailul doar a trecut: nu au fost primele alocate și nici nu l-au închis. Aici stau mailurile fără să se rezolve.<br><br>'
+          + '<b>De unde vin datele.</b> Din istoricul de departamente al mailurilor CTS (tabela <code>cts_department_moves</code>), scris automat la fiecare schimbare de departament observată de sync.<br><br>'
+          + '<b>Limitare (important).</b> Sync-ul CTS rulează la ~5 minute, deci două mutări făcute între două sincronizări apar ca una singură; pentru mailurile dinaintea activării raportului avem doar ultimul pas salvat. Cifrele sunt un <b>minim garantat</b>, nu o valoare exactă — se corectează când CTS ne va livra istoricul complet al alocărilor.</div>',
+        width: 640, confirmButtonText: 'Am înțeles'
+      });
+    } }, '? Cum se citește')
+  ]);
+
+  var kpis = h('div', { key: 'kpi', style: { display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 4 } }, [
+    card('Mailuri analizate', (tot.emails || 0).toLocaleString('ro-RO'), 'cu departament alocat în CTS', 'var(--tx)'),
+    card('Mailuri mutate', (tot.moved_emails || 0).toLocaleString('ro-RO'), (tot.moved_pct || 0) + '% din total', '#f59e0b'),
+    card('Total mutări', (tot.moves || 0).toLocaleString('ro-RO'), 'schimbări de departament', '#a855f7'),
+    card('Medie mutări / mail', (tot.avg_moves != null ? tot.avg_moves : 0), 'pe intervalul filtrat', '#3b82f6')
+  ]);
+
+  // ── Datele celor 3 statistici (tabel compact + grafic, pe același rând) ────────
+  var DIST_COLORS = ['#10b981', '#f59e0b', '#f97316', '#ef4444'];
+  var DIST_SHORT = ['0 mutări', '1 mutare', '2 mutări', '3+ mutări'];
+
+  var distRows = dist.map(function(r){
+    var pick = r.bucket > 0;
+    return {
+      label: DIST_SHORT[r.bucket], value: r.emails, pct: r.pct, color: DIST_COLORS[r.bucket],
+      active: !!(drill && drill.kind === 'moves' && drill.value === r.bucket),
+      title: pick ? 'Vezi mailurile cu cel puțin ' + r.bucket + ' mutări' : 'Rezolvate de departamentul inițial',
+      onPick: pick ? function(){ setDrill({ kind: 'moves', value: r.bucket, label: (r.bucket >= 3 ? 'mailuri cu 3+ mutări' : 'mailuri cu cel puțin ' + r.bucket + ' mutări') }); } : null
+    };
+  });
+
+  // Top 10 departamente cu cel puțin o mutare (cele cu 0 nu spun nimic — le sărim).
+  var initTop = inits.filter(function(r){ return (r.moves || 0) > 0; }).slice(0, 10);
+  var initRows = initTop.map(function(r){
+    return { label: r.label, value: r.moves, pct: r.pct, color: DEPT_COLORS[r.department] || '#a855f7',
+      active: !!(drill && drill.kind === 'from' && drill.value === r.department),
+      title: 'Vezi mailurile mutate de ' + r.label,
+      onPick: function(){ setDrill({ kind: 'from', value: r.department, label: 'mutări inițiate de ' + r.label }); } };
+  });
+
+  var midTop = mids.filter(function(r){ return (r.n || 0) > 0; }).slice(0, 10);
+  var midRows = midTop.map(function(r){
+    return { label: r.label, value: r.n, pct: r.pct, color: DEPT_COLORS[r.department] || '#f97316',
+      active: !!(drill && drill.kind === 'mid' && drill.value === r.department),
+      title: 'Vezi mailurile în care ' + r.label + ' a fost doar intermediar',
+      onPick: function(){ setDrill({ kind: 'mid', value: r.department, label: r.label + ' ca departament intermediar' }); } };
+  });
+
+  function barChartFor(rows, fallbackColor) {
+    return h(HBarChart, { bare: true, items: rows.map(function(r){ return { label: r.label, value: r.value, pct: r.pct }; }),
+      colorFn: function(it, i){ return (rows[i] && rows[i].color) || fallbackColor; },
+      height: Math.max(190, rows.length * 30 + 30) });
+  }
+
+  function chartPlaceholder(txt) {
+    return h('div', { style: { height: 190, display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center', color: 'var(--t3)', fontSize: 11.5, lineHeight: 1.55, padding: '0 10px', border: '1px dashed var(--bd)', borderRadius: 8 } }, txt);
+  }
+
+  var statsRow = h('div', { key: 'stats', style: { display: 'flex', flexDirection: 'column', marginTop: 4 } }, [
+    statPanel('s1', 1, 'Mutări per mail', 'De câte ori a schimbat mailul departamentul, de la intrare până la închidere.', '#3b82f6',
+      miniTable(['Nr. mutări', 'Mailuri', '%'], distRows, 'Fără date.'),
+      h(ProdPieChart, { bare: true, height: 240, labels: DIST_SHORT,
+        data: [0, 1, 2, 3].map(function(b){ var r = dist.filter(function(x){ return x.bucket === b; })[0]; return r ? r.emails : 0; }),
+        colors: DIST_COLORS })),
+
+    statPanel('s2', 2, 'Cine face mutările', 'La fiecare mutare se numără departamentul de pe care pleacă mailul. Top 10.', '#a855f7',
+      miniTable(['Departament', 'Mutări', '%'], initRows, 'Nicio mutare pe intervalul filtrat.'),
+      initRows.length ? barChartFor(initRows, '#a855f7') : chartPlaceholder('Nicio mutare între departamente pe intervalul filtrat.')),
+
+    statPanel('s3', 3, 'Departamente intermediare', 'Au ținut mailul, dar nu au fost primele alocate și nici nu l-au închis. Top 10.', '#f97316',
+      miniTable(['Departament', 'Apariții', '%'], midRows, 'Niciun intermediar pe intervalul filtrat.'),
+      midRows.length ? barChartFor(midRows, '#f97316')
+        : chartPlaceholder('Un intermediar apare doar la mailurile cu ≥2 mutări. Până când CTS livrează istoricul complet al alocărilor, vedem doar mutările prinse între două sincronizări (~5 min), deci lanțurile lungi ies sub-numărate.'))
+  ]);
+
+  // tabelul de cazuri concrete (drill-down)
+  var casesTotalPages = Math.max(1, Math.ceil((cases.total || 0) / (cases.page_size || 50)));
+  function chainCell(it) {
+    var slugs = (it.chain || '').split(' → ').filter(Boolean);
+    return h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' } },
+      slugs.map(function(s, i){
+        return h('span', { key: i, style: { display: 'inline-flex', alignItems: 'center', gap: 4 } }, [
+          i ? h('span', { key: 'ar', style: { color: 'var(--t3)', fontSize: 12 } }, '→') : null,
+          deptBadge(s) || h('span', { key: 'b', className: 'badge', style: { textTransform: 'none' } }, s)
+        ]);
+      }));
+  }
+  var casesBlock = !drill ? null : h('div', { key: 'cases' }, [
+    secHdr('cs-h', 'Cazuri concrete — ' + drill.label, '#ef4444',
+      'Mailurile din spatele cifrei de mai sus. Click pe rând → deschide emailul (pentru „de ce s-a mutat").'),
+    h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 10, margin: '6px 0 8px' } }, [
+      h('span', { key: 'n', style: { fontSize: 12, color: 'var(--t2)' } }, (cases.total || 0).toLocaleString('ro-RO') + ' mailuri'),
+      h('button', { key: 'x', className: 'btn secondary', style: { fontSize: 12, padding: '4px 10px' }, onClick: function(){ setDrill(null); } }, '✕ Închide lista')
+    ]),
+    casesLoading
+      ? h('div', { key: 'ld', style: { padding: 26, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…')
+      : h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto' } }, h('table', { className: 'list-table-full' }, [
+          h('thead', { key: 'h' }, h('tr', null, [
+            h('th', { key: 'id' }, 'ID'), h('th', { key: 'dt' }, 'Recepționat'), h('th', { key: 'su' }, 'Subiect'),
+            h('th', { key: 'fr' }, 'De la'), h('th', { key: 'ch' }, 'Traseu departamente'),
+            h('th', { key: 'mv', style: { textAlign: 'right' } }, 'Mutări'), h('th', { key: 'st' }, 'Închis')
+          ])),
+          h('tbody', { key: 'b' }, (cases.items || []).length ? cases.items.map(function(it){
+            return h('tr', { key: it.message_id, className: it.email_id ? 'clickable' : '', title: it.email_id ? 'Deschide emailul' : 'Doar în CTS — nu există în Cargo360',
+              onClick: it.email_id ? function(){ setSelectedId(it.email_id); } : null }, [
+              h('td', { key: 'id' }, it.email_id ? h(IdCell, { id: it.email_id }) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
+              h('td', { key: 'dt', style: { whiteSpace: 'nowrap' } }, (it.received_at || it.first_at) ? dateCell(it.received_at || it.first_at) : '—'),
+              h('td', { key: 'su', title: it.subject || '', style: { maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.subject || h('span', { style: { color: 'var(--t3)' } }, '(doar în CTS)')),
+              h('td', { key: 'fr', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.from_address || '—'),
+              h('td', { key: 'ch' }, chainCell(it)),
+              h('td', { key: 'mv', style: { textAlign: 'right', fontWeight: 700 } }, it.moves),
+              h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, it.solved_at ? dateCell(it.solved_at) : h('span', { style: { color: 'var(--yw)', fontSize: 11 } }, 'deschis'))
+            ]);
+          }) : h('tr', { key: 'e' }, h('td', { colSpan: 7, style: { textAlign: 'center', padding: 26, color: 'var(--t3)' } }, 'Niciun mail pentru selecția curentă.')))
+        ])),
+    h('div', { key: 'pg' }, pager(casePage, casesTotalPages, setCasePage))
+  ]);
+
+  var covNote = 'Captura live a mutărilor: ' + ((cov.live_events || 0).toLocaleString('ro-RO')) + ' evenimente'
+    + (cov.live_since ? (' (din ' + new Date(cov.live_since).toLocaleDateString('ro-RO') + ')') : ' (încă niciunul)')
+    + ' · reconstituite la activare: ' + ((cov.backfilled_events || 0).toLocaleString('ro-RO')) + '.';
+
+  return h('div', { className: 'page' }, [
+    h('div', { key: 'intro', style: { fontSize: 13, color: 'var(--t2)', marginBottom: 12 } },
+      'Ce procent din mailuri ajunge pe mai multe departamente, privit din 3 unghiuri: câte mutări are un mail, cine le inițiază și cine e doar intermediar. ' +
+      'Fiecare linie e clicabilă și deschide mailurile concrete din spatele cifrei.'),
+    kpis,
+    filters,
+    loading ? h('div', { key: 'ld', style: { padding: 40, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…') : h('div', { key: 'body' }, [
+      statsRow,
+
+      pairs.length ? secHdr('s4', 'Trasee frecvente (din → în)', '#10b981', 'Perechile concrete de departamente între care circulă mailurile.') : null,
+      pairs.length ? h('div', { key: 'ptbl', className: 'card', style: { padding: 0, overflow: 'auto', marginTop: 10 } },
+        h('table', { className: 'list-table-full' }, [
+          h('thead', { key: 'h' }, h('tr', null, [
+            h('th', { key: 'f' }, 'Din departament'), h('th', { key: 't' }, 'În departament'),
+            h('th', { key: 'n', style: { textAlign: 'right' } }, 'Nr. mutări'),
+            h('th', { key: 'p', style: { textAlign: 'right' } }, 'Pondere din mutări')
+          ])),
+          h('tbody', { key: 'b' }, pairs.map(function(p, i){
+            return h('tr', { key: i }, [
+              h('td', { key: 'f' }, deptBadge(p.from) || h('span', { className: 'badge', style: { textTransform: 'none' } }, p.from_label)),
+              h('td', { key: 't' }, deptBadge(p.to) || h('span', { className: 'badge', style: { textTransform: 'none' } }, p.to_label)),
+              h('td', { key: 'n', style: { textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' } }, (p.n || 0).toLocaleString('ro-RO')),
+              h('td', { key: 'p', style: { textAlign: 'right', color: 'var(--t2)' } }, (p.pct != null ? p.pct + '%' : '—'))
+            ]);
+          }))
+        ])) : null,
+
+      casesBlock,
+      h('div', { key: 'cov', style: { marginTop: 16, fontSize: 11.5, color: 'var(--t3)', lineHeight: 1.6 } }, covNote)
+    ]),
+    (function(){
+      var navIds = (cases.items || []).filter(function(it){ return it.email_id; }).map(function(it){ return it.email_id; });
+      var ci = navIds.indexOf(selectedId);
+      return selectedId != null ? h(EmailDetail, {
+        key: 'mod', emailId: selectedId, allIds: navIds, currentIndex: ci,
+        onNext: function(){ if (ci > -1 && ci < navIds.length - 1) setSelectedId(navIds[ci + 1]); },
+        onPrev: function(){ if (ci > 0) setSelectedId(navIds[ci - 1]); },
+        onClose: function(){ setSelectedId(null); }
+      }) : null;
+    })()
+  ]);
+}
+
+// Shell-ul modulului „Mail-uri CTS": lista de mailuri (comparație MG vs CTS) + raportul
+// de departamente. Tab-urile stau aici, nu în panouri, ca fiecare panou să-și încarce
+// datele DOAR când e afișat.
+function CtsMailsShell() {
+  const SUBS = [{ k: 'mailuri', l: 'Mailuri' }, { k: 'raport-dept', l: 'Raport departamente' }];
+  const [sub, setSub] = useState('mailuri');
+  return h('div', null, [
+    h('div', { key: 'tabs', className: 'modal-tabs', style: { borderBottom: '1px solid var(--bd)', marginBottom: 12 } },
+      SUBS.map(function(s){ return h('button', { key: s.k, className: 'tab' + (sub === s.k ? ' active' : ''), onClick: function(){ setSub(s.k); } }, s.l); })),
+    h('div', { key: 'body' }, sub === 'raport-dept' ? h(CtsDeptReport, { key: 'rd' }) : h(CtsTrainingPanel, { key: 'ml' }))
+  ]);
+}
+
 const TONE_COLORS = { neutru: '#6b7280', tensionat: '#ef4444', prietenos: '#22c55e' };
 function toneBadge(t) {
   if (!t) return null;
@@ -9510,7 +9832,7 @@ function PatternRecords(props) {
 }
 
 // Chart.js horizontal bar chart — for departments, document types, top senders
-function HBarChart({ title, items, note, height, colorFn }) {
+function HBarChart({ title, items, note, height, colorFn, bare }) {
   var canvasRef = React.useRef(null);
   var chartRef = React.useRef(null);
   var itemKey = (items || []).map(function(i) { return i.label + ':' + i.value; }).join('|');
@@ -9547,6 +9869,8 @@ function HBarChart({ title, items, note, height, colorFn }) {
   }, [itemKey]);
   if (!items || !items.length) return null;
   var autoH = height || (items.length * 34 + 24);
+  var _wrap = h('div', { key: 'wrap', style: { height: autoH + 'px', position: 'relative' } }, h('canvas', { key: 'cv', ref: canvasRef }));
+  if (bare) return _wrap;   // randat in interiorul altui card (fara ramă proprie)
   return h('div', { className: 'card', style: { marginTop: 14, padding: '14px 16px 10px' } }, [
     h('div', { key: 'hd', style: { marginBottom: note ? 4 : 10 } }, h('span', { style: { fontSize: 13, fontWeight: 700 } }, title)),
     note ? h('div', { key: 'nt', style: { fontSize: 12, color: 'var(--t3)', marginBottom: 10 } }, note) : null,
@@ -9818,7 +10142,7 @@ function ProdBarChart({ title, labels, data, colors, note, height, pct, horizont
 }
 
 // Chart.js doughnut — distribuții (categorii); culori din tokeni via prodCssVar
-function ProdPieChart({ title, labels, data, colors, note, height }) {
+function ProdPieChart({ title, labels, data, colors, note, height, bare }) {
   var canvasRef = React.useRef(null);
   var chartRef = React.useRef(null);
   var sig = JSON.stringify(labels) + '|' + JSON.stringify(data);
@@ -9827,6 +10151,7 @@ function ProdPieChart({ title, labels, data, colors, note, height }) {
     if (!C || !canvasRef.current) return;
     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
     if (!labels || !labels.length) return;
+  if (bare) return h('div', { style: { height: (height || 220) + 'px', position: 'relative' } }, h('canvas', { ref: canvasRef }));
     var txt = prodCssVar('--t2') || 'gray';
     var cols = (colors && colors.length) ? colors : [prodCssVar('--bl'), prodCssVar('--gn'), prodCssVar('--yw'), prodCssVar('--rd'), prodCssVar('--am'), prodCssVar('--t3')];
     chartRef.current = new C(canvasRef.current, {
@@ -15969,7 +16294,7 @@ function App() {
     setTab(origin || 'clients');
   }
   var clientsKey = 'clients' + (clientsDeepNav ? '-' + clientsDeepNav.ts : '');
-  const tabComp = { dashboard: h(Dashboard, { user }), emails: h(EmailsPage, { setTopbarRight }), documents: h(Documents, { setTopbarRight }), clients: h(Clients, { key: clientsKey, setTopbarRight, initialDeepNav: clientsDeepNav, onBack: backFromClient }), 'ai-analiza': h(AnalizaAI), 'cts-training': h(CtsTrainingPanel), reports: h(Reports), 'reports-stats': h(ReportsStatsShell, { setTopbarRight }), productivity: h(Productivity, { user, setTopbarRight }), satisfactie: h(SatisfactieDashboard, { onNavigateClient: navigateToClient }), settings: h(Settings, { user }), taskuri: h(TaskuriPage), 'device-ops': h(DeviceOpsPage), apeluri: h(ApelPage, { setTopbarRight }), 'cts-calls-training': h(CtsCallsTrainingPanel), 'calls-analitice': h(CallsAnalitice, { setTopbarRight }), 'quality-eval': h(QualityEvalPage), utilizatori: h(UtilizatoriPage, { user }), 'prompturi-ai': h(PrompturiAIPage), 'personal-mailboxes': h(PersonalMailboxesPage, { setTopbarRight }), 'feedback-config': h(FeedbackConfigPage), 'feedback-campaigns': h(FeedbackCampaignsPage), 'feedback-dashboard': h(FeedbackDashboardPage), 'surse-date': h(SurseDatePage) }[tab];
+  const tabComp = { dashboard: h(Dashboard, { user }), emails: h(EmailsPage, { setTopbarRight }), documents: h(Documents, { setTopbarRight }), clients: h(Clients, { key: clientsKey, setTopbarRight, initialDeepNav: clientsDeepNav, onBack: backFromClient }), 'ai-analiza': h(AnalizaAI), 'cts-training': h(CtsMailsShell), reports: h(Reports), 'reports-stats': h(ReportsStatsShell, { setTopbarRight }), productivity: h(Productivity, { user, setTopbarRight }), satisfactie: h(SatisfactieDashboard, { onNavigateClient: navigateToClient }), settings: h(Settings, { user }), taskuri: h(TaskuriPage), 'device-ops': h(DeviceOpsPage), apeluri: h(ApelPage, { setTopbarRight }), 'cts-calls-training': h(CtsCallsTrainingPanel), 'calls-analitice': h(CallsAnalitice, { setTopbarRight }), 'quality-eval': h(QualityEvalPage), utilizatori: h(UtilizatoriPage, { user }), 'prompturi-ai': h(PrompturiAIPage), 'personal-mailboxes': h(PersonalMailboxesPage, { setTopbarRight }), 'feedback-config': h(FeedbackConfigPage), 'feedback-campaigns': h(FeedbackCampaignsPage), 'feedback-dashboard': h(FeedbackDashboardPage), 'surse-date': h(SurseDatePage) }[tab];
   const tabTitle = (TABS.find(t => t.key === tab) || {}).label || tab;
 
   return h('div', { className: 'app' }, [
@@ -16031,7 +16356,6 @@ function SatisfactieDashboard({ onNavigateClient }) {
   const [snapshotRunning, setSnapshotRunning] = useState(false);
   const [snapshotMsg, setSnapshotMsg] = useState(null);
   const [expandedRows, setExpandedRows] = useState({});
-  const [expandedRisk, setExpandedRisk] = useState({});
   const [expandedSat, setExpandedSat] = useState({});
   // Panou verificare selectivă
   const [showVerif, setShowVerif] = useState(false);
@@ -16376,7 +16700,6 @@ function SatisfactieDashboard({ onNavigateClient }) {
   var distribution = (data && data.distribution) || {};
   var movers = (data && data.movers) || [];
   var topSatisfied = (data && data.top_satisfied) || [];
-  var atRisk = (data && data.at_risk) || [];
   var segDist = (data && data.segment_distribution) || {};
   var sigDist = (data && data.signal_distribution) || {};
   var trendDist = (data && data.trend_assessment_distribution) || {};
@@ -16612,58 +16935,6 @@ function SatisfactieDashboard({ onNavigateClient }) {
           ])
         ])
       : h('div', { key: 'top-sat-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Nicio dată disponibilă.'),
-
-    // ── Clienți la risc real ───────────────────────────────────────────────
-    secHdr('s-risk', 'Clienți la risc real (segment critic / la risc)', '#f97316'),
-    atRisk.length > 0
-      ? h('div', { key: 'at-risk', className: 'card', style: { padding: 0, overflow: 'hidden', borderTop: '3px solid #f97316' } }, [
-          h('div', { key: 'sub', style: { padding: '10px 16px', fontSize: 11, color: 'var(--t3)', borderBottom: '1px solid var(--bd)' } },
-            atRisk.length + ' clienți cu segment critic sau la risc — incluși chiar dacă scorul numeric pare OK. Click pe rând pentru detalii + red flags.'),
-          h('table', { key: 'tbl', style: { width: '100%', borderCollapse: 'collapse', fontSize: 13 } }, [
-            h('thead', { key: 'hd' }, h('tr', { style: { background: 'var(--bg2)', borderBottom: '1px solid var(--bd)' } }, [
-              h('th', { style: { width: 28, padding: '8px' } }),
-              h('th', { style: { textAlign: 'left', padding: '8px 10px', color: 'var(--t3)', fontWeight: 600, fontSize: 11, textTransform: 'uppercase', letterSpacing: '.05em' } }, 'Client'),
-              h('th', { style: { textAlign: 'right', padding: '8px 10px', color: 'var(--t3)', fontWeight: 600, fontSize: 11, width: 90 } }, 'Scor'),
-              h('th', { style: { padding: '8px 10px', color: 'var(--t3)', fontWeight: 600, fontSize: 11 } }, 'De ce e la risc — raționament AI'),
-              onNavigateClient ? h('th', { style: { width: 60, padding: '8px' } }) : null,
-            ])),
-            h('tbody', { key: 'bd' },
-              atRisk.map(function(u, i) {
-                var pct = u.satisfaction_pct;
-                var col = pct < 50 ? '#ef4444' : '#f97316';
-                var isExp = !!expandedRisk[u.client_id];
-                var reasoning = u.reasoning || '';
-                var shortReason = reasoning.length > 120 ? reasoning.slice(0, 120) + '…' : reasoning;
-                return [
-                  h('tr', { key: 'r' + u.client_id, 'data-sat-client-id': u.client_id, style: { borderTop: '1px solid var(--bd)', background: i % 2 === 0 ? 'transparent' : 'var(--bg2)', cursor: reasoning ? 'pointer' : 'default' },
-                    onClick: function() { if (!reasoning) return; setExpandedRisk(function(prev) { var n = Object.assign({}, prev); n[u.client_id] = !n[u.client_id]; return n; }); } }, [
-                    h('td', { key: 'exp', style: { padding: '8px 6px 8px 12px', textAlign: 'center', color: 'var(--t3)', fontSize: 12 } }, reasoning ? (isExp ? '▼' : '▶') : ''),
-                    h('td', { key: 'n', style: { padding: '8px 10px', color: 'var(--tx)', fontWeight: 500 } }, u.name),
-                    h('td', { key: 's', style: { padding: '8px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 800, fontSize: 15, color: col } }, pct.toFixed(1) + '%'),
-                    h('td', { key: 'rsn', style: { padding: '8px 10px', color: 'var(--t3)', fontSize: 12, lineHeight: 1.5 } },
-                      reasoning
-                        ? h('span', null, isExp ? '' : shortReason)
-                        : h('span', { style: { color: 'var(--t3)', fontStyle: 'italic' } }, 'Fără raționament disponibil.')
-                    ),
-                    onNavigateClient ? h('td', { key: 'view', style: { padding: '6px 8px', textAlign: 'center' } },
-                      h('button', { className: 'btn secondary', style: { padding: '3px 10px', fontSize: 11, whiteSpace: 'nowrap' }, onClick: function(e) { e.stopPropagation(); var mc = document.querySelector('.main-content'); _satScrollState = { scrollTop: mc ? mc.scrollTop : 0, clientId: u.client_id }; onNavigateClient(u.client_id, 'satisfactie', 'satisfactie'); } }, 'View')
-                    ) : null,
-                  ]),
-                  isExp ? h('tr', { key: 'exp' + u.client_id }, [
-                    h('td', { colSpan: 4, style: { padding: '0 16px 14px' } },
-                      h('div', { style: { fontSize: 12, color: 'var(--tx)', lineHeight: 1.7, padding: '10px 12px', background: 'color-mix(in srgb, #f97316 8%, transparent)', borderRadius: 5, borderLeft: '3px solid #f97316', marginTop: 2 } }, [
-                        h('span', { style: { fontSize: 10, fontWeight: 700, color: '#f97316', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 6 } }, 'Raționament complet AI'),
-                        reasoning,
-                        u.red_flags && u.red_flags.length > 0 ? h('div', { style: { marginTop: 8 } }, redFlagsList(u.red_flags)) : null,
-                      ])
-                    )
-                  ]) : null
-                ];
-              }).flat().filter(Boolean)
-            )
-          ])
-        ])
-      : h('div', { key: 'risk-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Niciun client cu segment critic sau la risc în ultima lună.'),
 
     // ── Clienți nesatisfăcuți (scor <70) ─────────────────────────────────
     secHdr('s-unsat', 'Clienți nesatisfăcuți — scor sub 70%', '#ef4444', 26, helpBtn),

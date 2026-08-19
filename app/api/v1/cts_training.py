@@ -728,3 +728,263 @@ def cts_training_set_sync_config(payload: dict = Body(...),
         {"k": SYNC_ENABLED_KEY, "v": ("true" if enabled else "false"), "by": by})
     db.commit()
     return SYNC.status()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Raport departamente (tab „Raport departamente" din Mail-uri CTS) — 2026-08-19
+#
+# Trei unghiuri peste acelasi lant de departamente prin care trece un mail:
+#   1) de cate ori a fost mutat un mail (distributie 0 / 1 / 2 / 3+),
+#   2) topul departamentelor care INITIAZA mutari (de pe cine pleaca mailul),
+#   3) topul departamentelor INTERMEDIARE (nici primul alocat, nici cel care inchide).
+#
+# Sursa: `cts_department_moves` (vezi migrations/20260819_cts_department_moves.sql) — un rand per
+# eveniment, scris de trigger la fiecare schimbare de departament pe cts_ground_truth. Lantul se
+# reconstruieste per MAIL (message_id), agregand tichetele lui (CTS face un tichet per destinatar)
+# si colapsand pasii consecutivi identici.
+#
+# LIMITARE (de spus si in UI): sync-ul CTS ruleaza la ~5 min, deci doua mutari intre doua rulari
+# se vad ca una singura, iar pentru mailurile de dinaintea migratiei avem doar pasul salvat in
+# cts_department_prev. Cifrele sunt un PLANSEU (sub-numarare), nu o valoare exacta.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEPT_REPORT_CTE = """
+WITH mail AS (
+    SELECT g.message_id,
+           min(COALESCE(g.cts_assigned_at, g.fetched_at)) AS started_at,
+           max(g.cts_solved_at) AS solved_at,
+           bool_or(lower(COALESCE(g.cts_status,'')) IN ('solved','rezolvat')) AS is_solved,
+           min(g.email_id) AS email_id
+      FROM cts_ground_truth g
+     WHERE COALESCE(g.cts_direction,'received') = 'received'
+       AND g.cts_deleted_at IS NULL
+       AND g.message_id IS NOT NULL
+     GROUP BY g.message_id
+    HAVING (CAST(:date_from AS date) IS NULL
+            OR min(COALESCE(g.cts_assigned_at, g.fetched_at)) >= CAST(:date_from AS date))
+       AND (CAST(:date_to AS date) IS NULL
+            OR min(COALESCE(g.cts_assigned_at, g.fetched_at)) < CAST(:date_to AS date) + interval '1 day')
+       AND (NOT CAST(:only_solved AS boolean)
+            OR bool_or(lower(COALESCE(g.cts_status,'')) IN ('solved','rezolvat')))
+),
+ev0 AS (
+    -- CTS face un tichet PER DESTINATAR, deci acelasi mail poate avea mai multe alocari
+    -- INITIALE (una per tichet). Le pastram doar pe cea mai veche — altfel replicile ar
+    -- aparea ca „mutari" care nu s-au intamplat. Mutarile reale (from_department NOT NULL)
+    -- se pastreaza toate, indiferent de tichet.
+    SELECT mv.message_id, mv.from_department, mv.to_department, mv.moved_at, mv.id,
+           row_number() OVER (PARTITION BY mv.message_id, (mv.from_department IS NULL)
+                              ORDER BY mv.moved_at, mv.id) AS rn_kind
+      FROM cts_department_moves mv
+      JOIN mail m ON m.message_id = mv.message_id
+     WHERE mv.to_department IS NOT NULL
+),
+ev AS (
+    SELECT message_id, to_department AS dep, moved_at, id,
+           lag(to_department) OVER (PARTITION BY message_id ORDER BY moved_at, id) AS prev_dep
+      FROM ev0
+     WHERE from_department IS NOT NULL OR rn_kind = 1
+),
+seq AS (
+    SELECT message_id, dep, moved_at,
+           row_number() OVER (PARTITION BY message_id ORDER BY moved_at, id) AS step,
+           count(*)     OVER (PARTITION BY message_id) AS steps
+      FROM ev
+     WHERE prev_dep IS NULL OR prev_dep IS DISTINCT FROM dep
+),
+kept AS (
+    SELECT message_id
+      FROM seq
+     GROUP BY message_id
+    HAVING CAST(:dept AS text) IS NULL OR bool_or(dep = CAST(:dept AS text))
+),
+ch AS (
+    SELECT s.* FROM seq s JOIN kept k ON k.message_id = s.message_id
+)
+"""
+
+
+def _dept_report_params(date_from: str, date_to: str, department: str, only_solved: int) -> dict:
+    """Normalizeaza filtrele comune ale raportului (date invalide -> ignorate, nu 400)."""
+    from datetime import date as _date
+
+    def _d(v):
+        try:
+            _date.fromisoformat((v or "").strip())
+            return v.strip()
+        except ValueError:
+            return None
+
+    dep = (department or "").strip() or None
+    if dep is not None and dep not in DEPT_LABELS:
+        dep = None
+    return {"date_from": _d(date_from), "date_to": _d(date_to), "dept": dep,
+            "only_solved": bool(only_solved)}
+
+
+def _lbl(slug):
+    return DEPT_LABELS.get(slug, slug or "—")
+
+
+def _pct(n, total):
+    return (round(100.0 * n / total, 1) if total else 0.0)
+
+
+@router.get("/cts-training/dept-report")
+def cts_training_dept_report(
+    date_from: str = Query("", description="data start YYYY-MM-DD (pe intrarea mailului)"),
+    date_to: str = Query("", description="data sfarsit YYYY-MM-DD"),
+    department: str = Query("", description="doar mailurile care au trecut prin acest departament"),
+    only_solved: int = Query(0, description="1 = doar mailurile inchise (solved)"),
+    top: int = Query(10, ge=3, le=30),
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Cele 3 statistici de mutari intre departamente + perechile din-in (pentru drill-down)."""
+    params = _dept_report_params(date_from, date_to, department, only_solved)
+
+    # 1) Distributia mailurilor dupa numarul de mutari (0 / 1 / 2 / 3+)
+    dist_rows = db.execute(text(_DEPT_REPORT_CTE + """
+        SELECT LEAST(steps - 1, 3) AS bucket, count(*) AS emails, sum(steps - 1) AS moves
+          FROM (SELECT message_id, max(steps) AS steps FROM ch GROUP BY message_id) t
+         GROUP BY 1 ORDER BY 1
+    """), params).fetchall()
+    by_bucket = {int(r._mapping["bucket"]): r._mapping for r in dist_rows}
+    total_emails = sum(int(m["emails"]) for m in by_bucket.values())
+    total_moves = sum(int(m["moves"] or 0) for m in by_bucket.values())
+    labels = {0: "0 (rezolvat de departamentul inițial)", 1: "1 mutare", 2: "2 mutări", 3: "3 sau mai multe mutări"}
+    distribution = [{
+        "bucket": b, "label": labels[b],
+        "emails": int(by_bucket[b]["emails"]) if b in by_bucket else 0,
+        "pct": _pct(int(by_bucket[b]["emails"]) if b in by_bucket else 0, total_emails),
+    } for b in (0, 1, 2, 3)]
+
+    # 2) Top departamente care fac mutari: la fiecare pas care NU e ultimul, departamentul
+    #    de pe care pleaca mailul a initiat o mutare.
+    init_rows = db.execute(text(_DEPT_REPORT_CTE + """
+        SELECT dep, count(*) AS n FROM ch WHERE step < steps GROUP BY dep ORDER BY n DESC
+    """), params).fetchall()
+    init_total = sum(int(r._mapping["n"]) for r in init_rows)
+    initiators = [{"department": r._mapping["dep"], "label": _lbl(r._mapping["dep"]),
+                   "moves": int(r._mapping["n"]), "pct": _pct(int(r._mapping["n"]), init_total)}
+                  for r in init_rows][:top]
+
+    # 3) Top departamente intermediare: pasi care nu sunt nici primul (alocarea initiala),
+    #    nici ultimul (unde s-a oprit / s-a inchis mailul).
+    mid_rows = db.execute(text(_DEPT_REPORT_CTE + """
+        SELECT dep, count(*) AS n FROM ch WHERE step > 1 AND step < steps GROUP BY dep ORDER BY n DESC
+    """), params).fetchall()
+    mid_total = sum(int(r._mapping["n"]) for r in mid_rows)
+    intermediaries = [{"department": r._mapping["dep"], "label": _lbl(r._mapping["dep"]),
+                       "n": int(r._mapping["n"]), "pct": _pct(int(r._mapping["n"]), mid_total)}
+                      for r in mid_rows][:top]
+
+    # Perechile din -> in (traseele concrete), pentru tabelul de sub grafice.
+    pair_rows = db.execute(text(_DEPT_REPORT_CTE + """
+        SELECT f, t, count(*) AS n FROM (
+            SELECT message_id, dep AS t,
+                   lag(dep) OVER (PARTITION BY message_id ORDER BY step) AS f
+              FROM ch
+        ) x WHERE f IS NOT NULL GROUP BY f, t ORDER BY n DESC LIMIT :lim
+    """), dict(params, lim=top * 2)).fetchall()
+    pairs = [{"from": r._mapping["f"], "from_label": _lbl(r._mapping["f"]),
+              "to": r._mapping["t"], "to_label": _lbl(r._mapping["t"]),
+              "n": int(r._mapping["n"]), "pct": _pct(int(r._mapping["n"]), total_moves)}
+             for r in pair_rows]
+
+    # Acoperire: de cand avem captura completa (trigger) vs. ce s-a putut reconstitui la migrare.
+    cov = db.execute(text(
+        "SELECT count(*) FILTER (WHERE detected_by='trigger') AS live, "
+        "       count(*) FILTER (WHERE detected_by='backfill') AS backfilled, "
+        "       min(moved_at) FILTER (WHERE detected_by='trigger') AS live_since "
+        "  FROM cts_department_moves")).fetchone()
+
+    moved = total_emails - (distribution[0]["emails"] if distribution else 0)
+    return {
+        "totals": {
+            "emails": total_emails,
+            "moved_emails": moved,
+            "moved_pct": _pct(moved, total_emails),
+            "moves": total_moves,
+            "avg_moves": (round(total_moves / total_emails, 2) if total_emails else 0),
+        },
+        "distribution": distribution,
+        "initiators": initiators,
+        "intermediaries": intermediaries,
+        "pairs": pairs,
+        "coverage": {
+            "live_events": int(cov._mapping["live"] or 0),
+            "backfilled_events": int(cov._mapping["backfilled"] or 0),
+            "live_since": cov._mapping["live_since"],
+        },
+        "filters": {"date_from": params["date_from"], "date_to": params["date_to"],
+                    "department": params["dept"], "only_solved": params["only_solved"]},
+    }
+
+
+@router.get("/cts-training/dept-report/cases")
+def cts_training_dept_report_cases(
+    date_from: str = Query(""),
+    date_to: str = Query(""),
+    department: str = Query("", description="doar mailurile care au trecut prin acest departament"),
+    only_solved: int = Query(0),
+    min_moves: int = Query(1, ge=0, le=10),
+    dept_from: str = Query("", description="departamentul care a initiat o mutare"),
+    dept_mid: str = Query("", description="departament aparut ca INTERMEDIAR pe lant"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Cazurile concrete din spatele statisticilor: un rand per mail, cu lantul de departamente.
+
+    Filtrele `dept_from` / `dept_mid` corespund click-ului pe o linie din statistica 2 / 3."""
+    params = _dept_report_params(date_from, date_to, department, only_solved)
+    d_from = (dept_from or "").strip() or None
+    d_mid = (dept_mid or "").strip() or None
+    params.update({"min_moves": min_moves,
+                   "d_from": d_from if d_from in DEPT_LABELS else None,
+                   "d_mid": d_mid if d_mid in DEPT_LABELS else None})
+
+    per_mail = _DEPT_REPORT_CTE + """
+    , agg AS (
+        SELECT c.message_id,
+               max(c.steps) - 1 AS moves,
+               min(c.moved_at)  AS first_at,
+               max(c.moved_at)  AS last_move_at,
+               string_agg(c.dep, ' → ' ORDER BY c.step) AS chain,
+               (array_agg(c.dep ORDER BY c.step))[1] AS first_dep,
+               (array_agg(c.dep ORDER BY c.step DESC))[1] AS last_dep
+          FROM ch c
+         GROUP BY c.message_id
+        HAVING max(c.steps) - 1 >= :min_moves
+           AND (CAST(:d_from AS text) IS NULL
+                OR bool_or(c.dep = CAST(:d_from AS text) AND c.step < c.steps))
+           AND (CAST(:d_mid AS text) IS NULL
+                OR bool_or(c.dep = CAST(:d_mid AS text) AND c.step > 1 AND c.step < c.steps))
+    )
+    """
+
+    total = db.execute(text(per_mail + " SELECT count(*) FROM agg"), params).scalar() or 0
+    rows = db.execute(text(per_mail + """
+        SELECT a.message_id, a.moves, a.chain, a.first_dep, a.last_dep,
+               a.first_at, a.last_move_at, m.email_id, m.solved_at, m.is_solved,
+               e.subject, e.from_address, e.received_at
+          FROM agg a
+          JOIN mail m ON m.message_id = a.message_id
+          LEFT JOIN emails e ON e.id = m.email_id
+         ORDER BY a.moves DESC, a.last_move_at DESC
+         LIMIT :page_size OFFSET :offset
+    """), dict(params, page_size=page_size, offset=(page - 1) * page_size)).fetchall()
+
+    items = [{
+        "message_id": m["message_id"], "email_id": m["email_id"],
+        "moves": int(m["moves"]), "chain": m["chain"],
+        "chain_labels": " → ".join(_lbl(s) for s in (m["chain"] or "").split(" → ") if s),
+        "first_department": m["first_dep"], "first_department_label": _lbl(m["first_dep"]),
+        "last_department": m["last_dep"], "last_department_label": _lbl(m["last_dep"]),
+        "first_at": m["first_at"], "last_move_at": m["last_move_at"],
+        "solved_at": m["solved_at"], "is_solved": bool(m["is_solved"]),
+        "subject": m["subject"], "from_address": m["from_address"], "received_at": m["received_at"],
+    } for m in (r._mapping for r in rows)]
+    return {"total": int(total), "page": page, "page_size": page_size, "items": items}

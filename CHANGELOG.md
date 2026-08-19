@@ -8,6 +8,42 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v2.18.0 - 2026-08-19
+
+### MINOR — Tab „Raport departamente" în Mail-uri CTS
+
+Raport nou peste traseul unui mail prin departamente, cu 3 unghiuri (conform modelului
+`Model_tabele_grafice_CargoTrack.docx`), fiecare cu grafic + tabel și drill-down pe mailurile concrete:
+
+1. **Distribuția mailurilor după numărul de mutări** (0 / 1 / 2 / 3+).
+2. **Top departamente care fac mutările** — cine trimite mailul mai departe.
+3. **Top departamente intermediare** — nici primele alocate, nici cele care închid mailul.
+   Plus tabel „trasee frecvente" (din → în) și KPI: mailuri analizate, % mutate, total mutări, medie/mail.
+
+Layout: **un indice pe rând**, fiecare card pe toată lățimea, împărțit în tabel compact (30%, top 10
+departamente cu mutări ≠ 0) + grafic (70%): donut pentru distribuția mutărilor, bare orizontale pentru
+topuri. Click pe orice linie din tabel → lista de mailuri din spatele cifrei.
+
+**Istoric mutări (nou):** `cts_department_moves` — un rând per eveniment (alocare inițială + fiecare
+schimbare de departament), scris de un trigger pe `cts_ground_truth`
+(`migrations/20260819_cts_department_moves.sql`). Migrația face și backfill din
+`cts_department_prev` / `changed_at` (singurul pas de istorie păstrat până acum).
+
+**Limitare cunoscută (afișată în UI):** sync-ul CTS rulează la ~5 min, deci două mutări între două
+sincronizări apar ca una singură, iar pe datele reconstituite lanțul are maxim un pas → statistica 3
+(intermediari) rămâne aproape goală până se adună date live. Preluarea istoricului complet de alocări
+din CTS rămâne task separat.
+
+### Eliminat — cardul „Clienți la risc real" din Satisfacție clienți
+
+Scos definitiv din UI (`SatisfactieDashboard`) și din backend: query-ul `at_risk` și câmpul omonim
+din `GET /api/v1/clients/satisfaction-stats` nu se mai calculează (o interogare mai puțin per
+încărcare de dashboard). Restul secțiunilor (top satisfăcuți, nesatisfăcuți <70%, segmente, semnale)
+rămân neschimbate.
+
+**Endpoints:** `GET /api/v1/cts-training/dept-report`, `GET /api/v1/cts-training/dept-report/cases`
+(filtre: interval, departament, doar mailuri închise; drill: `min_moves`, `dept_from`, `dept_mid`).
+
 ## v2.17.0 - 2026-08-18
 
 ### MINOR — Scripturi analiză apeluri V2 (3 actualizate + 2 noi)

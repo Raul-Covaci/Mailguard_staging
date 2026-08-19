@@ -55,6 +55,22 @@ modificările durabile se fac în fișierul din repo.
 
 ---
 
+## 🔀 MAIL-URI CTS — tab „Raport departamente" (2026-08-19)
+
+Traseul unui mail prin departamente. Sursa: **`cts_department_moves`** — un rând per eveniment
+(alocare inițială + fiecare schimbare de departament), populat de **trigger-ul**
+`trg_cts_gt_department_move` pe `cts_ground_truth` (migrația `20260819_cts_department_moves.sql`,
+singurul trigger din proiect; face și backfill din `cts_department_prev`/`changed_at`).
+
+- API: `GET /cts-training/dept-report` (3 statistici + trasee) și `/dept-report/cases` (drill-down).
+- UI: `CtsMailsShell` (tab-uri) → `CtsDeptReport` în `app/ui/vendor/mg-app.js`.
+- Lanțul se reconstruiește per `message_id`; alocările inițiale ale **replicilor** (CTS face un tichet
+  per destinatar) se colapsează la cea mai veche, altfel apar mutări inexistente.
+- Limitare: sync la ~5 min ⇒ mutările din același interval se văd ca una singură; istoricul complet
+  de alocări trebuie cerut de la CTS (task viitor). Cifrele sunt un minim, nu exact.
+
+---
+
 > Istoric dezvoltare (note tehnice cronologice pre-2026-06-15): vezi CLAUDE-HISTORY.md
 
 ---

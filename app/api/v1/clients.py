@@ -393,44 +393,6 @@ def get_satisfaction_stats(
             "red_flags": red_flags,
         })
 
-    # ── Clienți la risc (segment critic/la_risc) ──────────────────────────
-    at_risk_rows = db.execute(text("""
-        SELECT s.client_id, c.name, s.satisfaction_pct, s.breakdown
-        FROM client_satisfaction_snapshots s
-        JOIN clients c ON c.id = s.client_id
-        WHERE s.month_key = :mk AND s.satisfaction_pct IS NOT NULL
-          AND c.satisfaction_exclude = FALSE
-          AND (
-            s.breakdown->>'segment' IN ('"critic"', '"la_risc"', 'critic', 'la_risc')
-            OR (s.breakdown->'segment') #>> '{}' IN ('critic', 'la_risc')
-          )
-        ORDER BY s.satisfaction_pct ASC LIMIT 30
-    """), {"mk": last_month}).fetchall()
-    at_risk = []
-    for r in at_risk_rows:
-        bd = _parse_bd(r._mapping["breakdown"])
-        reasoning = ""
-        segment = ""
-        confidence = None
-        red_flags = []
-        if bd and isinstance(bd, dict):
-            reasoning = bd.get("iris_reasoning") or ""
-            if not reasoning:
-                ih = bd.get("iris_holistic") or {}
-                reasoning = ih.get("reasoning", "")
-            segment = bd.get("segment", "")
-            confidence = bd.get("confidence")
-            red_flags = bd.get("red_flags_active") or []
-        at_risk.append({
-            "client_id": r._mapping["client_id"],
-            "name": r._mapping["name"],
-            "satisfaction_pct": float(r._mapping["satisfaction_pct"] or 0),
-            "reasoning": reasoning,
-            "segment": segment,
-            "confidence": float(confidence) if confidence is not None else None,
-            "red_flags": red_flags,
-        })
-
     # ── Distribuție pe segmente ───────────────────────────────────────────
     seg_rows = db.execute(text("""
         SELECT (breakdown->'segment') #>> '{}' AS segment, COUNT(*) AS cnt
@@ -485,7 +447,6 @@ def get_satisfaction_stats(
         "movers": movers,
         "summary": summary,
         "top_satisfied": top_satisfied,
-        "at_risk": at_risk,
         "segment_distribution": segment_distribution,
         "signal_distribution": signal_distribution,
         "trend_assessment_distribution": trend_assessment_distribution,
