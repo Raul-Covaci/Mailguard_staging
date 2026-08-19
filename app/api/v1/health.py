@@ -5,6 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database import get_db
+# Leg-urile duplicate de centrala (acelasi apel logat pe doua canale) nu se numara in
+# statistici — regula unica, vezi productivity.apel_no_dup_leg_sql.
+from app.services import productivity as _prod
+_SRC_CALLS = "(SELECT * FROM calls _c WHERE " + _prod.apel_no_dup_leg_sql("_c") + ")"
 from app.config import get_settings
 
 router = APIRouter()
@@ -384,7 +388,7 @@ def stats_calls_dashboard(date_from: Optional[str] = Query(None),
                            AND call_status NOT IN ('ANSWERED','NO ANSWER','BUSY')) AS status_other,
           ROUND(AVG(duration_seconds)) AS avg_duration_seconds,
           COALESCE(SUM(duration_seconds), 0) AS total_duration_seconds
-        FROM calls
+        FROM {_SRC_CALLS} calls
         WHERE {rf}
     """), rp).fetchone()
     d = dict(row._mapping) if row else {}
@@ -412,7 +416,7 @@ def stats_calls_daily(days: int = Query(14, ge=1, le=90),
                 COUNT(*) FILTER (WHERE direction='outbound') AS outbound,
                 COUNT(*) FILTER (WHERE call_status='ANSWERED') AS answered,
                 COUNT(*) AS total
-            FROM calls
+            FROM {_SRC_CALLS} calls
             WHERE {wsql}
             GROUP BY date(started_at)
         )
@@ -452,7 +456,7 @@ def stats_calls_daily_category(days: int = Query(31, ge=1, le=92),
                COUNT(*) FILTER (WHERE ai_category='sesizare')   AS sesizare,
                COUNT(*) FILTER (WHERE ai_category='reclamatie') AS reclamatie,
                COUNT(*) FILTER (WHERE ai_category='necunoscut') AS necunoscut
-        FROM calls
+        FROM {_SRC_CALLS} calls
         WHERE {wsql} AND ai_category IS NOT NULL
         GROUP BY date(started_at)
         HAVING COUNT(*) FILTER (WHERE ai_category IS NOT NULL) > 0
@@ -483,7 +487,7 @@ def stats_calls_overview(date_from: Optional[str] = Query(None),
         ),
         agg AS (
             SELECT date_trunc('hour', started_at) AS h, COUNT(*) AS n
-            FROM calls WHERE started_at > {anchor} - INTERVAL '24 hours'
+            FROM {_SRC_CALLS} calls WHERE started_at > {anchor} - INTERVAL '24 hours'
               AND started_at <= {anchor}
             GROUP BY 1
         )
@@ -494,7 +498,7 @@ def stats_calls_overview(date_from: Optional[str] = Query(None),
     try:
         crows = db.execute(text(f"""
             SELECT cl.name AS name, COUNT(*) AS n
-            FROM calls c JOIN clients cl ON cl.id = c.client_id
+            FROM {_SRC_CALLS} c JOIN clients cl ON cl.id = c.client_id
             WHERE c.client_id IS NOT NULL
               AND {rf_c}
             GROUP BY cl.name ORDER BY n DESC, cl.name LIMIT 8
@@ -504,7 +508,7 @@ def stats_calls_overview(date_from: Optional[str] = Query(None),
         top_clients = []
     arows = db.execute(text(f"""
         SELECT ai_assignee AS name, COUNT(*) AS n
-        FROM calls WHERE ai_assignee IS NOT NULL
+        FROM {_SRC_CALLS} calls WHERE ai_assignee IS NOT NULL
           AND {rf}
         GROUP BY ai_assignee ORDER BY n DESC LIMIT 8
     """), rp).fetchall()

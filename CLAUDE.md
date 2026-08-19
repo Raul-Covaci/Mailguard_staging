@@ -85,6 +85,13 @@ utilizabil → `department_schedule`; fără nici program → ziua nu curge; 0 p
 funcția SQL `business_minutes_emp` (task-uri) — vezi
 `migrations/20260819d_business_minutes_pontaj_first.sql`.
 
+📞 **Apeluri — leg-uri duplicate.** Centrala scrie un CDR per canal apelat, deci un apel apare de
+două ori: leg `NO ANSWER` de 0s + leg-ul răspuns. În LISTE/statistici se ascunde leg-ul nerăspuns
+dacă are sibling răspuns în ±15 min (`productivity.apel_no_dup_leg_sql`); apelurile pierdute reale
+rămân. În CALCUL nu conta niciodată (se folosește `_APEL_REAL_CALL_SQL`). Timpul de răspuns vine din
+`calls.ring_seconds`; pe rândurile vechi e NULL → „nemăsurat", se completează cu
+`POST /calls/backfill-ring?date_from&date_to`.
+
 Excluderi din calcul: **doar** flagul `clients.productivity_exclude` (fără liste hardcodate în cod).
 Se aplică pe toate canalele, cu legături diferite per sursă: mail = `emails.client_id` + clientul
 atribuit în CTS (`extra.client_id` = ID IRIS); task = ID IRIS + nume; apel = cheia locală;

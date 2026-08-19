@@ -998,6 +998,30 @@ _APEL_LOST_CALL_SQL = """NOT EXISTS (
 # Leg neraspuns (inclusiv BUSY) — complementul lui `_APEL_REAL_CALL_SQL` pe acelasi rind.
 _APEL_UNANSWERED_SQL = "NOT (c.call_status = 'ANSWERED' AND COALESCE(c.duration_seconds, 0) > 1)"
 
+# LEG DUPLICAT. Centrala suna in PARALEL pe mai multe aparate si logheaza un CDR per canal, deci
+# acelasi apel fizic apare de doua ori: un leg 'NO ANSWER' de 0s (fara `callee_number`, fara
+# inregistrare) si leg-ul raspuns, cu durata reala. Exemplu real (productie): 0744525434 ->
+# 18.08 17:07 „0:00 / fara conversatie" + 18.08 17:06 „2:32 / informatie", acelasi agent.
+# In LISTE (pagina Apeluri, tab-ul Apeluri al clientului) leg-ul neraspuns trebuie ASCUNS cand
+# exista un sibling raspuns pentru acelasi numar in +/-15 min -- adica exact cand NU e apel
+# pierdut. Apelurile pierdute REALE (fara sibling raspuns) ramin vizibile.
+# Pe august 2026: 1561 de leg-uri duplicate ascunse, 666 apeluri pierdute reale pastrate.
+# In calcul nu se schimba nimic: scorul foloseste deja `_APEL_REAL_CALL_SQL`.
+# `{c}` = alias-ul tabelei `calls` in query-ul gazda.
+_APEL_DUP_LEG_TPL = """({c}.direction = 'inbound'
+      AND NOT ({c}.call_status = 'ANSWERED' AND COALESCE({c}.duration_seconds, 0) > 1)
+      AND EXISTS (SELECT 1 FROM calls _sib
+                   WHERE _sib.direction = 'inbound'
+                     AND _sib.caller_number = {c}.caller_number
+                     AND _sib.call_status = 'ANSWERED' AND COALESCE(_sib.duration_seconds, 0) > 1
+                     AND _sib.started_at BETWEEN {c}.started_at - INTERVAL '15 minutes'
+                                             AND {c}.started_at + INTERVAL '15 minutes'))"""
+
+
+def apel_no_dup_leg_sql(alias: str = "c") -> str:
+    """Predicat pentru LISTE: ascunde leg-urile duplicate ale aceluiasi apel (vezi _APEL_DUP_LEG_TPL)."""
+    return "NOT " + _APEL_DUP_LEG_TPL.format(c=alias)
+
 # Varianta cu LEFT JOIN pe angajat, pentru LISTE (pagina Apeluri), nu pentru calcul: acolo un apel
 # neatribuibil trebuie sa ramina vizibil, cu operator gol, nu sa dispara din tabel. Derivata din
 # aceeasi constanta ca sa nu existe doua reguli de atribuire care pot diverge in timp.

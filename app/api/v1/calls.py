@@ -15,6 +15,7 @@ from app.services import call_audio
 # Atribuirea apel -> angajat (3 trepte: mapare invatata din CTS, potrivire pe nume, assignee CTS)
 # e definita o singura data, in modulul de productivitate. O reimplementare aici ar diverge de
 # cifrele din Productivitate exact pe cazurile grele (nume scrise altfel de While1).
+from app.services import productivity as P
 from app.services.productivity import _APEL_AGENT_CTE, _APEL_AGENT_JOIN_LEFT
 
 logger = logging.getLogger("mailguard.calls")
@@ -59,10 +60,16 @@ def list_calls(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     dir: str = Query("desc", description="ordonare dupa started_at: 'asc' | 'desc'"),
+    include_legs: int = Query(0, description="1 = arata si leg-urile duplicate de centrala (debug)"),
     db: Session = Depends(get_db),
 ):
     where = ["1=1"]
     params = {}
+    # Centrala logheaza un CDR per canal apelat, deci acelasi apel fizic apare de doua ori: leg-ul
+    # 'NO ANSWER' de 0s si cel raspuns. Lista ascunde primul cand exista sibling raspuns in +/-15
+    # min (regula unica, din productivity: apel_no_dup_leg_sql). Apelurile pierdute REALE ramin.
+    if not include_legs:
+        where.append(P.apel_no_dup_leg_sql("c"))
     if direction:
         where.append("c.direction = :dir"); params["dir"] = direction
     if ai_category:
@@ -208,6 +215,24 @@ def download_call_audio(call_id: int, db: Session = Depends(get_db),
 def calls_sync_now(limit: int = Query(200, ge=1, le=1000)):
     from app.services import while1_ingest
     return while1_ingest.sync_run(limit=limit)
+
+
+@router.post("/calls/backfill-ring")
+def calls_backfill_ring(date_from: str = Query(..., description="'YYYY-MM-DD' sau 'YYYY-MM-DD HH:MM:SS'"),
+                        date_to: str = Query(..., description="'YYYY-MM-DD' sau 'YYYY-MM-DD HH:MM:SS'"),
+                        admin=Depends(get_current_admin)):
+    """Completeaza `calls.ring_seconds` pe un interval deja ingerat, re-interogand While1.
+
+    De ce e nevoie: coloana a aparut in migrarea 20260813c, dupa ce ingestul rula de luni, iar
+    cursorul incremental nu mai atinge randurile vechi. Fara timpul de raspuns, apelurile ies
+    „nemasurate" in productivitate desi sint apeluri reale (pe august 2026: 922 din 2127 de
+    apeluri primite si raspunse). Idempotent: completeaza doar unde e NULL, nu rescrie CDR-ul.
+    """
+    from app.services import while1_ingest
+    def _norm(v: str) -> str:
+        v = (v or "").strip()
+        return v if len(v) > 10 else (v + " 00:00:00")
+    return while1_ingest.backfill_ring_seconds(_norm(date_from), _norm(date_to))
 
 
 @router.post("/calls/process-now")

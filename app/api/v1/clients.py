@@ -21,6 +21,13 @@ from app.config import get_settings
 from app.database import get_db
 from app.services import iris_sync
 from app.services import iris_ai
+# Regula de ascundere a leg-urilor duplicate de centrala (apeluri) sta in productivity,
+# ca lista de apeluri a clientului si pagina Apeluri sa nu poata diverge.
+from app.services import productivity as _prod
+
+# Predicatele „fara leg-uri duplicate de centrala", pe alias-urile folosite in contoare.
+_NO_DUP_CA = _prod.apel_no_dup_leg_sql("ca")
+_NO_DUP_CL = _prod.apel_no_dup_leg_sql("cl")
 from app.services import satisfaction_engine
 from app.services import satisfaction_snapshot
 from app.services import cts_groundtruth_sync as _cts_sync
@@ -118,8 +125,10 @@ def list_clients(db: Session = Depends(get_db), page: int = 1, q: str = "",
                -- Apeluri: aceeasi imagine ca la mailuri (primite / date), ca lista sa arate
                -- toata conversatia cu clientul, nu doar canalul de email. `direction` e
                -- 'inbound'/'outbound' in tabela calls.
+               -- fara leg-urile duplicate de centrala (vezi apel_no_dup_leg_sql)
                (SELECT COUNT(*) FROM calls ca
-                  WHERE ca.client_id = c.id AND ca.direction = 'inbound') AS call_in_count,
+                  WHERE ca.client_id = c.id AND ca.direction = 'inbound'
+                    AND {_NO_DUP_CA}) AS call_in_count,
                (SELECT COUNT(*) FROM calls ca
                   WHERE ca.client_id = c.id AND ca.direction = 'outbound') AS call_out_count,
                (SELECT COUNT(*) FROM client_vehicles v WHERE v.client_id = c.id) AS vehicle_count,
@@ -161,7 +170,7 @@ def get_satisfaction_sample(
     Praguri: very_active>=20, active>=5, low_active>=1, inactive=0.
     Returnează client_id + name + activity_score per bucket + random.
     """
-    sample_sql = """
+    sample_sql = f"""
     WITH activity AS (
         SELECT c.id, c.iris_client_id, c.name,
             (
@@ -173,6 +182,7 @@ def get_satisfaction_sample(
                 SELECT COUNT(*) FROM calls cl
                 WHERE cl.client_id = c.id
                   AND cl.started_at > NOW() - (:wd * INTERVAL '1 day')
+                  AND {_NO_DUP_CL}
             ) AS activity_score
         FROM clients c WHERE c.is_active = true
     ),
@@ -501,7 +511,7 @@ def export_duplicate_contacts(db: Session = Depends(get_db)):
 
 @router.get("/clients/{client_id}")
 def get_client(client_id: int, db: Session = Depends(get_db)):
-    row = db.execute(text("""
+    row = db.execute(text(f"""
         SELECT id, iris_client_id, name, emails, phones, is_active,
                last_synced_at, satisfaction_exclude, email_priority,
                feedback_opt_out,
@@ -528,7 +538,8 @@ def get_client(client_id: int, db: Session = Depends(get_db)):
                ) AS sent_count,
                (SELECT COUNT(*) FROM client_vehicles v WHERE v.client_id = c.id) AS vehicle_count,
                (SELECT COUNT(*) FROM client_contracts ct WHERE ct.client_id = c.id) AS contract_count,
-               (SELECT COUNT(*) FROM calls cl WHERE cl.client_id = c.id) AS call_count,
+               (SELECT COUNT(*) FROM calls cl WHERE cl.client_id = c.id
+                  AND {_NO_DUP_CL}) AS call_count,
                (SELECT COUNT(*) FROM cts_task_ground_truth t WHERE t.client_id = c.iris_client_id) AS task_count
         FROM clients c WHERE c.id = :cid AND c.is_active = true
     """), {"cid": client_id}).fetchone()
@@ -687,17 +698,22 @@ def client_calls(client_id: int, db: Session = Depends(get_db), page: int = 1):
     """T4: Apelurile clientului, paginate, ordonate descrescător."""
     per_page = 40
     offset = (page - 1) * per_page
-    rows = db.execute(text("""
-        SELECT id, call_id, direction, caller_number, callee_number, agent_extension,
-               started_at, duration_seconds, ai_category, ai_tone, ai_department,
-               ai_priority, call_status, transcript_status
-        FROM calls
-        WHERE client_id = :cid
-        ORDER BY started_at DESC NULLS LAST
+    # Leg-urile duplicate de centrala (0s, 'NO ANSWER', cu sibling raspuns in +/-15 min) nu se
+    # afiseaza: acelasi apel fizic aparea de doua ori in istoricul clientului. Regula e comuna cu
+    # pagina Apeluri -- vezi productivity.apel_no_dup_leg_sql.
+    _no_dup = _prod.apel_no_dup_leg_sql("c")
+    rows = db.execute(text(f"""
+        SELECT c.id, c.call_id, c.direction, c.caller_number, c.callee_number, c.agent_extension,
+               c.started_at, c.duration_seconds, c.ai_category, c.ai_tone, c.ai_department,
+               c.ai_priority, c.call_status, c.transcript_status
+        FROM calls c
+        WHERE c.client_id = :cid AND {_no_dup}
+        ORDER BY c.started_at DESC NULLS LAST
         LIMIT :lim OFFSET :off
     """), {"cid": client_id, "lim": per_page, "off": offset}).fetchall()
     total = db.execute(
-        text("SELECT COUNT(*) FROM calls WHERE client_id = :cid"), {"cid": client_id}
+        text(f"SELECT COUNT(*) FROM calls c WHERE c.client_id = :cid AND {_no_dup}"),
+        {"cid": client_id}
     ).scalar() or 0
     total_pages = max(1, (total + per_page - 1) // per_page)
     return {"total": total, "page": page, "total_pages": total_pages,

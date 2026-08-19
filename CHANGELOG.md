@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.2.0 - 2026-08-19
+
+### MINOR — Apelurile nu mai apar dublate (leg-uri de centrală)
+
+Centrala sună în PARALEL pe mai multe aparate și scrie un CDR **per canal**, deci același apel
+fizic apărea de două ori în listă: un leg `NO ANSWER` de `0:00` („fără conversație / fără
+înregistrare", fără `callee_number`) și leg-ul răspuns, cu durata reală. Exemplu din producție:
+`0744525434` → 18.08 17:07 „0:00" + 18.08 17:06 „2:32", același agent, același client.
+
+Regulă nouă (`productivity.apel_no_dup_leg_sql`, o singură definiție): un leg de intrare nerăspuns
+se **ascunde** dacă există un leg răspuns pentru același număr în ±15 min — adică exact când nu e
+apel pierdut. **Apelurile pierdute reale rămân vizibile.** Pe august 2026: 1561 de leg-uri
+duplicate ascunse, 666 apeluri pierdute păstrate (filtrul „fără răspuns" arată acum 659 în loc de
+2215 rânduri brute).
+
+Aplicat în: pagina Apeluri (`GET /calls`, cu `include_legs=1` pentru inspecție), tab-ul Apeluri al
+clientului, contoarele de apeluri din lista și fișa clientului, `activity_score`, pagina Analitice
+(toate KPI-urile și seriile) și statisticile de Dashboard. Volume după colapsare, august: intrări
+4354 → 2793 rânduri.
+
+Calculul de productivitate **nu se schimbă** — folosea deja doar conversațiile reale
+(`_APEL_REAL_CALL_SQL`): scoruri identice înainte/după (suport_1 94,36 / suport_2 88,66 /
+taxe_drum 92,18).
+
+### MINOR — „Nemăsurat" pe apeluri reale: backfill `ring_seconds`
+
+Cauza nu e leg-ul de `0:00` (acela e deja exclus din calcul), ci lipsa timpului de răspuns:
+`calls.ring_seconds` a apărut în migrația `20260813c`, după ce ingestul While1 rula de luni, iar
+cursorul incremental nu mai atinge rândurile vechi. Pe august 2026: **922 din 2127** de apeluri
+primite și răspunse n-au nici `ring_seconds`, nici rând în CTS → ies „nemăsurate".
+
+Endpoint nou: `POST /api/v1/calls/backfill-ring?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD` (admin) —
+re-interoghează While1 pe interval și completează `ring_seconds` doar unde e NULL (idempotent, nu
+rescrie CDR-ul, nu mișcă cursorul incremental). Funcția exista în serviciu, dar nu era apelabilă.
+
 ## v3.1.0 - 2026-08-19
 
 ### MINOR — Timpul de lucru se măsoară pe PONTAJ, nu pe programul manual

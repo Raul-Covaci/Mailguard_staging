@@ -17,6 +17,8 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.api.v1.auth import get_current_admin
+# Regula unica de ascundere a leg-urilor duplicate de centrala (vezi apel_no_dup_leg_sql).
+from app.services import productivity as P
 
 _BATCH_JOBS_LOCK = threading.Lock()
 
@@ -84,6 +86,9 @@ def analytics_dashboard(
 
     agent_filter = _agent_dept_filter(agent, department, params)
     bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
+    # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
 
     kpi_sql = f"""
         SELECT
@@ -109,7 +114,7 @@ def analytics_dashboard(
             COUNT(cas.id) AS scored_calls
         FROM calls c
         LEFT JOIN call_ai_scores cas ON cas.call_id = c.id
-        WHERE {date_filter} {agent_filter} {bl_sql}
+        WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
     """
     kpi = db.execute(text(kpi_sql), params).fetchone()
 
@@ -137,7 +142,7 @@ def analytics_dashboard(
                 ROUND(AVG(cas.agent_score_total)::numeric, 2) AS avg_score
             FROM calls c
             LEFT JOIN call_ai_scores cas ON cas.call_id = c.id
-            WHERE {date_filter} {agent_filter} {bl_sql}
+            WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
             GROUP BY date(c.started_at)
         )
         SELECT to_char(ds.d, 'YYYY-MM-DD') AS day,
@@ -181,6 +186,9 @@ def analytics_top_clients(
     admin=Depends(get_current_admin),
 ):
     bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
+    # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
     params: dict = {"lim": limit}
     if date_from:
         date_filter = "c.started_at >= CAST(:date_from AS date)"
@@ -202,7 +210,7 @@ def analytics_top_clients(
         JOIN clients cl ON cl.id = c.client_id
         WHERE {date_filter}
           AND c.client_id IS NOT NULL
-          {bl_sql}
+          {bl_sql} {dup_sql}
         GROUP BY cl.id, cl.name
         ORDER BY call_count DESC
         LIMIT :lim
@@ -237,6 +245,9 @@ def analytics_scores(
         params["days"] = days
     agent_filter = _agent_dept_filter(agent, department, params)
     bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
+    # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
 
     sql = f"""
         SELECT
@@ -258,7 +269,7 @@ def analytics_scores(
         INNER JOIN call_ai_scores cas ON cas.call_id = c.id
         WHERE {date_filter}
           AND c.agent_extension IS NOT NULL
-          {agent_filter} {bl_sql}
+          {agent_filter} {bl_sql} {dup_sql}
         GROUP BY c.agent_extension
         ORDER BY agent_score_avg DESC NULLS LAST
     """
@@ -572,6 +583,9 @@ def analytics_binary_stats(
         params["days"] = days
     agent_filter = _agent_dept_filter(agent, department, params)
     bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
+    # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
 
     # Prompturile binare active din DB
     prompt_rows = db.execute(text(
@@ -599,7 +613,7 @@ def analytics_binary_stats(
                     COUNT(*) FILTER (WHERE cas.{col} IS NOT NULL) AS total
                 FROM calls c
                 INNER JOIN call_ai_scores cas ON cas.call_id = c.id
-                WHERE {date_filter} {agent_filter} {bl_sql}
+                WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
             """
             row = db.execute(text(sql), params).fetchone()
             if row:
@@ -628,7 +642,7 @@ def analytics_binary_stats(
                 COUNT(*) FILTER (WHERE {expr} IS NOT NULL) AS total
             FROM calls c
             INNER JOIN call_ai_scores cas ON cas.call_id = c.id
-            WHERE {date_filter} {agent_filter} {bl_sql}
+            WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
         """
         row = db.execute(text(sql), params).fetchone()
         if row:
@@ -664,6 +678,9 @@ def analytics_score_stats(
         params["days"] = days
     agent_filter = _agent_dept_filter(agent, department, params)
     bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
+    # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
 
     sql = f"""
         SELECT
@@ -683,7 +700,7 @@ def analytics_score_stats(
             ROUND(AVG(cas.customer_empathy)::numeric, 2)         AS customer_empathy
         FROM calls c
         INNER JOIN call_ai_scores cas ON cas.call_id = c.id
-        WHERE {date_filter} {agent_filter} {bl_sql}
+        WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
     """
     row = db.execute(text(sql), params).fetchone()
     if not row:
