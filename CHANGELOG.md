@@ -8,6 +8,24 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.3.1 - 2026-08-19
+
+### PATCH — Monitor: „Reclamații / În lucru" număra pe tot istoricul, nu pe luna afișată
+
+Cardul de departament punea alături două cifre cu numitori diferiți: **„Total lună"** (reclamațiile
+înregistrate în luna curentă) și **„În lucru"** (status 2 pe **tot istoricul**). De aceea Taxe de
+drum arăta „11 total / 9 în lucru" deși în luna curentă erau 3 în lucru — restul erau reclamații
+vechi, rămase deschise din lunile anterioare. Idem Suport 2: 6 total / 6 în lucru, în loc de 2.
+
+`noi` și `in_lucru` se raportează acum la **aceeași fereastră ca `total_luna`**, în ambele
+interogări ale monitorului (agregat + per departament). E aceeași convenție ca la mail/task, unde
+stările deschise se numără din ce a sosit în fereastra afișată, tocmai ca să nu apară restanța
+istorică din CTS.
+
+Verificat local (august): taxe_drum 10 total / **9 → 2** în lucru; suport_2 6 total / **6 → 4** în
+lucru; suport_1 și suport_3 neschimbate. `deschise` / `restante` / `peste_7z` rămân pe tot
+istoricul — sunt folosite de blocul `sesizari`, unde restanța chiar e subiectul.
+
 ## v3.3.0 - 2026-08-19
 
 ### MINOR — Zi fără nimeni pontat = zi inactivă (concediile nu mai consumă SLA)

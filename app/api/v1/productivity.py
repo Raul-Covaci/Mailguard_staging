@@ -945,8 +945,16 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                     AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
                    (qe.status IS DISTINCT FROM 3)                               AS deschisa,
                    -- status CTS: 1 = new, 2 = in progress, 3 = solved (vezi migrația 20260813d)
-                   (qe.status = 1)                                              AS noua,
-                   (qe.status = 2)                                              AS in_lucru,
+                   -- `noua` / `in_lucru` se raporteaza la LUNA CURENTA, ca `total_luna` de langa
+                   -- ele pe card. Pana la v3.3.1 numarau pe tot istoricul, deci cardul punea
+                   -- alaturi doua cifre cu numitori diferiti: „11 in luna" langa „9 in lucru",
+                   -- din care 7 erau reclamatii vechi, nu din luna afisata (taxe_drum, 19.08).
+                   -- Aceeasi conventie ca la mail/task pe monitor: fereastra afisata, nu restanta
+                   -- istorica.
+                   (qe.status = 1 AND date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                                     = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))  AS noua,
+                   (qe.status = 2 AND date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                                     = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))  AS in_lucru,
                    (date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
                       = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))       AS luna_curenta
             FROM cts_quality_evaluation qe
@@ -1301,8 +1309,12 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                        (qe.status = 3
                         AND DATE(qe.solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvat_azi,
                        (qe.status IS DISTINCT FROM 3)                               AS deschisa,
-                       (qe.status = 1)                                              AS noua,
-                       (qe.status = 2)                                              AS in_lucru,
+                       -- vezi nota de la interogarea de grup: fereastra e LUNA CURENTA,
+                       -- aceeasi ca `total_luna`, altfel cardul compara mere cu pere.
+                       (qe.status = 1 AND date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                                         = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))  AS noua,
+                       (qe.status = 2 AND date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
+                                         = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))  AS in_lucru,
                        (date_trunc('month', qe.created_at AT TIME ZONE '{_TZ}')
                           = date_trunc('month', (NOW() AT TIME ZONE '{_TZ}')))       AS luna_curenta
                 FROM cts_quality_evaluation qe
