@@ -999,13 +999,25 @@ _APEL_LOST_CALL_SQL = """NOT EXISTS (
 _APEL_UNANSWERED_SQL = "NOT (c.call_status = 'ANSWERED' AND COALESCE(c.duration_seconds, 0) > 1)"
 
 # LEG DUPLICAT. Centrala suna in PARALEL pe mai multe aparate si logheaza un CDR per canal, deci
-# acelasi apel fizic apare de doua ori: un leg 'NO ANSWER' de 0s (fara `callee_number`, fara
-# inregistrare) si leg-ul raspuns, cu durata reala. Exemplu real (productie): 0744525434 ->
-# 18.08 17:07 „0:00 / fara conversatie" + 18.08 17:06 „2:32 / informatie", acelasi agent.
-# In LISTE (pagina Apeluri, tab-ul Apeluri al clientului) leg-ul neraspuns trebuie ASCUNS cand
-# exista un sibling raspuns pentru acelasi numar in +/-15 min -- adica exact cand NU e apel
-# pierdut. Apelurile pierdute REALE (fara sibling raspuns) ramin vizibile.
-# Pe august 2026: 1561 de leg-uri duplicate ascunse, 666 apeluri pierdute reale pastrate.
+# acelasi apel fizic apare de doua ori: un leg 'NO ANSWER' de 0s si leg-ul raspuns, cu durata
+# reala. Exemplu real (productie): 0744525434 -> 18.08 17:07 „0:00 / fara conversatie" + 18.08
+# 17:06 „2:32 / informatie", acelasi agent.
+#
+# SEMNATURA leg-ului fantoma (masurat pe iulie+august): `callee_number IS NULL` si sibling raspuns
+# la citeva SECUNDE. Din 5352 de leg-uri nerapunse cu sibling raspuns in +/-15 min, 4493 aveau
+# `callee_number` NULL, iar 4900 din ele erau la sub 150s de sibling. Restul (sibling la 5-15 min,
+# cu callee completat) NU sint leg-uri paralele, ci REAPELARI: clientul a sunat, n-a prins, a sunat
+# iar mai tirziu. Prima incercare e un apel pierdut REAL si trebuie sa ramina vizibila.
+#
+# De aceea regula nu mai e „orice nerapuns cu sibling in +/-15 min", ci:
+#   * `callee_number IS NULL` si sibling raspuns in +/-2 min  (leg de ring paralel), SAU
+#   * sibling raspuns in +/-30 s, indiferent de callee     (acelasi eveniment fizic).
+# Efect pe august: 1365 ascunse (fata de 1561 cu regula veche) si 862 apeluri pierdute vizibile
+# (fata de 666) -- 196 de apeluri pierdute reale nu mai dispar din raport.
+#
+# ATENTIE, nu se aplica pe IESIRI: acolo un leg 'BUSY'/'NO ANSWER' urmat de o reusita e o
+# reapelare reala a operatorului (verificat: toate „suspectele" de pe outbound au numar valid si
+# status BUSY/NO ANSWER), deci ascunderea lor ar sterge munca facuta.
 # In calcul nu se schimba nimic: scorul foloseste deja `_APEL_REAL_CALL_SQL`.
 # `{c}` = alias-ul tabelei `calls` in query-ul gazda.
 _APEL_DUP_LEG_TPL = """({c}.direction = 'inbound'
@@ -1014,8 +1026,11 @@ _APEL_DUP_LEG_TPL = """({c}.direction = 'inbound'
                    WHERE _sib.direction = 'inbound'
                      AND _sib.caller_number = {c}.caller_number
                      AND _sib.call_status = 'ANSWERED' AND COALESCE(_sib.duration_seconds, 0) > 1
-                     AND _sib.started_at BETWEEN {c}.started_at - INTERVAL '15 minutes'
-                                             AND {c}.started_at + INTERVAL '15 minutes'))"""
+                     AND ((({c}.callee_number IS NULL)
+                           AND _sib.started_at BETWEEN {c}.started_at - INTERVAL '2 minutes'
+                                                   AND {c}.started_at + INTERVAL '2 minutes')
+                          OR _sib.started_at BETWEEN {c}.started_at - INTERVAL '30 seconds'
+                                                 AND {c}.started_at + INTERVAL '30 seconds')))"""
 
 
 def apel_no_dup_leg_sql(alias: str = "c") -> str:

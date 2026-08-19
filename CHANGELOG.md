@@ -8,6 +8,31 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.2.1 - 2026-08-19
+
+### PATCH — Dedupare apeluri: nu mai ascunde apelurile pierdute reale
+
+Regula din v3.2.0 („leg nerăspuns cu sibling răspuns în ±15 min") era prea largă: ascundea și
+cazul în care clientul a sunat, n-a prins, și a sunat DIN NOU peste câteva minute — prima încercare
+e un apel pierdut real, nu un leg de centrală.
+
+Semnătura leg-ului fantomă, măsurată pe iulie+august: `callee_number IS NULL` + sibling răspuns la
+câteva secunde (din 5352 de legături nerăspunse cu sibling, **4493 aveau `callee_number` NULL**, iar
+4900 erau la sub 150s de sibling). Regula devine:
+
+- `callee_number IS NULL` **și** sibling răspuns în ±2 min (ring paralel), **sau**
+- sibling răspuns în ±30 s, indiferent de `callee_number` (același eveniment fizic).
+
+Efect pe august: 1365 leg-uri ascunse (față de 1561) și **862 apeluri pierdute vizibile (față de
+666)** — 196 de apeluri pierdute reale nu mai dispar din raport. Cazul de referință
+(`0747586201`, leg 0s + răspuns la 26s) rămâne colapsat corect.
+
+**Ieșirile NU se deduplică** (verificat pe cerere): „suspectele" de pe outbound au număr valid și
+status `BUSY`/`NO ANSWER`, urmate de o reușită — sunt reapelări reale ale operatorului, nu leg-uri
+fantomă. Ascunderea lor ar șterge muncă făcută.
+
+Calculul de productivitate rămâne neatins (folosea deja `_APEL_REAL_CALL_SQL`).
+
 ## v3.2.0 - 2026-08-19
 
 ### MINOR — Apelurile nu mai apar dublate (leg-uri de centrală)

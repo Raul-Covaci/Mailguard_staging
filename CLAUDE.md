@@ -87,8 +87,10 @@ funcția SQL `business_minutes_emp` (task-uri) — vezi
 
 📞 **Apeluri — leg-uri duplicate.** Centrala scrie un CDR per canal apelat, deci un apel apare de
 două ori: leg `NO ANSWER` de 0s + leg-ul răspuns. În LISTE/statistici se ascunde leg-ul nerăspuns
-dacă are sibling răspuns în ±15 min (`productivity.apel_no_dup_leg_sql`); apelurile pierdute reale
-rămân. În CALCUL nu conta niciodată (se folosește `_APEL_REAL_CALL_SQL`). Timpul de răspuns vine din
+doar dacă are semnătura de ring paralel: `callee_number IS NULL` + sibling răspuns în ±2 min, sau
+sibling în ±30 s (`productivity.apel_no_dup_leg_sql`). Reapelările clientului (sibling la minute
+distanță, cu callee completat) rămân vizibile ca apeluri pierdute reale. **Ieșirile nu se
+deduplică** — acolo un `BUSY`/`NO ANSWER` urmat de reușită e reapelare reală a operatorului. În CALCUL nu conta niciodată (se folosește `_APEL_REAL_CALL_SQL`). Timpul de răspuns vine din
 `calls.ring_seconds`; pe rândurile vechi e NULL → „nemăsurat", se completează cu
 `POST /calls/backfill-ring?date_from&date_to`.
 
