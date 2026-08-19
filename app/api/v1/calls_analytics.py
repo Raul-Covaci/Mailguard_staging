@@ -19,6 +19,8 @@ from app.database import get_db
 from app.api.v1.auth import get_current_admin
 # Regula unica de ascundere a leg-urilor duplicate de centrala (vezi apel_no_dup_leg_sql).
 from app.services import productivity as P
+# BINARY_COLUMNS: cheie prompt binar -> coloana din call_ai_scores (sursa unica a setului).
+from app.services import call_scorer
 
 _BATCH_JOBS_LOCK = threading.Lock()
 
@@ -36,29 +38,122 @@ def _bl_filter() -> str:
     """
 
 
-def _agent_dept_filter(agent: Optional[str], department: Optional[str], params: dict) -> str:
-    """Fragment SQL pentru filtrare agent/departament via employee_department_mapping.
+# Atribuirea unui apel unui angajat NU se poate face pe egalitate de nume: `calls.agent_extension`
+# e `user_fullname` din CDR-ul While1, scris altfel decat `employee_department_mapping.name`
+# ("Oana Lasca" vs "Lasca Oana-Maria", "Adriana Brasovean" vs "Buse Angelica-Adriana"). Filtrul
+# vechi (`agent_extension IN (SELECT name ...)`) intorcea zero randuri pentru ORICE departament,
+# de unde bug-ul „doar Operational (toate) incarca date".
+#
+# Se refolosesc treptele din `productivity.py` (_APEL_AGENT_CTE / _APEL_AGENT_JOIN):
+#   1. maparea invatata din suprapunerea cu CTS (numele agentului -> angajatul dominant);
+#   2. potrivirea de nume tolerata la ordine si la prefixe de 4 litere;
+#   3. assignee-ul CTS, doar pentru apelurile fara nume de agent in CDR.
+# Treptele 1-2 depind doar de numele agentului, deci se rezolva o singura data si se tin in cache
+# scurt: cele 4 interogari ale dashboard-ului pleaca simultan si ar reface altfel aceeasi munca.
+_AGENT_MAP_TTL_SEC = 300
+_agent_map_cache: dict = {"at": 0.0, "rows": None}
+_agent_map_lock = threading.Lock()
 
-    agent    = email-ul userului (din department-users) → lookup name → filtru pe agent_extension
-    department = slug departament → lookup toți membrii → filtru pe agent_extension IN (...)
-    agent are prioritate față de department.
-    """
+_AGENT_MAP_SQL = r"""
+    WITH agent_map AS (
+        SELECT agent_extension, employee_id FROM (
+            SELECT c2.agent_extension, e2.id AS employee_id,
+                   ROW_NUMBER() OVER (PARTITION BY c2.agent_extension
+                                      ORDER BY COUNT(*) DESC, e2.id) AS rn
+            FROM calls c2
+            JOIN cts_calls_ground_truth g2 ON g2.call_local_id = c2.id
+            JOIN employee_department_mapping e2
+              ON lower(e2.email) = lower(g2.cts_assignee_email)
+            WHERE c2.agent_extension IS NOT NULL AND e2.enabled = true
+            GROUP BY 1, 2
+        ) t WHERE rn = 1
+    ),
+    names AS (
+        SELECT DISTINCT agent_extension AS n FROM calls
+        WHERE agent_extension IS NOT NULL AND agent_extension <> ''
+    )
+    SELECT n.n AS agent_extension, e.id AS employee_id, e.department, lower(e.email) AS email
+    FROM names n
+    LEFT JOIN agent_map am ON am.agent_extension = n.n
+    -- Agregatul cu CASE returneaza id-ul doar cand potrivirea de nume e unica; ambiguitatile
+    -- (doi angajati cu acelasi prefix) raman nerezolvate in loc sa fie ghicite.
+    LEFT JOIN LATERAL (
+        SELECT CASE WHEN count(*) = 1 THEN min(e3.id) END AS id
+        FROM employee_department_mapping e3
+        WHERE e3.enabled = true
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest(regexp_split_to_array(lower(trim(n.n)), '\s+')) tok
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM unnest(
+                      regexp_split_to_array(lower(regexp_replace(e3.name, '-', ' ', 'g')), '\s+')
+                  ) etok
+                  WHERE left(etok, 4) = left(tok, 4)
+              )
+          )
+    ) nm ON true
+    JOIN employee_department_mapping e
+      ON e.id = COALESCE(am.employee_id, nm.id) AND e.enabled = true
+"""
+
+
+def _agent_name_map(db) -> list:
+    """Numele de agent din While1, fiecare cu angajatul si departamentul lui (cache 5 min)."""
+    now = time.time()
+    with _agent_map_lock:
+        if _agent_map_cache["rows"] is not None and now - _agent_map_cache["at"] < _AGENT_MAP_TTL_SEC:
+            return _agent_map_cache["rows"]
+    rows = [dict(r._mapping) for r in db.execute(text(_AGENT_MAP_SQL)).fetchall()]
+    with _agent_map_lock:
+        _agent_map_cache["rows"] = rows
+        _agent_map_cache["at"] = now
+    return rows
+
+
+def dept_agent_names(db, department: Optional[str] = None, agent: Optional[str] = None) -> list:
+    """Numele de agent (`calls.agent_extension`) ale unui departament sau ale unui operator."""
+    rows = _agent_name_map(db)
     if agent:
-        # email → name → agent_extension
-        params["_ad_email"] = agent
-        return (
-            " AND c.agent_extension IN ("
-            "  SELECT name FROM employee_department_mapping WHERE email=:_ad_email AND enabled=true"
-            ")"
-        )
+        want = agent.strip().lower()
+        return sorted({r["agent_extension"] for r in rows if (r["email"] or "") == want})
     if department:
-        params["_ad_dept"] = department
-        return (
-            " AND c.agent_extension IN ("
-            "  SELECT name FROM employee_department_mapping WHERE department=:_ad_dept AND enabled=true"
-            ")"
-        )
-    return ""
+        want = department.strip().lower()
+        return sorted({r["agent_extension"] for r in rows if (r["department"] or "") == want})
+    return []
+
+
+def _agent_dept_filter(agent: Optional[str], department: Optional[str], params: dict, db=None) -> str:
+    """Fragment SQL pentru filtrare agent/departament. `agent` (email) are prioritate."""
+    if not agent and not department:
+        return ""
+    if db is None:      # apelant vechi, fara sesiune -> nu se filtreaza (mai bine tot decat nimic)
+        return ""
+
+    if agent:
+        params["_ad_email"] = agent.strip().lower()
+        cts_pred = "lower(e3.email) = :_ad_email"
+    else:
+        params["_ad_dept"] = (department or "").strip().lower()
+        cts_pred = "e3.department = :_ad_dept"
+
+    names = dept_agent_names(db, department=department, agent=agent)
+    # Treapta 3: apelurile pe care centrala nu le-a legat de un agent (`agent_extension` NULL)
+    # se atribuie dupa assignee-ul tichetului CTS — la fel ca in raportul de productivitate.
+    cts_branch = (
+        "(c.agent_extension IS NULL AND EXISTS ("
+        "  SELECT 1 FROM cts_calls_ground_truth g3"
+        "  JOIN employee_department_mapping e3 ON lower(e3.email) = lower(g3.cts_assignee_email)"
+        f" WHERE g3.call_local_id = c.id AND e3.enabled = true AND {cts_pred}"
+        "))"
+    )
+    if not names:
+        return " AND " + cts_branch
+
+    keys = []
+    for i, nm in enumerate(names):
+        k = f"_ad_n{i}"
+        params[k] = nm
+        keys.append(":" + k)
+    return f" AND (c.agent_extension IN ({', '.join(keys)}) OR {cts_branch})"
 
 
 # ── Dashboard KPI ──────────────────────────────────────────────────────────────
@@ -84,7 +179,7 @@ def analytics_dashboard(
         date_filter += " AND c.started_at < (CAST(:date_to AS date) + INTERVAL '1 day')"
         params["date_to"] = date_to
 
-    agent_filter = _agent_dept_filter(agent, department, params)
+    agent_filter = _agent_dept_filter(agent, department, params, db)
     bl_sql = _bl_filter() if exclude_blacklist else ""
     # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
     # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
@@ -243,7 +338,7 @@ def analytics_scores(
     else:
         date_filter = "c.started_at >= NOW() - (INTERVAL '1 day' * :days)"
         params["days"] = days
-    agent_filter = _agent_dept_filter(agent, department, params)
+    agent_filter = _agent_dept_filter(agent, department, params, db)
     bl_sql = _bl_filter() if exclude_blacklist else ""
     # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
     # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
@@ -275,6 +370,88 @@ def analytics_scores(
     """
     rows = db.execute(text(sql), params).fetchall()
     return {"days": days, "agents": [dict(r._mapping) for r in rows]}
+
+
+# ── Apelurile unui agent, cu scorul fiecaruia (drill-down din tabelul de scoruri) ─────────
+
+@router.get("/calls/analytics/agent-calls")
+def analytics_agent_calls(
+    agent_name: str = Query(..., min_length=1, description="calls.agent_extension din tabelul de scoruri"),
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    days: int = Query(30, ge=1, le=365),
+    exclude_blacklist: bool = Query(True),
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Apelurile scorate ale unui agent, cu scorul fiecarui apel.
+
+    Tabelul „Scoruri Agenti" arata doar medii; de aici se vede din CE apeluri vine media si
+    care apel a tras scorul in jos. `id`-ul returnat deschide modalul de apel (tab Analiza AI).
+    """
+    params: dict = {"agent": agent_name, "lim": limit}
+    if date_from:
+        date_filter = "c.started_at >= CAST(:date_from AS date)"
+        params["date_from"] = date_from
+        if date_to:
+            date_filter += " AND c.started_at < (CAST(:date_to AS date) + INTERVAL '1 day')"
+            params["date_to"] = date_to
+    else:
+        date_filter = "c.started_at >= NOW() - (INTERVAL '1 day' * :days)"
+        params["days"] = days
+    bl_sql = _bl_filter() if exclude_blacklist else ""
+    # Aceeasi regula de deduplicare a leg-urilor ca in agregat, altfel lista nu s-ar
+    # potrivi cu numarul de apeluri din randul agentului.
+    dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
+
+    # Coloanele binare intra in raspuns sub cheia promptului, ca UI-ul sa nu le hardcodeze.
+    bin_cols = ", ".join(f"cas.{col} AS bin_{key}" for key, col in call_scorer.BINARY_COLUMNS.items())
+
+    sql = f"""
+        SELECT
+            c.id, c.started_at, c.direction, c.call_status,
+            c.caller_number, c.callee_number, c.duration_seconds,
+            c.ai_category, c.ai_tone,
+            cl.name AS client_name,
+            cas.agent_score_total, cas.customer_score_total,
+            cas.agent_explaining_solution, cas.agent_patient, cas.agent_understanding,
+            cas.agent_politeness, cas.agent_empathy, cas.agent_transparency,
+            cas.issue_resolved, cas.issue_within_company_scope,
+            cas.agent_next_steps_clear, cas.customer_unacknowledged_count,
+            cas.issue_main_problem, cas.scored_at,
+            {bin_cols}
+        FROM calls c
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        LEFT JOIN clients cl ON cl.id = c.client_id
+        WHERE {date_filter}
+          AND c.agent_extension = :agent
+          {bl_sql} {dup_sql}
+        ORDER BY cas.agent_score_total ASC NULLS LAST, c.started_at DESC
+        LIMIT :lim
+    """
+    rows = db.execute(text(sql), params).fetchall()
+
+    calls = []
+    for r in rows:
+        d = dict(r._mapping)
+        d["binary"] = {k[4:]: d.pop(k) for k in list(d) if k.startswith("bin_")}
+        calls.append(d)
+    return {
+        "agent": agent_name,
+        "count": len(calls),
+        "binary_labels": _binary_labels(db),
+        "calls": calls,
+    }
+
+
+def _binary_labels(db) -> dict:
+    """Etichetele intrebarilor binare active, in ordinea din BINARY_COLUMNS."""
+    rows = db.execute(text(
+        "SELECT key, label FROM call_scoring_prompts WHERE output_type='binary' AND enabled=true"
+    )).fetchall()
+    by_key = {r[0]: r[1] for r in rows}
+    return {k: by_key[k] for k in call_scorer.BINARY_COLUMNS if k in by_key}
 
 
 @router.get("/calls/analytics/scores/{call_id}")
@@ -404,7 +581,7 @@ def analytics_rescore_missing_binary(
         "WHERE ("
         "  agentul_sa_prezentat IS NULL AND clientul_aminta_judecata IS NULL "
         "  AND clientul_aminta_renuntare IS NULL AND clientul_contactat_anterior IS NULL"
-        ") OR ("
+        ") OR masini_care_nu_transmit IS NULL OR ("
         # scripturile V2: transparency (agentScore V3), scope/soluție (issueResolution V2),
         # pași următori (agentActions V2)
         "  agent_transparency IS NULL OR issue_within_company_scope IS NULL "
@@ -581,60 +758,36 @@ def analytics_binary_stats(
     else:
         date_filter = "c.started_at >= NOW() - (INTERVAL '1 day' * :days)"
         params["days"] = days
-    agent_filter = _agent_dept_filter(agent, department, params)
+    agent_filter = _agent_dept_filter(agent, department, params, db)
     bl_sql = _bl_filter() if exclude_blacklist else ""
     # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
     # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
     dup_sql = "AND " + P.apel_no_dup_leg_sql("c")
 
-    # Prompturile binare active din DB
+    # Prompturile binare active din DB. Setul afisat = EXACT intrebarile binare cu prompt
+    # propriu (5, vezi migratia 20260819f). Indicatorii derivati din prompturile V2 nu mai
+    # apar aici: nu sunt intrebari selectate de business, iar `issueResolution` a iesit dintre
+    # binare (are patru campuri, si tot el alimenteaza KPI-ul „% Rezolvate").
     prompt_rows = db.execute(text(
-        "SELECT key, label FROM call_scoring_prompts WHERE output_type='binary' AND enabled=true ORDER BY key"
+        "SELECT key, label FROM call_scoring_prompts WHERE output_type='binary' AND enabled=true"
     )).fetchall()
+    by_key = {r[0]: r[1] for r in prompt_rows}
+
+    # Ordinea cardurilor o da BINARY_COLUMNS (ordinea ceruta de business), nu alfabeticul.
+    ordered = [k for k in call_scorer.BINARY_COLUMNS if k in by_key]
+    ordered += [k for k in sorted(by_key) if k not in call_scorer.BINARY_COLUMNS]
 
     results = []
-    for pr in prompt_rows:
-        key, label = pr[0], pr[1]
-        # call_ai_scores nu stochează toate cheile binare — mapăm cele cunoscute
-        COL_MAP = {
-            "checkForValidCall": "is_valid_call",
-            "issueResolution": "issue_resolved",
-            "agentulSaPrezentat": "agentul_sa_prezentat",
-            "clientulAmintaJudecata": "clientul_aminta_judecata",
-            "clientulAmintaRenuntare": "clientul_aminta_renuntare",
-            "clientulContactatAnterior": "clientul_contactat_anterior",
-        }
-        col = COL_MAP.get(key)
-        if col:
-            sql = f"""
-                SELECT
-                    COUNT(*) FILTER (WHERE cas.{col} = true)  AS positive,
-                    COUNT(*) FILTER (WHERE cas.{col} = false) AS negative,
-                    COUNT(*) FILTER (WHERE cas.{col} IS NOT NULL) AS total
-                FROM calls c
-                INNER JOIN call_ai_scores cas ON cas.call_id = c.id
-                WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
-            """
-            row = db.execute(text(sql), params).fetchone()
-            if row:
-                results.append({"key": key, "label": label,
-                                 "positive": row[0] or 0, "negative": row[1] or 0, "total": row[2] or 0})
-        else:
-            # Prompt fără coloană dedicată în call_ai_scores — total 0 (nu e scorat încă)
-            results.append({"key": key, "label": label, "positive": 0, "negative": 0, "total": 0})
-
-    # Indicatori binari derivați din prompturile V2 (nu au prompt binar dedicat, dar
-    # rezultatul lor e boolean → merită card donut la fel ca restul).
-    seen = {r["key"] for r in results}
-    DERIVED = [
-        ("issueWithinCompanyScope", "Cerere în competența companiei", "cas.issue_within_company_scope"),
-        ("agentNextStepsClear", "Pași următori comunicați clar", "cas.agent_next_steps_clear"),
-        ("customerRequestsAcknowledged", "Toate cererile clientului recepționate",
-         "(cas.customer_unacknowledged_count = 0)"),
-    ]
-    for key, label, expr in DERIVED:
-        if key in seen:
-            continue
+    for key in ordered:
+        col = call_scorer.BINARY_COLUMNS.get(key)
+        # O intrebare binara fara coloana dedicata se citeste din `binary_evidence`, deci
+        # intra in statistici fara migratie noua.
+        expr = (
+            f"cas.{col}" if col
+            else "(cas.binary_evidence -> :bkey_%s ->> 'result')::boolean" % key
+        )
+        if not col:
+            params[f"bkey_{key}"] = key
         sql = f"""
             SELECT
                 COUNT(*) FILTER (WHERE {expr} = true)  AS positive,
@@ -645,9 +798,12 @@ def analytics_binary_stats(
             WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
         """
         row = db.execute(text(sql), params).fetchone()
-        if row:
-            results.append({"key": key, "label": label,
-                            "positive": row[0] or 0, "negative": row[1] or 0, "total": row[2] or 0})
+        results.append({
+            "key": key, "label": by_key[key],
+            "positive": (row[0] if row else 0) or 0,
+            "negative": (row[1] if row else 0) or 0,
+            "total": (row[2] if row else 0) or 0,
+        })
 
     return {"stats": results}
 
@@ -676,7 +832,7 @@ def analytics_score_stats(
     else:
         date_filter = "c.started_at >= NOW() - (INTERVAL '1 day' * :days)"
         params["days"] = days
-    agent_filter = _agent_dept_filter(agent, department, params)
+    agent_filter = _agent_dept_filter(agent, department, params, db)
     bl_sql = _bl_filter() if exclude_blacklist else ""
     # Leg-urile duplicate de centrala (0s, cu sibling raspuns in +/-15 min) nu se numara:
     # acelasi apel fizic aparea de doua ori si umfla toate KPI-urile.
@@ -749,12 +905,21 @@ def analytics_departments(
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
-    """Departamente distincte din employee_department_mapping (enabled=true), pentru selector UI."""
+    """Departamentele care au cel putin un agent cu apeluri in centrala, pentru selector UI.
+
+    Se filtreaza prin aceeasi mapare nume-agent -> angajat folosita de filtre: un departament
+    fara niciun operator in CDR-urile While1 nu are ce afisa, iar prezenta lui in selector
+    arata ca un bug („am ales departamentul si nu se incarca nimic").
+    """
+    with_calls = {r["department"] for r in _agent_name_map(db) if r.get("department")}
     rows = db.execute(text(
         "SELECT DISTINCT department FROM employee_department_mapping "
         "WHERE enabled=true AND department IS NOT NULL ORDER BY department"
     )).fetchall()
-    return {"departments": [r[0] for r in rows]}
+    all_depts = [r[0] for r in rows]
+    # Daca maparea nu a produs nimic (baza goala / sync nerulat), se cade pe lista completa
+    # in loc sa se goleasca selectorul.
+    return {"departments": [d for d in all_depts if d in with_calls] or all_depts}
 
 
 @router.get("/calls/analytics/department-users")

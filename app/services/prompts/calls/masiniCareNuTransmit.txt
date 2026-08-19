@@ -1,0 +1,31 @@
+You are evaluating whether the CUSTOMER reported vehicles that are NOT TRANSMITTING data during the call.
+
+CONTEXT: CargoTrack is a telematics company: GPS devices mounted on customer vehicles send position and telemetry to the platform. The single most frequent fault reported on support calls is a vehicle that stopped sending data - the truck does not appear on the map, its position is frozen, or the customer cannot see where it is. Counting these calls tells the business how much of the support load is device transmission failure.
+
+YOUR TASK: Decide whether the customer reports at least one vehicle/device that is not transmitting data.
+
+Consider TRUE when the customer says any of:
+✓ A vehicle is not transmitting ("nu transmite", "nu mai trimite date", "nu mai comunică")
+✓ They cannot see a vehicle on the platform ("nu văd mașina", "nu apare pe hartă", "a dispărut de pe platformă")
+✓ The position is stale or frozen ("stă în același loc de ieri", "nu se actualizeaza pozitia", "arată unde a fost acum două zile")
+✓ The device appears dead or offline ("aparatul e mort", "nu mai merge GPS-ul de pe camion", "e offline")
+✓ Transmission is intermittent ("transmite când vrea el", "apare și dispare")
+This is TRUE whether one vehicle or the whole fleet is affected, and regardless of whether the agent managed to solve it.
+
+Consider FALSE when:
+✗ The call is about something else entirely: invoices, road tax (rovinieta, HU-GO, toll), VAT recovery, driver declarations, tachograph downloads, contracts, new installations, platform login problems, reports or user accounts
+✗ The platform itself is unreachable but the devices are fine ("nu pot intra pe site", "nu-mi merge parola")
+✗ Wrong or inaccurate data is shown while the vehicle IS transmitting (wrong fuel level, wrong driver assigned, incorrect route naming)
+✗ The customer asks a question about how transmission works, without reporting a fault
+✗ The AGENT raises the topic without the customer reporting such a problem
+
+IMPORTANT NUANCE: the defining element is the ABSENCE of data from the vehicle. A vehicle that transmits but shows a wrong value is a data-quality issue, not a transmission failure - that is FALSE.
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
+- Judge ONLY the customer's words.
+- "evidence" must quote the exact phrase that decided the answer.
+-------------------------------
+{
+  "result": "<true daca clientul reclama cel putin un vehicul/dispozitiv care nu transmite date, false in rest>",
+  "evidence": "<Citatul exact din apel pe baza caruia ai decis, plus o justificare de o propozitie. Mentioneaza cate vehicule sunt afectate daca reiese din apel. Daca raspunsul e false, scrie pe scurt care era subiectul apelului.>"
+}

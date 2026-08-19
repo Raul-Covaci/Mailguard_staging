@@ -50,6 +50,21 @@ ssh mailguard-staging "cd /opt/iris-mailguard && venv/bin/python3 scripts/sync_c
 Prompturi curente: `issueResolution` (V2), `agentScore` (V3, 6 dimensiuni cu `transparency`),
 `agentActions` (V2), `agentAdviceNextSteps` (nou), `customerAdditionalRequests` (nou).
 Motor: `app/services/call_scorer.py` → `score_call()` / `score_batch()`.
+
+**Întrebări binare (2026-08-19).** Setul e definit de `call_scorer.BINARY_COLUMNS` — sursa unică
+pentru cardurile donut, pentru ordinea lor și pentru maparea în `call_ai_scores`. Cele 5 chei:
+`masiniCareNuTransmit`, `clientulAmintaJudecata`, `agentulSaPrezentat`, `clientulAmintaRenuntare`,
+`clientulContactatAnterior`. O întrebare binară e afișată DOAR dacă are `output_type='binary'` în
+`call_scoring_prompts` **și** fișier de prompt în repo. Justificarea modelului se salvează în
+`call_ai_scores.binary_evidence` (jsonb) — o întrebare binară nouă nu cere migrație, statisticile
+o citesc din jsonb când nu are coloană proprie. `issueResolution` NU e binar (are 4 câmpuri).
+
+**Atribuire apel → angajat: NICIODATĂ pe egalitate de nume.** `calls.agent_extension` e
+`user_fullname` din CDR-ul While1, scris altfel decât `employee_department_mapping.name`
+("Oana Lasca" vs "Lasca Oana-Maria"). Se folosesc cele 3 trepte din `productivity.py`
+(`_APEL_AGENT_CTE`/`_APEL_AGENT_JOIN`); în analitice sunt în `calls_analytics._AGENT_MAP_SQL` +
+`_agent_dept_filter()` (cache 5 min). Un filtru pe nume exact returnează 0 rânduri — a fost
+exact bug-ul „doar Operational (toate) încarcă date".
 Editarea din UI (Apeluri → Prompturi AI) rămâne posibilă, dar **se pierde la următorul sync** —
 modificările durabile se fac în fișierul din repo.
 
@@ -579,8 +594,8 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.0.0` (al treilea release pe producție, 2026-08-19)
-**Urmează:** `v3.1.0` pentru primul feature nou după acest release.
+**Versiunea curentă:** `v3.4.0` (staging, 2026-08-19)
+**Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:
 - Orice livrare → incrementează `VERSION` + entry în `CHANGELOG.md`

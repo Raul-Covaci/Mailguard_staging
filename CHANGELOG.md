@@ -8,6 +8,53 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.4.0 - 2026-08-19
+
+### MINOR — Analiza apelurilor: întrebări binare reale, filtru pe departament funcțional, scor per apel
+
+**1. Întrebările binare erau altele decât cele alese, și nu aveau prompturi.**
+Motorul citea deja patru chei binare (`agentulSaPrezentat`, `clientulAmintaJudecata`,
+`clientulAmintaRenuntare`, `clientulContactatAnterior`), dar ele nu existau nici în seed, nici ca
+fișier de prompt — deci nu rulau niciodată, iar coloanele din `call_ai_scores` rămâneau NULL.
+Cardurile afișau în schimb `issueResolution` (marcat greșit ca binar, deși are patru câmpuri) plus
+trei indicatori derivați hardcodați în cod.
+
+Setul afișat e acum exact cel cerut de business, fiecare cu prompt propriu versionat în
+`app/services/prompts/calls/`:
+- Mașini care nu transmit *(nouă)*
+- Clientul ne amenință că ne dă în judecată?
+- Agentul s-a prezentat la începutul apelului?
+- Clientul a amenințat că renunță la colaborarea cu noi?
+- Clientul a menționat că ne-a contactat anterior, dar nu a primit răspuns?
+
+Fiecare răspuns vine acum cu citatul pe care s-a bazat modelul (`call_ai_scores.binary_evidence`),
+vizibil în tab-ul „Analiza AI" al apelului. O întrebare binară nouă nu mai cere migrație: fără
+coloană dedicată, rezultatul se citește din `binary_evidence`.
+
+**2. Selectarea unui departament nu încărca nimic.**
+Filtrul compara `calls.agent_extension` (numele scris de centrala While1) cu
+`employee_department_mapping.name` prin egalitate exactă — dar cele două nu coincid niciodată
+("Oana Lasca" vs "Lasca Oana-Maria", "Adriana Brasovean" vs "Buse Angelica-Adriana"). Zero
+potriviri ⇒ zero rânduri pentru orice departament; mergea doar „Operational (toate)", care nu
+aplică filtrul.
+
+Analiticele folosesc acum aceeași atribuire în trei trepte ca raportul de productivitate: mapare
+învățată din suprapunerea cu CTS → potrivire de nume tolerantă la ordine și la prefixe de 4 litere
+→ assignee-ul CTS pentru apelurile fără nume de agent în CDR. Se aplică la fel pe filtrul de
+operator. Selectorul de departamente listează doar departamentele care au efectiv agenți în
+centrală.
+
+**3. Scor per apel, nu doar medii per agent.**
+Tabelul „Scoruri Agenți" arăta doar medii. Un click pe rândul agentului deschide acum lista
+apelurilor lui, cu scorul agent/client al fiecăruia, rezolvarea, indicatorii binari declanșați și
+problema principală — sortate crescător după scor, deci apelurile slabe primele. Click pe un apel
+deschide modalul de apel direct pe tab-ul „Analiza AI". Endpoint nou:
+`GET /calls/analytics/agent-calls`.
+
+Migrație: `20260819f_call_binary_questions.sql`.
+După deploy: `venv/bin/python3 scripts/sync_call_prompts.py`, apoi „Rescoreaza apeluri incomplete"
+din tab-ul Scoruri Agenți (apelurile deja scorate nu au întrebările binare completate).
+
 ## v3.3.1 - 2026-08-19
 
 ### PATCH — Monitor: „Reclamații / În lucru" număra pe tot istoricul, nu pe luna afișată

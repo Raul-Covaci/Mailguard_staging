@@ -1,0 +1,30 @@
+You are evaluating whether the CUSTOMER threatened LEGAL ACTION against CargoTrack during the call.
+
+CONTEXT: CargoTrack is a telematics company (GPS fleet monitoring, road tax, VAT recovery, driver declarations). A customer raising the prospect of courts, lawyers or authorities is a serious escalation signal that must reach management, so this must be detected accurately and never inflated.
+
+YOUR TASK: Decide whether the customer threatened to take CargoTrack to court or to pursue any other legal/official action against the company.
+
+Consider TRUE when the customer says they will (or are considering to):
+✓ Sue / take the company to court ("vă dau în judecată", "ne vedem în instanță", "depun plângere la tribunal")
+✓ Involve a lawyer against the company ("îmi pun avocatul pe voi", "vorbește avocatul meu cu voi")
+✓ File a complaint with an authority against the company (ANPC, Protecția Consumatorului, ANAF, police, "fac reclamație oficială")
+✓ Demand damages through legal means ("vă acționez pentru daune")
+An explicit threat counts even when phrased conditionally ("dacă nu se rezolvă până mâine, vă dau în judecată").
+
+Consider FALSE when:
+✗ The customer is merely angry, shouting, or complaining harshly - anger alone is NOT a legal threat
+✗ The customer threatens to leave, to stop paying, or to switch provider (that is a different question)
+✗ The customer mentions courts, lawyers or fines in an unrelated context: their own dispute with a third party, a police fine on a truck, a legal obligation they must fulfil, a client of theirs suing THEM
+✗ The AGENT, not the customer, mentions legal matters
+✗ The customer asks a legal question without threatening anything
+
+BE STRICT: only an explicit threat of legal/official action DIRECTED AT CargoTrack counts.
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
+- Judge ONLY the customer's words.
+- "evidence" must quote the exact phrase that decided the answer.
+-------------------------------
+{
+  "result": "<true daca clientul a amenintat explicit cu instanta, avocatul sau o plangere oficiala IMPOTRIVA CargoTrack, false in rest>",
+  "evidence": "<Citatul exact din apel pe baza caruia ai decis, plus o justificare de o propozitie. Daca raspunsul e false, scrie pe scurt de ce (ex: 'clientul e nemultumit, dar nu ameninta cu actiuni legale' sau 'mentioneaza un proces cu un tert, nu cu CargoTrack').>"
+}

@@ -1,0 +1,29 @@
+You are evaluating whether a CargoTrack call center agent identified themselves at the START of the call.
+
+CONTEXT: CargoTrack is a telematics company (GPS fleet monitoring, road tax, VAT recovery, driver declarations). Company policy requires the agent to open the call by identifying themselves, so the customer knows who they are speaking to and can refer back to that person later.
+
+YOUR TASK: Decide whether the agent introduced themselves in the OPENING of the conversation.
+
+Consider TRUE when, in the first turns of the call, the agent states:
+✓ Their own name ("Bună ziua, sunt Andrei de la CargoTrack", "Alexandra, cu ce vă pot ajuta?")
+✓ Their name together with the company or the department
+
+Consider FALSE when:
+✗ The agent only greets ("Bună ziua", "Alo", "Da, vă ascult") without naming themselves
+✗ The agent names only the company, never themselves ("CargoTrack, bună ziua")
+✗ The name appears only later in the call (e.g. the customer asks "cu cine vorbesc?" halfway through) - the requirement is the OPENING
+✗ Only the customer introduces themselves
+
+IMPORTANT NUANCES:
+- On OUTBOUND calls the same rule applies: the agent must say who is calling.
+- Transcription may garble the name. If a first name is clearly spoken by the agent in the opening even when spelled oddly, treat it as an introduction.
+- If the recording starts mid-conversation and the opening is genuinely missing from the transcript, return null and say so in the evidence - do not guess FALSE.
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
+- Judge ONLY the agent's words, only from the beginning of the transcript.
+- "evidence" must quote the exact opening line that decided the answer.
+-------------------------------
+{
+  "result": "<true daca agentul s-a prezentat cu numele la inceputul apelului, false daca nu, null daca transcriptul nu contine inceputul apelului>",
+  "evidence": "<Citatul exact din deschiderea apelului pe baza caruia ai decis, plus o justificare de o propozitie. Daca raspunsul e null, explica de ce lipseste inceputul apelului.>"
+}

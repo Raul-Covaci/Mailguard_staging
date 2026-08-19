@@ -36,7 +36,6 @@ SEED_PROMPTS: Dict[str, Dict[str, Any]] = {
     },
     "issueResolution": {
         "label": "Rezolvare problemă",
-        "output_type": "binary",
         "output_schema": {
             "mainProblem": "str", "requestWithinCompanyScope": "bool",
             "problemWasSolved": "bool", "mainSolution": "str",
@@ -98,11 +97,49 @@ SEED_PROMPTS: Dict[str, Dict[str, Any]] = {
         "label": "Cereri suplimentare client",
         "output_schema": {"additionalRequests": "list", "unacknowledgedCount": "int"},
     },
+    # Întrebările binare (da/nu) — fiecare are prompt propriu în prompts/calls/ și o
+    # coloană boolean în call_ai_scores; justificarea intră în binary_evidence.
+    "masiniCareNuTransmit": {
+        "label": "Mașini care nu transmit",
+        "output_type": "binary",
+        "output_schema": {"result": "bool", "evidence": "str"},
+    },
+    "clientulAmintaJudecata": {
+        "label": "Clientul ne amenință că ne dă în judecată?",
+        "output_type": "binary",
+        "output_schema": {"result": "bool", "evidence": "str"},
+    },
+    "agentulSaPrezentat": {
+        "label": "Agentul s-a prezentat la începutul apelului?",
+        "output_type": "binary",
+        "output_schema": {"result": "bool", "evidence": "str"},
+    },
+    "clientulAmintaRenuntare": {
+        "label": "Clientul a amenințat că renunță la colaborarea cu noi?",
+        "output_type": "binary",
+        "output_schema": {"result": "bool", "evidence": "str"},
+    },
+    "clientulContactatAnterior": {
+        "label": "Clientul a menționat că ne-a contactat anterior, dar nu a primit răspuns?",
+        "output_type": "binary",
+        "output_schema": {"result": "bool", "evidence": "str"},
+    },
 }
 
 
 # Prompturile versionate în repo: app/services/prompts/calls/<key>.txt
 PROMPTS_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "prompts", "calls")
+
+# Cheie prompt binar → coloana boolean din call_ai_scores. O întrebare binară nouă poate fi
+# adăugată fără coloană proprie: rezultatul ei rămâne oricum în `binary_evidence` (jsonb),
+# de unde îl citesc statisticile. Coloana e doar pentru interogări rapide/indexabile.
+BINARY_COLUMNS: Dict[str, str] = {
+    "masiniCareNuTransmit":      "masini_care_nu_transmit",
+    "clientulAmintaJudecata":    "clientul_aminta_judecata",
+    "agentulSaPrezentat":        "agentul_sa_prezentat",
+    "clientulAmintaRenuntare":   "clientul_aminta_renuntare",
+    "clientulContactatAnterior": "clientul_contactat_anterior",
+}
 
 
 def load_prompt_texts_from_repo() -> Dict[str, str]:
@@ -394,10 +431,19 @@ def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
         issue_res = r.get("issueResolution") or {}
         agent_vulgar = r.get("agentVulgarWords")
         customer_vulgar = r.get("customerVulgarWords")
-        agentul_sa_prezentat = (r.get("agentulSaPrezentat") or {}).get("result")
-        clientul_aminta_judecata = (r.get("clientulAmintaJudecata") or {}).get("result")
-        clientul_aminta_renuntare = (r.get("clientulAmintaRenuntare") or {}).get("result")
-        clientul_contactat_anterior = (r.get("clientulContactatAnterior") or {}).get("result")
+        # Întrebările binare: rezultat + justificare, colectate din toate prompturile
+        # marcate `binary` care au rulat (nu doar din cheile cu coloană dedicată).
+        binary_vals: Dict[str, Optional[bool]] = {}
+        binary_evidence: Dict[str, Any] = {}
+        for bkey, bmeta in prompts.items():
+            if bmeta.get("output_type") != "binary":
+                continue
+            bres = r.get(bkey)
+            if not isinstance(bres, dict):
+                continue
+            bval = _safe_bool(bres.get("result"))
+            binary_vals[bkey] = bval
+            binary_evidence[bkey] = {"result": bval, "evidence": bres.get("evidence") or None}
 
         # Scoruri agent
         a_exp = _safe_int(agent_score_data.get("explainingTheSolution"))
@@ -434,6 +480,7 @@ def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
                 customer_additional_requests, customer_unacknowledged_count,
                 agentul_sa_prezentat, clientul_aminta_judecata,
                 clientul_aminta_renuntare, clientul_contactat_anterior,
+                masini_care_nu_transmit, binary_evidence,
                 model
             ) VALUES (
                 :call_id, NOW(),
@@ -450,6 +497,7 @@ def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
                 CAST(:addl_req AS jsonb), :unack_count,
                 :agentul_sa_prezentat, :clientul_aminta_judecata,
                 :clientul_aminta_renuntare, :clientul_contactat_anterior,
+                :masini_care_nu_transmit, CAST(:binary_evidence AS jsonb),
                 'claude-haiku-4-5-20251001'
             )
             ON CONFLICT (call_id) DO NOTHING
@@ -479,10 +527,12 @@ def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
             "issue_scope": _safe_bool(issue_res.get("requestWithinCompanyScope")),
             "addl_req": json.dumps(addl_req) if addl_req else None,
             "unack_count": _safe_int(addl_req.get("unacknowledgedCount")),
-            "agentul_sa_prezentat": agentul_sa_prezentat,
-            "clientul_aminta_judecata": clientul_aminta_judecata,
-            "clientul_aminta_renuntare": clientul_aminta_renuntare,
-            "clientul_contactat_anterior": clientul_contactat_anterior,
+            "agentul_sa_prezentat": binary_vals.get("agentulSaPrezentat"),
+            "clientul_aminta_judecata": binary_vals.get("clientulAmintaJudecata"),
+            "clientul_aminta_renuntare": binary_vals.get("clientulAmintaRenuntare"),
+            "clientul_contactat_anterior": binary_vals.get("clientulContactatAnterior"),
+            "masini_care_nu_transmit": binary_vals.get("masiniCareNuTransmit"),
+            "binary_evidence": json.dumps(binary_evidence, ensure_ascii=False) if binary_evidence else None,
             "model": "claude-haiku-4-5-20251001",
         })
         db.commit()

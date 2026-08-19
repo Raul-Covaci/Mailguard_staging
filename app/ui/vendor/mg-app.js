@@ -14502,6 +14502,80 @@ function TaskDetail({ item, index, total, onClose, onPrev, onNext }) {
 }
 
 
+// Drill-down din tabelul „Scoruri Agenti": apelurile unui agent, cu scorul fiecarui apel.
+// Tabelul de deasupra arata doar medii — de aici se vede din CE apeluri vine media si care
+// apel a tras-o in jos. Ordonat crescator dupa scor (cele mai slabe primele).
+function AgentCallsPanel({ busy, err, data, onOpenCall }) {
+  if (busy) return h('div', { style: { padding: 14, fontSize: 12, color: 'var(--t3)' } }, 'Se incarca apelurile...');
+  if (err)  return h('div', { style: { padding: 14, fontSize: 12, color: 'var(--rd)' } }, err);
+  var calls = (data && data.calls) || [];
+  if (!calls.length) return h('div', { style: { padding: 14, fontSize: 12, color: 'var(--t3)' } },
+    'Niciun apel scorat pentru acest agent in perioada selectata.');
+
+  var labels = (data && data.binary_labels) || {};
+  var bKeys  = Object.keys(labels);
+  var scoreCol = function (v) { return v == null ? 'var(--t3)' : v >= 7 ? '#10b981' : v >= 5 ? '#f59e0b' : '#ef4444'; };
+  var pill = function (key, txt, col, title) {
+    return h('span', { key: key, title: title || txt, style: { display: 'inline-block', padding: '1px 7px', borderRadius: 10,
+      fontSize: 10, fontWeight: 700, background: col + '22', color: col, border: '1px solid ' + col + '55', whiteSpace: 'nowrap' } }, txt);
+  };
+  // Eticheta scurta pentru pastila binara: primele doua cuvinte din intrebare.
+  var shortLbl = function (k) { return String(labels[k] || k).replace(/\?$/, '').split(/\s+/).slice(0, 2).join(' '); };
+
+  return h('div', { style: { padding: '10px 14px 14px' } }, [
+    h('div', { key: 'hd', style: { fontSize: 11, color: 'var(--t3)', marginBottom: 8 } },
+      calls.length + ' apeluri scorate — click pe un rand deschide apelul (tab „Analiza AI"). Sortate crescator dupa scor.'),
+    h('div', { key: 'tbl', className: 'table-wrap', style: { marginTop: 0 } },
+      h('table', null, [
+        h('thead', null, h('tr', null, [
+          h('th', null, 'Data'),
+          h('th', null, 'Client'),
+          h('th', null, 'Directie'),
+          h('th', { style: { textAlign: 'right' } }, 'Durata'),
+          h('th', { style: { textAlign: 'right' } }, 'Scor agent'),
+          h('th', { style: { textAlign: 'right' } }, 'Scor client'),
+          h('th', null, 'Rezolvat'),
+          h('th', null, 'Indicatori'),
+          h('th', null, 'Problema'),
+        ])),
+        h('tbody', null, calls.map(function (c) {
+          var bin = c.binary || {};
+          return h('tr', { key: c.id, style: { cursor: 'pointer' },
+              onClick: function (e) { e.stopPropagation(); onOpenCall(c.id); } }, [
+            h('td', { style: { whiteSpace: 'nowrap', fontSize: 12 } },
+              c.started_at ? new Date(c.started_at).toLocaleString('ro-RO', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'),
+            h('td', { style: { fontSize: 12 } }, c.client_name || (c.direction === 'inbound' ? c.caller_number : c.callee_number) || '—'),
+            h('td', null, directionBadge(c.direction)),
+            h('td', { style: { textAlign: 'right', fontSize: 12 } }, durationLabel(c.duration_seconds)),
+            h('td', { style: { textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: scoreCol(c.agent_score_total) } },
+              c.agent_score_total != null ? c.agent_score_total : '—'),
+            h('td', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: scoreCol(c.customer_score_total) } },
+              c.customer_score_total != null ? c.customer_score_total : '—'),
+            h('td', null, c.issue_resolved == null
+              ? pill('r', 'necunoscut', '#6b7280')
+              : c.issue_resolved ? pill('r', 'da', '#10b981')
+              : c.issue_within_company_scope === false ? pill('r', 'in afara competentei', '#6b7280')
+              : pill('r', 'nu', '#ef4444')),
+            // Pastile doar pentru indicatorii declansati (true) — un rand cu toate cele 5
+            // pastile pe „nu" ar fi ilizibil si n-ar spune nimic.
+            h('td', null, h('span', { style: { display: 'inline-flex', gap: 4, flexWrap: 'wrap' } },
+              bKeys.filter(function (k) { return bin[k] === true; })
+                   .map(function (k) {
+                     var good = k === 'agentulSaPrezentat';
+                     return pill(k, shortLbl(k), good ? '#10b981' : '#ef4444', labels[k]);
+                   })
+                   .concat(bin.agentulSaPrezentat === false ? [pill('np', 'fara prezentare', '#f59e0b', labels.agentulSaPrezentat)] : [])
+            )),
+            h('td', { style: { fontSize: 12, color: 'var(--t2)', maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                title: c.issue_main_problem || '' }, c.issue_main_problem || '—'),
+          ]);
+        }))
+      ])
+    ),
+  ]);
+}
+
+
 // ── Analitice Apeluri ───────────────────────────────────────────────────────
 function CallsAnalitice({ setTopbarRight }) {
   var TABS = [
@@ -14559,6 +14633,13 @@ function CallsAnalitice({ setTopbarRight }) {
   var [analyzeError, setAnalyzeError]     = useState(null);
   var [analyzeSelectedId, setAnalyzeSelectedId] = useState(null);
 
+  // Drill-down din tabelul de scoruri: apelurile agentului, cu scorul fiecaruia.
+  var [openAgent, setOpenAgent]       = useState(null);
+  var [agentCalls, setAgentCalls]     = useState(null);
+  var [agentCallsBusy, setAgentCallsBusy] = useState(false);
+  var [agentCallsErr, setAgentCallsErr]   = useState('');
+  var [callModalId, setCallModalId]   = useState(null);
+
   function runAnalyze() {
     if (!analyzeQuery.trim()) return;
     setAnalyzeLoading(true); setAnalyzeResult(null); setAnalyzeError(null);
@@ -14609,6 +14690,8 @@ function CallsAnalitice({ setTopbarRight }) {
   }, [dept]);
 
   useEffect(function () {
+    // Datele din drill-down apartin filtrelor vechi — se inchide la orice schimbare.
+    setOpenAgent(null); setAgentCalls(null);
     if (tab === 'dashboard') loadDash();
     if (tab === 'scoruri')   loadScores();
     if (tab === 'blacklist') loadBl();
@@ -14646,6 +14729,20 @@ function CallsAnalitice({ setTopbarRight }) {
   }
   function loadBl() {
     api('/calls/analytics/phone-blacklist').then(function (d) { setBl(d); }).catch(function (e) { setBlErr(String(e.message || e)); });
+  }
+  // Apelurile unui agent: aceeasi perioada si aceeasi excludere de numere ca agregatul de
+  // deasupra, ca lista sa se potriveasca la numar cu randul din tabel.
+  function toggleAgentCalls(agentName) {
+    if (openAgent === agentName) { setOpenAgent(null); setAgentCalls(null); return; }
+    setOpenAgent(agentName); setAgentCalls(null); setAgentCallsErr(''); setAgentCallsBusy(true);
+    var r = monthRange(month);
+    var from = (!range.from && !range.to) ? r.from : (range.from || range.to);
+    var to   = (!range.from && !range.to) ? r.to   : (range.to || range.from);
+    api('/calls/analytics/agent-calls?agent_name=' + encodeURIComponent(agentName)
+        + '&date_from=' + from + '&date_to=' + to + '&exclude_blacklist=' + excludeBL)
+      .then(function (d) { setAgentCalls(d); })
+      .catch(function (e) { setAgentCallsErr(String(e.message || e)); })
+      .finally(function () { setAgentCallsBusy(false); });
   }
   function loadPrompts() {
     api('/calls/analytics/scoring-prompts').then(function (d) { setPrompts(d); });
@@ -14994,9 +15091,15 @@ function CallsAnalitice({ setTopbarRight }) {
                 h('th', { style: { textAlign: 'right' }, title: 'Apeluri in care pasii urmatori au fost comunicati clar' }, '% Pasi clari'),
                 h('th', { style: { textAlign: 'right' }, title: 'Cereri suplimentare ale clientului pe care agentul nu le-a recepționat deloc' }, 'Cereri ignorate'),
               ])),
-              h('tbody', null, agents.map(function (a, i) {
-                return h('tr', { key: i }, [
-                  h('td', null, a.agent || '—'),
+              h('tbody', null, agents.reduce(function (acc, a, i) {
+                var open = openAgent === a.agent;
+                acc.push(h('tr', { key: 'a' + i, style: { cursor: 'pointer', background: open ? 'var(--bg3)' : 'transparent' },
+                    onClick: function () { toggleAgentCalls(a.agent); },
+                    title: 'Vezi apelurile agentului, cu scorul fiecaruia' }, [
+                  h('td', null, h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } }, [
+                    h('span', { key: 'c', style: { fontSize: 10, color: 'var(--t3)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' } }, '▶'),
+                    h('span', { key: 'n' }, a.agent || '—'),
+                  ])),
                   h('td', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, a.call_count),
                   h('td', null, scoreBar(a.agent_score_avg)),
                   h('td', null, scoreBar(a.avg_empathy)),
@@ -15006,11 +15109,34 @@ function CallsAnalitice({ setTopbarRight }) {
                   h('td', { style: { textAlign: 'right' } }, a.resolved_count != null && a.scored_count ? Math.round(a.resolved_count * 100 / a.scored_count) + '%' : '—'),
                   h('td', { style: { textAlign: 'right' } }, a.next_steps_scored_count ? Math.round((a.next_steps_clear_count || 0) * 100 / a.next_steps_scored_count) + '%' : '—'),
                   h('td', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: (a.unacknowledged_requests || 0) > 0 ? 'var(--rd)' : 'var(--t3)' } }, a.unacknowledged_requests || 0),
-                ]);
-              }))
+                ]));
+                if (open) {
+                  acc.push(h('tr', { key: 'd' + i }, h('td', { colSpan: 10, style: { padding: 0, background: 'var(--bg2)' } },
+                    h(AgentCallsPanel, {
+                      busy: agentCallsBusy, err: agentCallsErr, data: agentCalls,
+                      onOpenCall: function (id) { setCallModalId(id); },
+                    })
+                  )));
+                }
+                return acc;
+              }, []))
             ])
           ),
       scoresErr ? h('div', { style: { color: 'var(--rd)', marginTop: 8 } }, scoresErr) : null,
+      callModalId != null ? h(CallDetail, {
+        key: 'cm', callId: callModalId,
+        allIds: (agentCalls && agentCalls.calls || []).map(function (c) { return c.id; }),
+        currentIndex: (agentCalls && agentCalls.calls || []).findIndex(function (c) { return c.id === callModalId; }),
+        onNext: function () {
+          var ids = (agentCalls && agentCalls.calls || []).map(function (c) { return c.id; });
+          var i = ids.indexOf(callModalId); if (i > -1 && i < ids.length - 1) setCallModalId(ids[i + 1]);
+        },
+        onPrev: function () {
+          var ids = (agentCalls && agentCalls.calls || []).map(function (c) { return c.id; });
+          var i = ids.indexOf(callModalId); if (i > 0) setCallModalId(ids[i - 1]);
+        },
+        onClose: function () { setCallModalId(null); },
+      }) : null,
     ]);
   })();
 
@@ -15391,6 +15517,17 @@ function metaField(label, value) {
 }
 
 
+// Intrebarile binare de scoring: cheia promptului -> eticheta + coloana de compatibilitate
+// pentru apelurile scorate inainte de `binary_evidence`. Ordinea = cea din BINARY_COLUMNS
+// (app/services/call_scorer.py); `bun: true` = raspunsul „da" e rezultatul dorit.
+var CALL_BINARY_QUESTIONS = [
+  { k: 'masiniCareNuTransmit',      col: 'masini_care_nu_transmit',     l: 'Mașini care nu transmit' },
+  { k: 'clientulAmintaJudecata',    col: 'clientul_aminta_judecata',    l: 'Clientul ne amenință că ne dă în judecată?' },
+  { k: 'agentulSaPrezentat',        col: 'agentul_sa_prezentat',        l: 'Agentul s-a prezentat la începutul apelului?', bun: true },
+  { k: 'clientulAmintaRenuntare',   col: 'clientul_aminta_renuntare',   l: 'Clientul a amenințat că renunță la colaborarea cu noi?' },
+  { k: 'clientulContactatAnterior', col: 'clientul_contactat_anterior', l: 'Clientul a menționat că ne-a contactat anterior, dar nu a primit răspuns?' },
+];
+
 // Panou „Analiza AI" din modalul de apel — rezultatul intrebarilor AI (call_ai_scores)
 // pentru apelul curent: problema/solutia, scoruri agent+client, pasi urmatori, cereri
 // suplimentare ale clientului. Datele vin odata cu GET /calls/{id} (camp ai_scores).
@@ -15529,6 +15666,33 @@ function CallAiAnalysis({ scores, callId, onRescored }) {
           ]) : null,
         ])
       : null,
+
+    // Intrebarile binare, cu citatul pe care si-a bazat modelul raspunsul.
+    (function () {
+      var ev = asObj(scores.binary_evidence) || {};
+      var rows = CALL_BINARY_QUESTIONS.map(function (q) {
+        var e = ev[q.k] || {};
+        // Apelurile scorate inainte de `binary_evidence` au doar coloana boolean.
+        var val = e.result != null ? e.result : (scores[q.col] != null ? scores[q.col] : null);
+        return { q: q, val: val, evidence: e.evidence || null };
+      }).filter(function (r) { return r.val != null || r.evidence; });
+      if (!rows.length) return null;
+      return h('div', { key: 'bin', style: cardS }, [
+        h('div', { key: 'l', style: lblS }, 'Intrebari binare'),
+        h('div', { key: 'ls', style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+          rows.map(function (r) {
+            var good = r.val === (r.q.bun === true);
+            var col = r.val == null ? '#6b7280' : good ? '#10b981' : '#ef4444';
+            return h('div', { key: r.q.k, style: { borderLeft: '3px solid ' + col, paddingLeft: 10 } }, [
+              h('div', { key: 'h', style: { display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' } }, [
+                h('span', { key: 'q', style: { fontSize: 13 } }, r.q.l),
+                badge('v', r.val == null ? 'necunoscut' : r.val ? 'DA' : 'NU', col),
+              ]),
+              r.evidence ? h('div', { key: 'e', style: { fontSize: 12, color: 'var(--t2)', marginTop: 3, lineHeight: 1.5 } }, r.evidence) : null,
+            ]);
+          })),
+      ]);
+    })(),
 
     textBlock('advemp', 'Sfat agent — empatie', scores.agent_advice_empathy),
     textBlock('advprof', 'Sfat agent — profesionalism', scores.agent_advice_professionalism),

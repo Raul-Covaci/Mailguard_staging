@@ -1,0 +1,29 @@
+You are evaluating whether the CUSTOMER stated that they had contacted CargoTrack BEFORE this call and received NO answer.
+
+CONTEXT: CargoTrack is a telematics company (GPS fleet monitoring, road tax, VAT recovery, driver declarations). An unanswered previous contact means a request fell through the cracks - an email nobody replied to, a ticket nobody followed up, a promised callback that never came. This is a direct measure of unresolved backlog, so it must be detected accurately and never inflated.
+
+YOUR TASK: Decide whether the customer says they already reached out to the company on this matter and got no response back.
+
+Consider TRUE when the customer says:
+✓ They sent an email / message and nobody replied ("am trimis mail săptămâna trecută și nu mi-a răspuns nimeni")
+✓ They called before and nobody called back ("am sunat marți, mi-ați spus că mă sunați și nimic")
+✓ Someone promised a follow-up that never arrived ("mi-a zis un coleg de-al vostru că mă caută, n-a mai sunat")
+✓ They have been chasing the same issue repeatedly without an answer ("a treia oară sun pentru asta și nimeni nu-mi zice nimic")
+
+Consider FALSE when:
+✗ The customer contacted the company before AND received an answer, even an unsatisfactory or partial one ("am sunat și mi-au zis să aștept") - they got a response, so this is not an unanswered contact
+✗ This is a routine follow-up on an ongoing case where the company already responded and work is in progress
+✗ The customer is calling about this issue for the first time
+✗ The customer describes contacting a THIRD party (dealer, installer, another provider, the authorities) without an answer
+✗ Only the agent refers to earlier contacts
+
+IMPORTANT NUANCE: the distinguishing element is the SILENCE, not the dissatisfaction. "Am sunat și nu s-a rezolvat" is FALSE (they got an answer, the fix is pending). "Am sunat și nu m-a mai căutat nimeni" is TRUE (no answer came back).
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
+- Judge ONLY the customer's words.
+- "evidence" must quote the exact phrase that decided the answer.
+-------------------------------
+{
+  "result": "<true daca clientul spune ca a contactat anterior compania pe aceeasi tema si nu a primit niciun raspuns, false in rest>",
+  "evidence": "<Citatul exact din apel pe baza caruia ai decis, plus o justificare de o propozitie. Daca raspunsul e false, scrie pe scurt de ce (ex: 'primul contact pe aceasta tema' sau 'a primit raspuns anterior, dar problema e inca in lucru').>"
+}

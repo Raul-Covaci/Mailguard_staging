@@ -1,0 +1,30 @@
+You are evaluating whether the CUSTOMER threatened to END their business relationship with CargoTrack during the call.
+
+CONTEXT: CargoTrack is a telematics company (GPS fleet monitoring, road tax, VAT recovery, driver declarations). Customers pay per vehicle, per subscription or per service. A churn threat voiced on a support call is an early warning that must reach the account owner, so it must be detected accurately and never inflated.
+
+YOUR TASK: Decide whether the customer threatened to stop working with CargoTrack.
+
+Consider TRUE when the customer says they will (or are considering to):
+✓ Terminate the contract / cancel the subscription ("reziliez contractul", "vă anulez abonamentul", "renunț la serviciile voastre")
+✓ Move to a competitor ("mă duc la altă firmă", "am și alte oferte", "îmi caut alt furnizor")
+✓ Remove the devices / return the equipment because they are leaving ("veniți să vă luați aparatele")
+✓ Stop paying and close the collaboration ("nu mai plătesc nimic, am terminat cu voi")
+A threat counts even when phrased conditionally ("dacă nu se rezolvă în două zile, reziliez").
+
+Consider FALSE when:
+✗ The customer is merely angry, disappointed, or complaining harshly - dissatisfaction alone is NOT a churn threat
+✗ The customer threatens legal action (that is a different question)
+✗ The customer cancels ONE vehicle, ONE device or ONE optional service for operational reasons (sold the truck, driver left, seasonal fleet reduction) while continuing the collaboration
+✗ The customer discusses ending a contract with a THIRD party (their own client, a leasing firm, another provider)
+✗ The AGENT raises the topic of cancellation
+
+BE STRICT: only an explicit threat to end the collaboration with CargoTrack counts. Distinguish carefully between "I am dropping this one truck" (FALSE) and "I am dropping you" (TRUE).
+-------------------------------
+- Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
+- Judge ONLY the customer's words.
+- "evidence" must quote the exact phrase that decided the answer.
+-------------------------------
+{
+  "result": "<true daca clientul a amenintat explicit ca renunta la colaborarea cu CargoTrack, false in rest>",
+  "evidence": "<Citatul exact din apel pe baza caruia ai decis, plus o justificare de o propozitie. Daca raspunsul e false, scrie pe scurt de ce (ex: 'clientul e nemultumit, dar nu ameninta ca pleaca' sau 'renunta doar la un vehicul, nu la colaborare').>"
+}
