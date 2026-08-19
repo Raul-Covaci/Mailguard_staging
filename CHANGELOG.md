@@ -8,6 +8,26 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.0.1 - 2026-08-19
+
+### PATCH — Sync clienți: o eroare pe un client nu mai omoară tot lotul
+
+Simptom (producție): „Sync eșuat: `current transaction is aborted, commands ignored until end of
+transaction block`", cu vehicule/contracte goale. Cauza nu e clientul pe care pică, ci faptul că tot
+pull-ul (~16k clienți) rula într-o **singură tranzacție**: prima instrucțiune căzută abortează
+tranzacția, iar `except`-ul din jurul sync-ului de assets înghițea eroarea reală și continua — toate
+instrucțiunile de după ieșeau cu mesajul generic, singurul care ajungea în UI.
+
+- Fiecare client rulează acum într-un **SAVEPOINT** propriu: la eroare se face `ROLLBACK TO
+  SAVEPOINT` doar pentru el, restul lotului continuă.
+- Prima eroare reală se întoarce în rezultat (`first_error`) și se numără (`errors`); status nou
+  **`partial`** când lotul a mers dar unii clienți au picat.
+- UI (Clienți → „Sync acum") afișează `partial` cu numărul de clienți căzuți + prima eroare reală,
+  în loc să aștepte până la timeout.
+- Dacă se pierde conexiunea (nu doar instrucțiunea), sync-ul se oprește explicit, nu tăcut.
+
+Verificat local pe feed-ul real: 16.492 clienți, 43.741 vehicule, 32.309 contracte, `errors: 0`.
+
 ## v3.0.0 - 2026-08-19 — RELEASE PE PRODUCȚIE
 
 Consolidează toate livrările v2.1.0 → v2.18.0 (intrările individuale rămân mai jos, neatinse).

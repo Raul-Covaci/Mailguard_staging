@@ -4640,6 +4640,13 @@ function Clients({ setTopbarRight, initialDeepNav, onBack }) {
           mgToast('success', 'Sync: ' + s.fetched + ' aduse / ' + (s.inserted || 0) + ' inserate / ' + (s.updated || 0) + ' actualizate / ' + (s.deactivated || 0) + ' dezactivate', 5000);
           reload(); setBusy(false); return;
         }
+        // „partial" = lotul a mers, dar unii clienti au picat (fiecare are savepoint propriu).
+        // Aratam prima eroare reala, nu doar numarul — altfel ramane invizibila in log.
+        if (s && s.status === 'partial') {
+          mgToast('error', 'Sync partial: ' + (s.errors || 0) + ' clienti au esuat din ' + (s.fetched || 0) +
+            '. Prima eroare: ' + (s.first_error || 'necunoscuta'), 9000);
+          reload(); setBusy(false); return;
+        }
         if (s && s.status === 'error') {
           mgToast('error', 'Sync esuat: ' + (s.message || 'eroare necunoscuta'), 6000);
           setBusy(false); return;

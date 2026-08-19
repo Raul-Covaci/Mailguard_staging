@@ -437,6 +437,11 @@ def sync_clients_from_iris() -> dict:
 
     inserted, updated = 0, 0
     vehicles_synced, contracts_synced, clients_with_assets = 0, 0, 0
+    # Erorile per client NU mai sunt inghitite: fara SAVEPOINT, prima instructiune cazuta
+    # (ex. o coloana/index care lipseste pe un mediu) aborta TRANZACTIA, iar toti clientii
+    # de dupa ea cadeau cu „current transaction is aborted, commands ignored until end of
+    # transaction block" — mesajul generic ascundea eroarea reala si sync-ul iesea gol.
+    errors, first_error = 0, None
     seen_ids = set()
     with _conn() as conn:
         cur = conn.cursor()
@@ -445,76 +450,91 @@ def sync_clients_from_iris() -> dict:
             if iris_id is None:
                 continue
             seen_ids.add(iris_id)
-            # Adresele NOASTRE nu identifica un client: in CTS ele inseamna „agentul care
-            # gestioneaza clientul" (`office@`, adrese de colegi, `fara_email@`). Le separam
-            # ca `match_client()` sa nu atribuie un client arbitrar oricarui email trimis de
-            # un coleg (vezi migratia 20260729c). Nu se pierd: merg in internal_contact_emails.
-            _emails_all = c.get('emails') or []
-            _emails_ext = [a for a in _emails_all if not _is_internal_client_address(a)]
-            _emails_int = [str(a).strip().lower() for a in _emails_all
-                           if _is_internal_client_address(a)]
-            emails_json = json.dumps(_emails_ext)
-            internal_emails_json = json.dumps(sorted(set(_emails_int)))
-            phones_json = json.dumps(c.get('phones') or [])
-            email_priority = _norm_email_priority(
-                c.get('email_priority', c.get('priority', c.get('mail_priority'))))
-            ccui = _pick(c, "cui", "cui_client", "cif", "cod_fiscal", "vat")
-            ccui = str(ccui).strip() if ccui is not None and str(ccui).strip() else None
-            # emails/phones: dacă IRIS trimite [] dar avem adrese descoperite local, le păstrăm.
-            # EXCLUDED.emails = [] nu suprascrie adresele existente ne-goale (discovered local).
-            cur.execute("""
-                INSERT INTO clients(iris_client_id, name, cui, emails, internal_contact_emails,
-                    phones, is_active, email_priority, last_synced_at, updated_at)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, NOW(), NOW())
-                ON CONFLICT (iris_client_id) DO UPDATE SET
-                    name=EXCLUDED.name, cui=COALESCE(EXCLUDED.cui, clients.cui),
-                    emails=CASE
-                        WHEN EXCLUDED.emails IS NOT NULL AND jsonb_array_length(EXCLUDED.emails) > 0
-                        THEN EXCLUDED.emails
-                        -- IRIS nu trimite nicio adresa EXTERNA: pastram ce avem local
-                        -- (descoperit din interactiuni), dar DOAR partea externa. Altfel un
-                        -- client care are in CTS exclusiv adrese interne rămânea cu ele in
-                        -- `emails` si redevenea tinta de match arbitrar.
-                        -- Atentie: procentul se dubleaza in acest query (psycopg2 il trateaza
-                        -- ca placeholder de parametru cand execute() primeste argumente).
-                        ELSE COALESCE(NULLIF((
-                            SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
-                            FROM jsonb_array_elements_text(COALESCE(clients.emails, '[]'::jsonb)) v
-                            WHERE lower(v) NOT LIKE '%%cargotrack.ro'
-                              AND lower(v) NOT LIKE '%%trakosoft.ro'
-                        ), '[]'::jsonb), EXCLUDED.emails)
-                    END,
-                    internal_contact_emails=CASE
-                        WHEN jsonb_array_length(EXCLUDED.internal_contact_emails) > 0
-                        THEN EXCLUDED.internal_contact_emails
-                        ELSE clients.internal_contact_emails
-                    END,
-                    phones=CASE
-                        WHEN EXCLUDED.phones IS NOT NULL AND jsonb_array_length(EXCLUDED.phones) > 0
-                        THEN EXCLUDED.phones
-                        ELSE COALESCE(NULLIF(clients.phones, '[]'::jsonb), EXCLUDED.phones)
-                    END,
-                    is_active=EXCLUDED.is_active, email_priority=EXCLUDED.email_priority,
-                    last_synced_at=NOW(), updated_at=NOW()
-                RETURNING id, (xmax = 0) AS inserted
-            """, (iris_id, c.get('name'), ccui, emails_json, internal_emails_json, phones_json,
-                  c.get('is_active', True), email_priority))
-            row = cur.fetchone()
-            local_id = row[0] if row else None
-            if row and row[1]:
-                inserted += 1
-            else:
-                updated += 1
-            # OPS-0124: vehicule + contracte (no-op daca feed-ul nu le contine)
-            if local_id is not None:
-                try:
+            cur.execute("SAVEPOINT sp_client")
+            try:
+                # Adresele NOASTRE nu identifica un client: in CTS ele inseamna „agentul care
+                # gestioneaza clientul" (`office@`, adrese de colegi, `fara_email@`). Le separam
+                # ca `match_client()` sa nu atribuie un client arbitrar oricarui email trimis de
+                # un coleg (vezi migratia 20260729c). Nu se pierd: merg in internal_contact_emails.
+                _emails_all = c.get('emails') or []
+                _emails_ext = [a for a in _emails_all if not _is_internal_client_address(a)]
+                _emails_int = [str(a).strip().lower() for a in _emails_all
+                               if _is_internal_client_address(a)]
+                emails_json = json.dumps(_emails_ext)
+                internal_emails_json = json.dumps(sorted(set(_emails_int)))
+                phones_json = json.dumps(c.get('phones') or [])
+                email_priority = _norm_email_priority(
+                    c.get('email_priority', c.get('priority', c.get('mail_priority'))))
+                ccui = _pick(c, "cui", "cui_client", "cif", "cod_fiscal", "vat")
+                ccui = str(ccui).strip() if ccui is not None and str(ccui).strip() else None
+                # emails/phones: dacă IRIS trimite [] dar avem adrese descoperite local, le păstrăm.
+                # EXCLUDED.emails = [] nu suprascrie adresele existente ne-goale (discovered local).
+                cur.execute("""
+                    INSERT INTO clients(iris_client_id, name, cui, emails, internal_contact_emails,
+                        phones, is_active, email_priority, last_synced_at, updated_at)
+                    VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, NOW(), NOW())
+                    ON CONFLICT (iris_client_id) DO UPDATE SET
+                        name=EXCLUDED.name, cui=COALESCE(EXCLUDED.cui, clients.cui),
+                        emails=CASE
+                            WHEN EXCLUDED.emails IS NOT NULL AND jsonb_array_length(EXCLUDED.emails) > 0
+                            THEN EXCLUDED.emails
+                            -- IRIS nu trimite nicio adresa EXTERNA: pastram ce avem local
+                            -- (descoperit din interactiuni), dar DOAR partea externa. Altfel un
+                            -- client care are in CTS exclusiv adrese interne rămânea cu ele in
+                            -- `emails` si redevenea tinta de match arbitrar.
+                            -- Atentie: procentul se dubleaza in acest query (psycopg2 il trateaza
+                            -- ca placeholder de parametru cand execute() primeste argumente).
+                            ELSE COALESCE(NULLIF((
+                                SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
+                                FROM jsonb_array_elements_text(COALESCE(clients.emails, '[]'::jsonb)) v
+                                WHERE lower(v) NOT LIKE '%%cargotrack.ro'
+                                  AND lower(v) NOT LIKE '%%trakosoft.ro'
+                            ), '[]'::jsonb), EXCLUDED.emails)
+                        END,
+                        internal_contact_emails=CASE
+                            WHEN jsonb_array_length(EXCLUDED.internal_contact_emails) > 0
+                            THEN EXCLUDED.internal_contact_emails
+                            ELSE clients.internal_contact_emails
+                        END,
+                        phones=CASE
+                            WHEN EXCLUDED.phones IS NOT NULL AND jsonb_array_length(EXCLUDED.phones) > 0
+                            THEN EXCLUDED.phones
+                            ELSE COALESCE(NULLIF(clients.phones, '[]'::jsonb), EXCLUDED.phones)
+                        END,
+                        is_active=EXCLUDED.is_active, email_priority=EXCLUDED.email_priority,
+                        last_synced_at=NOW(), updated_at=NOW()
+                    RETURNING id, (xmax = 0) AS inserted
+                """, (iris_id, c.get('name'), ccui, emails_json, internal_emails_json, phones_json,
+                      c.get('is_active', True), email_priority))
+                row = cur.fetchone()
+                local_id = row[0] if row else None
+                if row and row[1]:
+                    inserted += 1
+                else:
+                    updated += 1
+                # OPS-0124: vehicule + contracte (no-op daca feed-ul nu le contine)
+                if local_id is not None:
                     nv, nc = _sync_client_assets(cur, local_id, iris_id, c)
                     if nv or nc:
                         clients_with_assets += 1
                     vehicles_synced += nv
                     contracts_synced += nc
+                cur.execute("RELEASE SAVEPOINT sp_client")
+            except Exception as e:
+                # Rollback DOAR pe clientul cazut: restul lotului merge mai departe, iar
+                # prima eroare reala se intoarce in rezultat (o vede UI-ul, nu doar log-ul).
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_client")
+                    cur.execute("RELEASE SAVEPOINT sp_client")
                 except Exception:
-                    logger.exception("client assets sync failed for iris_id=%s", iris_id)
+                    # Conexiunea e moarta (nu doar instructiunea) — nu are rost sa continuam
+                    # lotul pe o tranzactie pe care n-o mai putem salva.
+                    logger.error("client sync: conexiune pierduta la iris_id=%s", iris_id)
+                    raise
+                errors += 1
+                if first_error is None:
+                    first_error = "iris_id=%s: %s: %s" % (iris_id, type(e).__name__, str(e).strip()[:300])
+                logger.exception("client sync failed for iris_id=%s", iris_id)
         # Mark missing clients as inactive
         if seen_ids:
             cur.execute("""
@@ -530,11 +550,12 @@ def sync_clients_from_iris() -> dict:
                 UPDATE settings SET value = %s::jsonb, updated_at = NOW()
                 WHERE key = 'client_assets.last_result'
             """, (json.dumps({
-                "status": "ok",
+                "status": ("ok" if not errors else "partial"),
                 "fetched": len(clients), "inserted": inserted, "updated": updated,
                 "deactivated": deactivated,
                 "vehicles": vehicles_synced, "contracts": contracts_synced,
                 "clients_with_assets": clients_with_assets,
+                "errors": errors, "first_error": first_error,
             }),))
         except Exception:
             logger.exception("client_assets.last_result update failed")
@@ -556,10 +577,12 @@ def sync_clients_from_iris() -> dict:
     except Exception:
         logger.exception("rebuild indexuri client failed after client sync")
 
-    return {"status": "ok", "fetched": len(clients), "inserted": inserted,
+    return {"status": ("ok" if not errors else "partial"),
+            "fetched": len(clients), "inserted": inserted,
             "updated": updated, "deactivated": deactivated,
             "vehicles": vehicles_synced, "contracts": contracts_synced,
             "clients_with_assets": clients_with_assets,
+            "errors": errors, "first_error": first_error,
             "emails_discovered": discovered,
             "phone_keys_indexed": phone_keys,
             "unique_emails_indexed": unique_emails}
