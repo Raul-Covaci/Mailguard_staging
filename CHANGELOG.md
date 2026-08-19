@@ -8,6 +8,62 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.0.0 - 2026-08-19 — RELEASE PE PRODUCȚIE
+
+Consolidează toate livrările v2.1.0 → v2.18.0 (intrările individuale rămân mai jos, neatinse).
+
+**Mail-uri CTS & analiză trafic**
+- Tab nou **„Raport departamente"**: 3 indici (mutări per mail, cine mută, departamente intermediare),
+  fiecare cu tabel top 10 + grafic și drill-down pe mailurile concrete (v2.18.0).
+- Tabelă nouă `cts_department_moves` + trigger pe `cts_ground_truth` — istoricul mutărilor între
+  departamente, cu backfill din `cts_department_prev` (v2.18.0).
+
+**Satisfacție clienți**
+- Motor V6 pe traiectorie IRIS: `iris_reasoning` condensat la rezumat acționabil 2-3 rânduri
+  (v2.11.0, v2.13.1) + sinteză lunară AI (v2.13.2), cu fix pe `model_hint` lipsă (v2.16.1).
+- Scos cardul „Clienți la risc real" din dashboard și din API (v2.18.0).
+
+**Analiză apeluri**
+- Prompturi de scoring versionate în repo (`app/services/prompts/calls/`), sync fără redeploy;
+  `issueResolution` V2, `agentScore` V3 (dimensiunea `transparency`), `agentActions` V2 + 2 prompturi
+  noi (`agentAdviceNextSteps`, `customerAdditionalRequests`) și KPI-uri noi în dashboard (v2.17.0).
+- Apelurile din Productivitate vin din centrală, nu din CTS; leg-urile de centrală nu mai contează ca
+  apeluri; apeluri pierdute numărate corect; fix decalaj de 3h la ora apelului (v2.12.0, v2.13.0).
+
+**Productivitate**
+- Tabel **Productivitate zilnică** per departament (colapsabil, o linie per zi, scor TOTAL),
+  endpoint `GET /productivity/daily` (v2.15.0), mutat în cardul fiecărui departament — 0.29s în loc
+  de 1.03s la deschidere (v2.15.1).
+- Monitor operațional: contoare pe ziua curentă, identificarea rândurilor și contribuția ponderată
+  (v2.9.0), reclamații „Deschise"/„În lucru" + total lunar (v2.13.0, v2.14.0), pictograma scrie
+  obiectivul real, nu minimul (v2.14.0).
+- Editare manuală a pontajului (v2.9.0).
+
+**Acces & securitate**
+- Roluri interne operator / admin / developer (v2.5.0), pre-atribuire pe email + atribuire în masă
+  pe departament (v2.6.0), module interzise blocate pe server, nu doar ascunse în meniu (v2.6.1).
+- Audit adversarial pre-producție: 11 defecte reparate (v2.4.0) + încă 2 găuri închise la
+  re-verificare (v2.4.1).
+
+**Documente & integrare CTS**
+- Trasabilitate documente MailGuard în CTS — CCTS-5308 / CCTS-5071 (v2.2.0), corecții din audit +
+  statistici pe pagina Procesare documente (v2.2.1), documentație `update_documents` (v2.2.2) și
+  apariția lui în panoul Conexiune API (v2.2.3).
+- Documente spre CTS: max 1,6 MB, PDF obligatoriu la vehicul și contract (v2.3.0).
+
+**Operațional / infrastructură**
+- Deploy prin `git pull` pe server (`deploy-pull.sh`) + integrare Git (v2.7.0).
+- Export bază de date pentru dezvoltare locală, din Setări (v2.8.0).
+- Cleanup automat storage zilnic la 00:00 (v2.1.0) + fix la raportarea `storage_cleanup.sh` (v2.3.1).
+
+**UI general & fix-uri**
+- Sortare pe coloane în tabelele mari, coloana Client/Device la Task-uri, apeluri in/out în lista de
+  Clienți (v2.10.0).
+- Fix: vehiculele și contractele clienților erau înghețate din 29.07 — cheia IRIS citită doar din
+  environment (v2.10.0, v2.14.0).
+- Fix: pagina Utilizatori rămânea albă pentru admini; operatorul vede cele două monitoare (v2.9.1).
+- Fix: emailurile cu Ordin de Plată primeau P4/P5 în loc de P2 (v2.1.1).
+
 ## v2.18.0 - 2026-08-19
 
 ### MINOR — Tab „Raport departamente" în Mail-uri CTS

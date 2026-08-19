@@ -544,8 +544,8 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v2.0.0` (al doilea release pe producție, 2026-08-08)
-**Urmează:** `v2.1.0` pentru primul feature nou după acest release.
+**Versiunea curentă:** `v3.0.0` (al treilea release pe producție, 2026-08-19)
+**Urmează:** `v3.1.0` pentru primul feature nou după acest release.
 
 Reguli impuse agentului:
 - Orice livrare → incrementează `VERSION` + entry în `CHANGELOG.md`
