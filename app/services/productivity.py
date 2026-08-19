@@ -414,9 +414,13 @@ class _BizCache:
         # dintre operatorii efectiv prezenti. Folosit ca fereastra pentru departamentele fara
         # `department_schedule` (contabilitate, recuperare_tva) -- vezi _dept_window.
         self._dept_day_union: dict = {}
+        # zilele care au ORICE rand de pontaj (prezent sau absent) — separa „nimeni prezent" de
+        # „ziua nu a fost pontata deloc"
+        self._dept_day_any: set = set()
         for emp_id, dept, work_date, present, begin_time, end_time in att_rows:
             wd_date = work_date if isinstance(work_date, _dt.date) else _dt.date.fromisoformat(str(work_date))
             self._att[(int(emp_id), wd_date)] = (bool(present), begin_time, end_time, dept)
+            self._dept_day_any.add((dept, wd_date))
             if present:
                 key = (dept, wd_date)
                 self._dept_day_count[key] = self._dept_day_count.get(key, 0) + 1
@@ -429,18 +433,75 @@ class _BizCache:
                         e if prev is None or e > prev[1] else prev[1],
                     )
 
-    def is_working_day_for_dept(self, dept: str, day: _dt.date) -> bool:
-        """True dacă departamentul are ≥1 angajat prezent în ziua respectivă (inclusiv sâmbăta).
+        # Angajatii activi per departament + concediile lor aprobate. Necesare ca sa deosebim
+        # „zi in care nu a fost NIMENI la lucru" (concediu -> zi inactiva, ca duminica) de
+        # „zi fara pontaj importat" (gaura de sync -> nu penalizam). Vezi is_working_day_for_dept.
+        self._dept_emp: dict = {}
+        for r in db.execute(text(
+            "SELECT department, id, iris_id FROM employee_department_mapping "
+            "WHERE enabled = true AND department = ANY(:depts)"),
+                {"depts": list(departments)}).fetchall():
+            self._dept_emp.setdefault(r[0], []).append((int(r[1]), (str(r[2]) if r[2] else None)))
+        emp_ids = [e[0] for lst in self._dept_emp.values() for e in lst]
+        iris_ids = [e[1] for lst in self._dept_emp.values() for e in lst if e[1]]
+        iris_to_emp = {e[1]: e[0] for lst in self._dept_emp.values() for e in lst if e[1]}
+        self._leave: dict = {}
+        if emp_ids:
+            for eid, sd, ed in db.execute(text(
+                "SELECT employee_id, start_date, end_date FROM employee_schedule "
+                "WHERE employee_id = ANY(:ids) AND start_date <= :dt AND end_date >= :df"),
+                    {"ids": emp_ids, "df": date_from, "dt": date_to}).fetchall():
+                self._leave.setdefault(int(eid), []).append((sd, ed))
+        if iris_ids:
+            try:
+                for iid, sd, ed in db.execute(text(
+                    "SELECT v.employee_id, v.period_begin::date, v.period_end::date "
+                    "FROM cts_dv_employee_vacation_request v "
+                    "WHERE v.employee_id = ANY(:ids) AND v.deleted_at IS NULL "
+                    "  AND v.status::int IN (1, 2) "
+                    "  AND v.period_begin::date <= :dt AND v.period_end::date >= :df"),
+                        {"ids": iris_ids, "df": date_from, "dt": date_to}).fetchall():
+                    eid = iris_to_emp.get(str(iid))
+                    if eid:
+                        self._leave.setdefault(eid, []).append((sd, ed))
+            except Exception:
+                pass  # tabela DV lipseste pe unele medii — concediile din employee_schedule raman
+        self._all_leave_cache: dict = {}
 
-        Dacă nu există nicio înregistrare de pontaj pentru (dept, day) — ex. ziua e în viitor
-        sau pontajul nu a fost importat — nu penalizăm: returnăm True (zi potențial lucrătoare).
-        Logica de schedule (weekday fără program = skip) rămâne separată în business_minutes().
+    def _all_on_leave(self, dept: str, day: _dt.date) -> bool:
+        """True daca TOTI angajatii activi ai departamentului sunt in concediu aprobat in ziua asta."""
+        key = (dept, day)
+        if key in self._all_leave_cache:
+            return self._all_leave_cache[key]
+        emps = self._dept_emp.get(dept) or []
+        if not emps:
+            res = False
+        else:
+            res = all(any(sd <= day <= ed for sd, ed in (self._leave.get(eid) or []))
+                      for eid, _iris in emps)
+        self._all_leave_cache[key] = res
+        return res
+
+    def is_working_day_for_dept(self, dept: str, day: _dt.date) -> bool:
+        """True dacă departamentul a avut ≥1 angajat pontat prezent în ziua respectivă.
+
+        Regula (2026-08-19, decizie business): o zi în care NU e pontat nimeni din departament e
+        INACTIVĂ — ca duminica. Sâmbăta cu un singur om pontat e, invers, zi lucrătoare.
+        Nuanta e „de ce lipsește pontajul":
+          * există rânduri de pontaj, dar 0 prezenți            -> zi inactivă;
+          * nu există rânduri, dar TOȚI angajații activi ai departamentului sunt în concediu
+            aprobat (employee_schedule / DV)                    -> zi inactivă (cazul real:
+            suport_3, Tyepak Zoltan în concediu 10-21.08, 10 zile în care SLA curgea degeaba);
+          * nu există rânduri și nu e concediu general          -> zi potențial lucrătoare (pontaj
+            neimportat/în viitor) — NU penalizăm, altfel o pană de sync ar opri tot SLA-ul.
+        Logica de fereastră (pontaj > program) rămâne separată în _dept_window().
         """
         key = (dept, day)
-        if key not in self._dept_day_count:
-            # Fara inregistrari de pontaj deloc pentru (dept, day): nu stim → zi potentiala
-            return True
-        return self._dept_day_count[key] >= _MIN_STAFF_FOR_WORKING_DAY
+        if key in self._dept_day_count:
+            return self._dept_day_count[key] >= _MIN_STAFF_FOR_WORKING_DAY
+        if (dept, day) in self._dept_day_any:
+            return False           # s-a pontat ziua, dar nimeni prezent
+        return not self._all_on_leave(dept, day)
 
     def _dept_window(self, dept: str, day: _dt.date):
         """Fereastra de contorizare a departamentului pentru o zi, sau None dacă nu curge.

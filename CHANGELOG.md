@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.3.0 - 2026-08-19
+
+### MINOR — Zi fără nimeni pontat = zi inactivă (concediile nu mai consumă SLA)
+
+O zi în care nu e pontat niciun angajat al departamentului e **inactivă, ca duminica** — iar
+sâmbăta cu un singur om pontat e, invers, zi lucrătoare. Până acum, o zi **fără niciun rând** de
+pontaj era tratată ca „poate lucrătoare" și cădea pe `department_schedule`, deci SLA-ul curgea și
+în concedii.
+
+Caz real: `suport_3` are un singur angajat (Tyepak Zoltan), în concediu aprobat **10–21.08.2026**.
+Cele 10 zile lucrătoare din concediu se măsurau pe programul manual 08:00–17:30, deși nu era
+nimeni — iar 13 din 36 de reclamații ale lunii au `solved_at` după 07.08, deci chiar prindeau
+ferestre inexistente.
+
+Regula distinge **de ce** lipsește pontajul:
+
+- există rânduri de pontaj, dar 0 prezenți → zi inactivă (ca înainte);
+- nu există rânduri, dar **toți** angajații activi ai departamentului sunt în concediu aprobat
+  (`employee_schedule` sau `cts_dv_employee_vacation_request`, status 1/2) → zi inactivă;
+- nu există rânduri și nu e concediu general → zi potențial lucrătoare, fallback pe
+  `department_schedule`. Fără această ramură, o pană de sync ar opri tot SLA-ul și toate scorurile
+  ar sări la 100%.
+
+Verificat pe august 2026: singurul departament cu zile „toți în concediu" e `suport_3` (10 zile);
+restul au 0, deci sunt neatinse. `zile_lucratoare` suport_3: 21 → **11**; reclamații contact
+83,33% → **90,0%**. Celelalte departamente: cifre identice.
+
+Ca bonus, dispare o divergență Python/SQL: o zi cu rânduri de pontaj dar 0 prezenți era tratată ca
+lucrătoare în Python și ca inactivă în SQL. Acum ambele o consideră inactivă.
+
+Schimbarea e în oglindă: `_BizCache.is_working_day_for_dept` (mailuri, apeluri, operațiuni) și
+funcția SQL `business_minutes_emp` prin
+`migrations/20260819e_business_minutes_concediu_zi_inactiva.sql`. Verificat că dau identic pe
+același interval (07.08 15:00 → 24.08 10:00 = 210 min în ambele).
+
 ## v3.2.1 - 2026-08-19
 
 ### PATCH — Dedupare apeluri: nu mai ascunde apelurile pierdute reale

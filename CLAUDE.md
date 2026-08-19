@@ -78,7 +78,12 @@ departamentului**, iar sursa de adevăr e **`employee_attendance`** („Utilizat
 departamente", preluat din CTS sau ajustat manual), NU `department_schedule` (populată manual).
 
 Precedență: pontaj cu ore în ziua respectivă → uniunea turelor celor prezenți; fără pontaj
-utilizabil → `department_schedule`; fără nici program → ziua nu curge; 0 prezenți → nu curge.
+utilizabil → `department_schedule`; fără nici program → ziua nu curge.
+
+**Zi activă = ≥1 angajat pontat prezent.** Zi cu rânduri de pontaj dar 0 prezenți → inactivă. Zi
+fără niciun rând → inactivă DOAR dacă toți angajații activi ai departamentului sunt în concediu
+aprobat (`employee_schedule` / `cts_dv_employee_vacation_request`); altfel e gaură de sync și se
+cade pe program (altfel o pană de pontaj ar face toate scorurile 100%).
 
 ⚠️ Logica există în DOUĂ locuri și trebuie schimbată în OGLINDĂ:
 `_BizCache._dept_window` din `app/services/productivity.py` (mailuri, apeluri, operațiuni) și
