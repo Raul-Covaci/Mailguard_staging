@@ -8,6 +8,59 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.1.0 - 2026-08-19
+
+### MINOR — Timpul de lucru se măsoară pe PONTAJ, nu pe programul manual
+
+Fereastra în care curge SLA-ul era luată din `department_schedule` (tabelă populată manual), iar
+pontajul servea doar la verificarea „≥1 prezent". Tabela divergase de realitate: `suport_2` era
+configurat **07:00–22:00**, deși turele reale sunt 08:00–16:30 și 12:30–21:00.
+
+Caz real, Suport 2 / august: mail intrat sâmbătă 01.08 19:04 (după program), rezolvat luni 03.08
+09:36 → se raportau **156,7 min (2h37, „Overdue")**, pentru că numărătoarea pornea luni la 07:00.
+Al doilea: 02.08 00:31 (duminică) → 03.08 09:30 = **150,8 min (2h31)**.
+
+Precedență nouă (decizie business): sursa de adevăr e **„Utilizatori → Pontaj pe departamente"**
+(`employee_attendance` — preluat din CTS sau ajustat manual):
+
+1. există pontaj cu ore în ziua respectivă → fereastra = **uniunea turelor celor prezenți**
+   (primul început → ultimul final);
+2. nu există pontaj utilizabil (zi neimportată / viitoare / prezenți fără ore) → fallback pe
+   `department_schedule`;
+3. nici program configurat → ziua nu curge. Zi cu 0 prezenți → nu curge (neschimbat).
+
+Cele două cazuri de mai sus dau acum **96,7 min (1h36)** și **90,8 min (1h30)** — identic în Python
+și în SQL. Schimbarea e oglindită în `_BizCache._dept_window` (mailuri, apeluri, operațiuni) și în
+funcția `business_minutes_emp` (task-uri), prin
+`migrations/20260819d_business_minutes_pontaj_first.sql`.
+
+Impact pe august 2026 (scoruri recalculate, ferestrele fiind mai mici): suport_2 82,57 → **88,66**,
+taxe_drum 87,47 → **92,18**, suport_3 91,67 → **93,00**, suport_1 94,25 → **94,36**, contabilitate
+neschimbată (n-avea program configurat, deci folosea deja pontajul).
+
+### MINOR — Clienții excluși din productivitate se aplică pe TOATE canalele
+
+Lista de excluderi (`clients.productivity_exclude`: HU-GO, LOCATOR BG, RUPTELA, TOLL4EUROPE,
+00-FIRMA NECUNOSCUTA LA MONTAJ, ORANGE ROMANIA, HELP DESK CTS, CTS INTERNAL CLIENT) era consultată
+doar pe mailuri, și acolo doar prin `emails.client_id`. Acum se aplică pe fiecare canal, cu
+legătura corectă pentru fiecare sursă:
+
+- **mail** — flagul pe clientul dedus local **plus** clientul atribuit în CTS (`extra.client_id`,
+  ID IRIS): 70 de mailuri pe august scăpau doar prin al doilea;
+- **task** — `cts_task_ground_truth.client_id` e ID IRIS (595 rânduri se potrivesc pe
+  `iris_client_id` față de 29 pe cheia locală), cu fallback pe nume: **91 de rânduri** pe august
+  (comercial 43, suport_2 42, taxe_drum 4, contabilitate 1, suport_1 1);
+- **apel** — `calls.client_id` (cheie locală);
+- **operațiuni** — doar pe nume, `device_operations.client_id` fiind NULL pe toate rândurile;
+- **reclamații** — `cts_quality_evaluation` nu are câmp de client, deci nu se poate filtra (rămâne
+  de cerut în feed).
+
+Aplicat în scor, breakdown, prognoză, analitice **și** în cele 16 interogări ale monitoarelor
+(filtrare în subquery, ca un filtru uitat într-un panou să nu mai poată arăta alt volum).
+`migrations/20260819c_productivity_exclude_reassert.sql` re-asertează lista (util pe producție,
+unde s-a constatat drift de migrații). Volume după filtrare pe august: task suport_2 1390 → 1348,
+taxe_drum bgtoll 42 → 40 / etoll 58 → 57 / hugo 90 → 89, email contabilitate 689 → 686.
+
 ## v3.0.2 - 2026-08-19
 
 ### PATCH — Reparație drift schemă pe producție (cauza reală a sync-ului eșuat)
@@ -24,6 +77,21 @@ rulează chiar dacă vechile migrații sunt marcate aplicate), strict aditiv și
 toate coloanele folosite de sync pe `clients` / `client_contracts` / `client_vehicles`, plus
 indexurile dependente și cele două indexuri UNICE pe care se sprijină `ON CONFLICT`. Pe mediile
 sănătoase (staging, local) e no-op — verificat.
+
+### PATCH — Productivitate: operațiunile pseudo-clienților ies din calcul
+
+„00-FIRMA NECUNOSCUTA LA MONTAJ" (placeholder de montaj, nu o firmă) intra în obiectivul
+*Operațiuni* al Suport 2 cu **38 de rânduri măsurabile pe august 2026** (37 pe „Instalare nouă", 1 pe
+„Mutare"). Clientul era deja marcat `productivity_exclude = TRUE`, dar excluderea se aplica doar pe
+mailuri: `_fetch_device_ops_rows` și breakdown-ul de operațiuni nu o consultau deloc.
+
+- Ambele query-uri filtrează acum pe `clients.productivity_exclude`. Potrivirea se face pe **nume**,
+  nu pe id, fiindcă `device_operations.client_id` e NULL pe toate rândurile (view-ul DV nu-l trimite).
+- `migrations/20260819c_productivity_exclude_reassert.sql` re-asertează lista de excluderi (util și
+  pe producție, unde s-a constatat drift de migrații).
+- Verificat local pe august: instalare_noua 357 → 320, mutare 129 → 128; restul canalelor neatinse.
+- Sursa de adevăr rămâne flagul din `clients`, nu o listă hardcodată — o excludere nouă se face o
+  singură dată, pentru toate canalele.
 
 ### PATCH — Productivitate (Rapoarte): un card de departament pe rând
 

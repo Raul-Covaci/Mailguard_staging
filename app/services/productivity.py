@@ -445,17 +445,32 @@ class _BizCache:
     def _dept_window(self, dept: str, day: _dt.date):
         """Fereastra de contorizare a departamentului pentru o zi, sau None dacă nu curge.
 
-        Regula (2026-08-04): daca departamentul are >=1 om prezent, SLA curge pe PROGRAMUL
-        DEPARTAMENTULUI, indiferent cine rezolva efectiv si in ce tura e. Clientul asteapta
-        departamentul, nu persoana.
-          - are `department_schedule` (suport_1/2/3, taxe_drum) -> fereastra = programul zilei
-          - nu are program (contabilitate, recuperare_tva)      -> fereastra = uniunea turelor
-            celor prezenti in acea zi (de la primul inceput la ultimul final)
+        Regula (2026-08-04): clientul asteapta DEPARTAMENTUL, nu persoana -- cat timp
+        departamentul are >=1 om prezent, timpul curge pe acoperirea departamentului,
+        indiferent cine rezolva efectiv si in ce tura e.
+
+        PRECEDENTA (2026-08-19, decizie business): sursa de adevar e PONTAJUL din
+        „Utilizatori -> Pontaj pe departamente" (`employee_attendance`: preluat din CTS sau
+        ajustat manual), NU tabela `department_schedule` populata manual.
+          1. exista pontaj cu ore pentru ziua respectiva -> fereastra = uniunea turelor celor
+             prezenti (primul inceput -> ultimul final);
+          2. nu exista pontaj utilizabil (zi neimportata, viitoare, sau prezenti fara ore) ->
+             fallback pe `department_schedule`;
+          3. nici program configurat -> ziua nu curge.
+        Inainte era invers, si programul manual batea pontajul: `suport_2` era configurat
+        07:00-22:00, desi turele reale sunt 08:00-16:30 / 12:30-21:00 -> un mail intrat sambata
+        19:04 si rezolvat luni 09:36 iesea 2h37 (numarat de la 07:00) in loc de 1h37.
         Zi cu 0 prezenti = nu curge deloc (se sare la ziua urmatoare).
         """
         if not self.is_working_day_for_dept(dept, day):
             return None
 
+        # 1) PONTAJ (sursa de adevar)
+        win = self._dept_day_union.get((dept, day))
+        if win is not None:
+            return win
+
+        # 2) fallback: programul configurat al departamentului
         sched = self._sched.get((dept, day.isoweekday()))
         if sched is not None:
             st, et, req_att = sched
@@ -465,8 +480,8 @@ class _BizCache:
             return (_dt.datetime.combine(day, st, tzinfo=_TZ_RO),
                     _dt.datetime.combine(day, et, tzinfo=_TZ_RO))
 
-        # Fara program configurat: uniunea turelor reale ale celor prezenti.
-        return self._dept_day_union.get((dept, day))
+        # 3) nici pontaj, nici program -> nu curge
+        return None
 
     def working_days_in_range(self, dept: str, date_from: _dt.date, date_to: _dt.date,
                                holidays: set) -> int:
@@ -615,6 +630,37 @@ _EMAIL_START_SQL = r"""COALESCE(
 # Presupune `LEFT JOIN clients pex ON pex.id = e.client_id` in query-ul gazda.
 _EMAIL_EXCLUDE_SQL = "COALESCE(pex.productivity_exclude, false) = false"
 
+# Aceeasi excludere, dar pe clientul ATRIBUIT IN CTS (`extra.client_id` = ID IRIS). Necesar: pe
+# august 2026, 70 de mailuri ale clientilor exclusi treceau filtrul de mai sus, fiindca
+# `emails.client_id` (deductie din adresa expeditorului) indica alt client decat cel pus de operator
+# in CTS. `{g}` = alias-ul tabelei `cts_ground_truth` in query-ul gazda.
+_EMAIL_EXCLUDE_CTS_SQL = """NOT EXISTS (SELECT 1 FROM clients cex
+                               WHERE cex.productivity_exclude
+                                 AND cex.iris_client_id = NULLIF({g}.raw->'extra'->>'client_id','')::bigint)"""
+
+# TASK-uri: `cts_task_ground_truth.client_id` e ID din IRIS (595 randuri se potrivesc pe
+# `iris_client_id` fata de 29 pe cheia locala), cu fallback pe nume. Pe august 2026 erau 91 de
+# randuri de la clienti exclusi (comercial 43, suport_2 42, taxe_drum 4, contabilitate 1, suport_1 1)
+# care intrau in scor. `{t}` = alias-ul tabelei in query-ul gazda.
+_TASK_EXCLUDE_SQL = """NOT EXISTS (SELECT 1 FROM clients cex
+                               WHERE cex.productivity_exclude
+                                 AND (cex.iris_client_id = {t}.client_id
+                                      OR lower(cex.name) = lower({t}.client_name)))"""
+
+# APELURI: `calls.client_id` e cheia LOCALA (pusa de match_client / sync-ul CTS), nu ID IRIS.
+# `{c}` = alias-ul tabelei `calls` in query-ul gazda.
+_APEL_EXCLUDE_SQL = """NOT EXISTS (SELECT 1 FROM clients cex
+                               WHERE cex.productivity_exclude AND cex.id = {c}.client_id)"""
+
+# EXCLUDERI pe OPERATIUNI (device_operations) — acelasi flag `clients.productivity_exclude` ca la
+# mailuri, dar potrivirea NU se poate face pe id: `device_operations.client_id` e NULL pe TOATE
+# randurile (view-ul DV nu-l trimite), deci se cade pe NUME. Sursa de adevar rimine flagul din
+# `clients`, nu o lista hardcodata in cod — o excludere noua se face o singura data, pentru toate
+# canalele. Caz real (august 2026, suport_2 / instalare_noua): „00-FIRMA NECUNOSCUTA LA MONTAJ" e
+# placeholder de montaj, nu o firma, si intra cu 38 de randuri masurabile in scor.
+# Fragmentul e inlinuit in cele doua query-uri de operatiuni (scor + breakdown) — daca se schimba,
+# se schimba in ambele, altfel lista si scorul ar raspunde diferit la aceeasi intrebare.
+
 # CLIENT. Sursa principala e atribuirea din CTS (`extra.client_id`, ID IRIS): acolo un operator a
 # decis pe cine e tichetul. `emails.client_id` e doar o DEDUCTIE din adresa expeditorului, care
 # greseste cand acelasi om scrie pentru mai multe firme.
@@ -653,6 +699,7 @@ def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: O
             WHERE cgt.cts_status='solved' AND cgt.cts_direction='received'
               AND edm.department=:d AND edm.enabled=true
               AND {_EMAIL_EXCLUDE_SQL}
+              AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='cgt')}
               AND date_trunc('month', (COALESCE(cgt.cts_solved_at, cgt.cts_solved_seen_at, cgt.cts_reply_at)
                                        AT TIME ZONE 'Europe/Bucharest'))::date = :first
         """),
@@ -762,6 +809,7 @@ def _fetch_task_rows(db: Session, department: str, first: _dt.date, categorie: O
               AND lower(ctgt.status) = 'solved'
               AND ctgt.cts_created_at IS NOT NULL AND ctgt.cts_updated_at IS NOT NULL
               AND {fam_filter}
+              AND {_TASK_EXCLUDE_SQL.format(t='ctgt')}
               AND date_trunc('month', ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date = :first
         """),
         params,
@@ -792,6 +840,10 @@ def _fetch_device_ops_rows(db: Session, department: str, first: _dt.date, catego
               AND edo.action_type = :cat
               AND edo.finished_at IS NOT NULL AND edo.closed_at IS NOT NULL
               AND date_trunc('month', edo.closed_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+              AND NOT EXISTS (SELECT 1 FROM clients cex
+                               WHERE cex.productivity_exclude
+                                 AND (cex.id = edo.client_id
+                                      OR lower(cex.name) = lower(edo.client_name)))
         """),
         {"cat": categorie, "first": first},
     ).fetchall()
@@ -988,6 +1040,7 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
             WHERE edm.department=:d
               AND c.direction = 'inbound'
               AND {_APEL_REAL_CALL_SQL}
+              AND {_APEL_EXCLUDE_SQL.format(c='c')}
               AND date_trunc('month', c.started_at)::date = :first
               AND (
                 CASE
@@ -1142,6 +1195,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 WHERE g.cts_status='solved' AND g.cts_direction='received'
                   AND edm.department=:d AND edm.enabled=true
                   AND {_EMAIL_EXCLUDE_SQL}
+                  AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='g')}
                   AND date_trunc('month', (COALESCE(g.cts_solved_at, g.cts_solved_seen_at, g.cts_reply_at)
                                            AT TIME ZONE 'Europe/Bucharest'))::date = :first
             """),
@@ -1204,6 +1258,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                   AND lower(t.status) = 'solved'
                   AND t.cts_created_at IS NOT NULL AND t.cts_updated_at IS NOT NULL
                   AND {fam_filter}
+                  AND {_TASK_EXCLUDE_SQL.format(t='t')}
                   AND date_trunc('month', t.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date = :first
             """),
             task_params,
@@ -1246,6 +1301,10 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                   AND d.action_type = :cat
                   AND d.finished_at IS NOT NULL AND d.closed_at IS NOT NULL
                   AND date_trunc('month', d.closed_at AT TIME ZONE 'Europe/Bucharest')::date = :first
+                  AND NOT EXISTS (SELECT 1 FROM clients cex
+                                   WHERE cex.productivity_exclude
+                                     AND (cex.id = d.client_id
+                                          OR lower(cex.name) = lower(d.client_name)))
             """),
             {"cat": categorie, "first": first},
         ).fetchall()
@@ -1376,6 +1435,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 WHERE edm.department=:d
                   AND c.direction = 'inbound'
                   AND {_APEL_REAL_CALL_SQL}
+                  AND {_APEL_EXCLUDE_SQL.format(c='c')}
                   AND date_trunc('month', c.started_at)::date = :first
             """),
             {"d": department, "first": first},
@@ -2454,6 +2514,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                         LEFT JOIN clients pex ON pex.id = e.client_id
                         WHERE edm.department = :dept
                           AND {_EMAIL_EXCLUDE_SQL}
+                          AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='g')}
                           AND date_trunc('month', g.cts_reply_at AT TIME ZONE 'Europe/Bucharest') =
                               date_trunc('month', CAST(:hfirst AS timestamp))
                     """),
@@ -2485,7 +2546,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
 
             elif tip in ("task", "device_ops"):
                 rows = db.execute(
-                    text("""
+                    text(f"""
                         SELECT COUNT(*) as vol,
                                COUNT(CASE WHEN tgt.cts_created_at IS NOT NULL
                                          AND tgt.cts_updated_at IS NOT NULL
@@ -2497,6 +2558,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                         JOIN employee_department_mapping edm ON edm.id = tgt.assignee_employee_id
                         WHERE edm.department = :dept AND edm.enabled = true
                           AND lower(tgt.status) = 'solved'
+                          AND {_TASK_EXCLUDE_SQL.format(t='tgt')}
                           AND date_trunc('month', tgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest') =
                               date_trunc('month', CAST(:hfirst AS timestamp))
                     """),
@@ -2621,12 +2683,13 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                 task_obj = next((x for x in objectives if x["tip"] in ("task", "device_ops")), None)
                 if task_obj:
                     trows = db.execute(
-                        text("""
+                        text(f"""
                             SELECT tgt.assignee_employee_id as emp_id, COUNT(*) as vol
                             FROM cts_task_ground_truth tgt
                             JOIN employee_department_mapping edm ON edm.id = tgt.assignee_employee_id
                             WHERE edm.department = :dept AND edm.enabled = true
                               AND lower(tgt.status) = 'solved'
+                              AND {_TASK_EXCLUDE_SQL.format(t='tgt')}
                               AND date_trunc('month', tgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest') =
                                   date_trunc('month', CAST(:hfirst AS timestamp))
                             GROUP BY tgt.assignee_employee_id
@@ -2769,6 +2832,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             WHERE cgt.cts_status='solved' AND cgt.cts_direction='received'
               AND edm.enabled=true AND edm.department = ANY(:depts)
               AND {_EMAIL_EXCLUDE_SQL}
+              AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='cgt')}
               """ + uid_filter + """
               AND (COALESCE(cgt.cts_solved_at, cgt.cts_solved_seen_at, cgt.cts_reply_at)
                        AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
@@ -2894,7 +2958,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
     # ---- task-uri ----
     task_uid_filter = "AND edm.id = :uid" if user_id is not None else ""
     raw_task_rows = db.execute(
-        text(r"""
+        text(rf"""
             SELECT edm.id AS op_id,
                    edm.department AS dept,
                    (ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date AS solved_day,
@@ -2906,6 +2970,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             JOIN employee_department_mapping edm ON edm.id = ctgt.assignee_employee_id
             WHERE lower(ctgt.status) = 'solved'
               AND ctgt.cts_created_at IS NOT NULL AND ctgt.cts_updated_at IS NOT NULL
+              AND {_TASK_EXCLUDE_SQL.format(t='ctgt')}
               AND edm.enabled = true AND edm.department = ANY(:depts)
               """ + task_uid_filter + """
               AND (ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
@@ -3060,6 +3125,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             WHERE edm.department = ANY(:depts)
               AND c.direction = 'inbound'
               AND {_APEL_REAL_CALL_SQL}
+              AND {_APEL_EXCLUDE_SQL.format(c='c')}
               """ + apel_uid_filter + f"""
               AND {_APEL_DAY_SQL} BETWEEN :df AND :dt
               AND (

@@ -33,7 +33,22 @@ require_prod_full = _ac.require_role(_ac.ROLE_ADMIN, _ac.ROLE_DEVELOPER)
 # Vezi app/services/productivity.py (_EMAIL_START_SQL / _EMAIL_EXCLUDE_SQL) pentru motivatie:
 # `extra.created_at` e momentul crearii tichetului, nu al sosirii mailului.
 _EMAIL_START_SQL = P._EMAIL_START_SQL
-_EMAIL_EXCLUDE_SQL = P._EMAIL_EXCLUDE_SQL
+# Excluderea are DOUA laturi: flagul pe clientul dedus local (`emails.client_id`, prin `pex`) si
+# clientul ATRIBUIT IN CTS (`extra.client_id` = ID IRIS) -- vezi P._EMAIL_EXCLUDE_CTS_SQL. Toate
+# query-urile de mail de aici folosesc alias-ul `g` pentru `cts_ground_truth`.
+_EMAIL_EXCLUDE_SQL = (P._EMAIL_EXCLUDE_SQL + "\n          AND "
+                      + P._EMAIL_EXCLUDE_CTS_SQL.format(g='g'))
+# Sursele de task-uri / apeluri / operatiuni, filtrate de clientii exclusi din productivitate
+# (`clients.productivity_exclude`). Se filtreaza in SUBQUERY, nu in WHERE-ul fiecarui query:
+# monitorul are ~15 interogari pe aceste tabele, iar un filtru uitat intr-una din ele ar face ca
+# doua panouri sa arate volume diferite pentru aceeasi zi.
+_SRC_TASK = ("(SELECT * FROM cts_task_ground_truth _t WHERE "
+             + P._TASK_EXCLUDE_SQL.format(t='_t') + ")")
+_SRC_CALLS = ("(SELECT * FROM calls _c WHERE "
+              + P._APEL_EXCLUDE_SQL.format(c='_c') + ")")
+_SRC_DEVOPS = ("(SELECT * FROM device_operations _d WHERE NOT EXISTS ("
+               "SELECT 1 FROM clients cex WHERE cex.productivity_exclude "
+               "AND (cex.id = _d.client_id OR lower(cex.name) = lower(_d.client_name))))")
 # JOIN necesar pentru _EMAIL_EXCLUDE_SQL cand query-ul nu are deja `emails e` / `clients pex`.
 _J_EMAIL_EXCL = """
         LEFT JOIN emails e ON e.id = g.email_id
@@ -796,7 +811,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                              AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS in_progress,
             COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
                              AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS pending
-        FROM cts_task_ground_truth t
+        FROM {_SRC_TASK} t
         {_dep_task}
         WHERE {_EFF_DEPT_TASK} = ANY(:depts)
     """), _p).fetchone()
@@ -817,7 +832,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT
             COUNT(*) FILTER (WHERE {P._APEL_REAL_CALL_SQL})                              AS azi,
             COUNT(*) FILTER (WHERE {P._APEL_UNANSWERED_SQL} AND {P._APEL_LOST_CALL_SQL}) AS pierdute_azi
-        FROM calls c
+        FROM {_SRC_CALLS} c
         {P._APEL_AGENT_JOIN}
         WHERE c.direction = 'inbound'
           AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
@@ -832,7 +847,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     # NU pe cardurile per departament — acolo ar arăta 11% din realitate.
     lost_row = db.execute(text(f"""
         SELECT COUNT(*)
-        FROM calls c
+        FROM {_SRC_CALLS} c
         WHERE c.direction = 'inbound'
           AND {P._APEL_UNANSWERED_SQL}
           AND {P._APEL_LOST_CALL_SQL}
@@ -886,7 +901,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT
             COUNT(*) FILTER (WHERE lower(c.ai_category) = 'sesizare')   AS sesizari_azi,
             COUNT(*) FILTER (WHERE lower(c.ai_category) = 'reclamatie') AS reclamatii_azi
-        FROM calls c
+        FROM {_SRC_CALLS} c
         {P._APEL_AGENT_JOIN}
         WHERE c.direction = 'inbound'
           AND {P._APEL_REAL_CALL_SQL}
@@ -994,7 +1009,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT
             COUNT(*) FILTER (WHERE DATE(d.closed_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
             COUNT(*) FILTER (WHERE d.closed_at IS NULL AND d.finished_at IS NOT NULL)       AS in_asteptare
-        FROM device_operations d
+        FROM {_SRC_DEVOPS} d
         {_dep_dev}
     """), _p).fetchone()
 
@@ -1017,7 +1032,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     """)
     h_task = _hourly(f"""
         SELECT EXTRACT(hour FROM t.cts_updated_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM cts_task_ground_truth t
+        FROM {_SRC_TASK} t
         {_dep_task}
         WHERE t.status IN ('solved','closed')
           AND DATE(t.cts_updated_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
@@ -1028,7 +1043,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     h_call = _hourly(f"""
         {P._APEL_AGENT_CTE}
         SELECT EXTRACT(hour FROM c.started_at)::int AS h, COUNT(*)
-        FROM calls c
+        FROM {_SRC_CALLS} c
         {P._APEL_AGENT_JOIN}
         WHERE c.direction = 'inbound'
           AND {P._APEL_REAL_CALL_SQL}
@@ -1038,7 +1053,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     """)
     h_dev = _hourly(f"""
         SELECT EXTRACT(hour FROM d.closed_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM device_operations d
+        FROM {_SRC_DEVOPS} d
         {_dep_dev}
         WHERE d.closed_at IS NOT NULL
           AND DATE(d.closed_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
@@ -1065,7 +1080,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     """)
     h_task_new = _hourly(f"""
         SELECT EXTRACT(hour FROM t.cts_created_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM cts_task_ground_truth t
+        FROM {_SRC_TASK} t
         {_dep_task}
         WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
           AND {_EFF_DEPT_TASK} = ANY(:depts)
@@ -1080,7 +1095,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT EXTRACT(hour FROM (c.started_at
                  + make_interval(secs => COALESCE(c.duration_seconds, 0))))::int AS h,
                COUNT(*)
-        FROM calls c
+        FROM {_SRC_CALLS} c
         {P._APEL_AGENT_JOIN}
         WHERE c.direction = 'inbound'
           AND {P._APEL_REAL_CALL_SQL}
@@ -1109,7 +1124,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     """)
     h_task_open = _hourly(f"""
         SELECT EXTRACT(hour FROM t.cts_created_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM cts_task_ground_truth t
+        FROM {_SRC_TASK} t
         {_dep_task}
         WHERE t.status NOT IN ('solved','closed')
           AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
@@ -1122,7 +1137,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     h_call_open = _hourly(f"""
         {P._APEL_AGENT_CTE}
         SELECT EXTRACT(hour FROM c.started_at)::int AS h, COUNT(*)
-        FROM calls c
+        FROM {_SRC_CALLS} c
         {P._APEL_AGENT_JOIN}
         WHERE c.direction = 'inbound'
           AND {P._APEL_UNANSWERED_SQL}
@@ -1133,7 +1148,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     """)
     h_dev_open = _hourly(f"""
         SELECT EXTRACT(hour FROM d.finished_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM device_operations d
+        FROM {_SRC_DEVOPS} d
         {_dep_dev}
         WHERE d.closed_at IS NULL AND d.finished_at IS NOT NULL
           AND DATE(d.finished_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
@@ -1142,7 +1157,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
 
     h_dev_new = _hourly(f"""
         SELECT EXTRACT(hour FROM d.finished_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
-        FROM device_operations d
+        FROM {_SRC_DEVOPS} d
         {_dep_dev}
         WHERE d.finished_at IS NOT NULL
           AND DATE(d.finished_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
@@ -1230,7 +1245,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
                                     AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)   AS noi,
                    COUNT(*) FILTER (WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS intrate_azi
-            FROM cts_task_ground_truth t
+            FROM {_SRC_TASK} t
             LEFT JOIN employee_department_mapping edm
               ON t.assignee_employee_id = edm.id
             WHERE COALESCE(t.department, edm.department) = ANY(:depts)
@@ -1246,7 +1261,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             SELECT edm.department AS dept,
                    COUNT(*) FILTER (WHERE {P._APEL_REAL_CALL_SQL})                              AS azi,
                    COUNT(*) FILTER (WHERE {P._APEL_UNANSWERED_SQL} AND {P._APEL_LOST_CALL_SQL}) AS pierdute_azi
-            FROM calls c
+            FROM {_SRC_CALLS} c
             {P._APEL_AGENT_JOIN}
             WHERE c.direction = 'inbound'
               AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}

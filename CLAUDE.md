@@ -71,6 +71,27 @@ singurul trigger din proiect; face și backfill din `cts_department_prev`/`chang
 
 ---
 
+## ⏱️ PRODUCTIVITATE — fereastra de timp = PONTAJ (2026-08-19)
+
+Minutele de lucru (SLA mailuri/task-uri/apeluri/operațiuni) se numără pe **acoperirea
+departamentului**, iar sursa de adevăr e **`employee_attendance`** („Utilizatori → Pontaj pe
+departamente", preluat din CTS sau ajustat manual), NU `department_schedule` (populată manual).
+
+Precedență: pontaj cu ore în ziua respectivă → uniunea turelor celor prezenți; fără pontaj
+utilizabil → `department_schedule`; fără nici program → ziua nu curge; 0 prezenți → nu curge.
+
+⚠️ Logica există în DOUĂ locuri și trebuie schimbată în OGLINDĂ:
+`_BizCache._dept_window` din `app/services/productivity.py` (mailuri, apeluri, operațiuni) și
+funcția SQL `business_minutes_emp` (task-uri) — vezi
+`migrations/20260819d_business_minutes_pontaj_first.sql`.
+
+Excluderi din calcul: **doar** flagul `clients.productivity_exclude` (fără liste hardcodate în cod).
+Se aplică pe toate canalele, cu legături diferite per sursă: mail = `emails.client_id` + clientul
+atribuit în CTS (`extra.client_id` = ID IRIS); task = ID IRIS + nume; apel = cheia locală;
+operațiuni = doar nume (`device_operations.client_id` e NULL). Reclamațiile nu au client în feed.
+
+---
+
 > Istoric dezvoltare (note tehnice cronologice pre-2026-06-15): vezi CLAUDE-HISTORY.md
 
 ---
