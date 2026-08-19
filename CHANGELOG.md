@@ -8,6 +8,31 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.0.2 - 2026-08-19
+
+### PATCH — Reparație drift schemă pe producție (cauza reală a sync-ului eșuat)
+
+Diagnosticul pe producție a confirmat: `_release_migrations` marchează ca aplicate migrațiile
+`20260629_client_contract_category.sql` și baseline-ul pe `clients`, dar coloanele **nu există** în
+schemă — marcare fără execuție. Lipseau `client_contracts.category`, `clients.created_at`,
+`clients.updated_at` și indexul `client_contracts_category_idx`. Sync-ul cădea la primul INSERT
+(`column "category" does not exist`), tranzacția se aborta, restul lotului raporta doar mesajul
+generic → `client_vehicles` și `client_contracts` cu **0 rânduri** pe producție.
+
+`migrations/20260819b_repair_client_schema_drift.sql` — fișier nou (nume nou ⇒ `migrate.sh` îl
+rulează chiar dacă vechile migrații sunt marcate aplicate), strict aditiv și idempotent: reasertează
+toate coloanele folosite de sync pe `clients` / `client_contracts` / `client_vehicles`, plus
+indexurile dependente și cele două indexuri UNICE pe care se sprijină `ON CONFLICT`. Pe mediile
+sănătoase (staging, local) e no-op — verificat.
+
+### PATCH — Productivitate (Rapoarte): un card de departament pe rând
+
+Grila trece de la 2 carduri pe rând la **1** (`repeat(1, minmax(0,1fr))`). Cardul fiind acum pe toată
+lățimea, gauge-ul nu mai stă pe o coloană de 50% — gauge.js calculează raza din înălțime (200px),
+deci arcul rămânea mic, centrat între două zone goale. Acum: coloană proprie de `minmax(280px,340px)`
+pentru gauge, restul lățimii pentru chip-urile de metrici, care se așază pe un singur rând
+(`repeat(auto-fit, minmax(150px,1fr))`). Tab-ul „Obiective & Ponderi" rămâne pe 2 coloane.
+
 ## v3.0.1 - 2026-08-19
 
 ### PATCH — Sync clienți: o eroare pe un client nu mai omoară tot lotul

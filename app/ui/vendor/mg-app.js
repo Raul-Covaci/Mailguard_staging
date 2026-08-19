@@ -11537,8 +11537,11 @@ function ProdDeptCard({ d, isForecast, dailyMonth }) {
         !isForecast ? h('span', { key:'sb', className:'badge ' + st.cls }, st.label) : null
       ])
     ]),
-    // two-column layout: gauge LEFT ~45%, metrics RIGHT ~55%
-    h('div', { key:'twocol', style:{ display:'grid', gridTemplateColumns:'minmax(0,50%) minmax(0,50%)', gap:16, alignItems:'center', marginBottom:12 } }, [
+    // Card pe toata latimea (un departament pe rand): gauge-ul sta intr-o coloana fixa de
+    // ~340px, nu la 50% din pagina — gauge.js calculeaza raza din INALTIME (200px), deci pe o
+    // coloana lata arcul ramanea mic si centrat intre doua zone goale. Restul latimii merge la
+    // chip-urile de metrici, care se aseaza pe un singur rand cand incape.
+    h('div', { key:'twocol', style:{ display:'grid', gridTemplateColumns:'minmax(280px, 340px) minmax(0, 1fr)', gap:20, alignItems:'center', marginBottom:12 } }, [
       // LEFT: gauge (fluid width, no fixed px)
       h('div', { key:'left', style:{ display:'flex', flexDirection:'column', alignItems:'stretch', gap:6 } }, [
         h(ProdGauge, { key:'g', val:isForecast ? null : d.obiectiv_atins, min:d.obiectiv_minim, max:d.obiectiv_real, color:gaugeCol }),
@@ -11547,8 +11550,8 @@ function ProdDeptCard({ d, isForecast, dailyMonth }) {
           h('span', { key:'mx', style:{ color:'var(--gn)', fontVariantNumeric:'tabular-nums' } }, '▎ real ' + prodPct(d.obiectiv_real))
         ])
       ]),
-      // RIGHT: metric chips 2×2 grid
-      h('div', { key:'right', style:{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 } }, [
+      // RIGHT: chip-uri de metrici — pe un rand cand incape, altfel se rup singure
+      h('div', { key:'right', style:{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(150px, 1fr))', gap:8 } }, [
         h(ProdMetric, { key:'coef', label:'Coeficient', value:(d.coeficient == null ? '—' : Number(d.coeficient).toFixed(4)), col:'var(--am)' }),
         h(ProdMetric, { key:'zl', label:'Zile lucrătoare', value:prodNum(d.zile_lucratoare), col:'var(--t3)' }),
         h(ProdMetric, { key:'plan', label:'Ore planificate', value:prodNum(d.ore_planificate), col:'var(--yw)' }),
@@ -12059,7 +12062,7 @@ function ProductivityReports({ month, dept, rangeMode }) {
           : 'Prognoză bazată pe media ultimelor 2 luni. Valorile sunt estimative.')
     ]) : null,
     h('div', { key:'grid', style:{
-      display:'grid', gridTemplateColumns:'repeat(2, minmax(0, 1fr))', gap:16, alignItems:'start',
+      display:'grid', gridTemplateColumns:'repeat(1, minmax(0, 1fr))', gap:16, alignItems:'start',
       opacity: isForecastResp ? 0.92 : 1
     } },
       filtered.map(function(d){
