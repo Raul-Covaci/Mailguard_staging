@@ -42,7 +42,7 @@ router = APIRouter()
 RENAME_SYSTEM_PROMPT = """Ești un modul de redenumire a documentelor dintr-un sistem de procesare a emailurilor. Tipul fiecărui document este DEJA identificat de sistem și ți se transmite. Sarcina ta NU este să reclasifici, ci doar să produci numele standardizat al fișierului conform regulilor de mai jos.
 
 ## Ce primești (input)
-- `tip_document` — tipul deja identificat (ex.: `talon`, `carte` / `CIV`, `CEMT`, `COC`, `contract`, `anexa 1`, `anexa 2`, `anexa 3`, `anexa 4`, `formular de înregistrare`, `proces verbal`, `CUI firmă`, `buletin administrator`).
+- `tip_document` — tipul deja identificat (ex.: `talon`, `carte` / `CIV`, `CEMT`, `COC`, `contract`, `anexa 1`, `anexa 2`, `anexa 3`, `anexa 4`, `formular de înregistrare`, `CUI firmă`, `buletin administrator`).
 - `continut` — textul / OCR al documentului (necesar la documentele de vehicul pentru a extrage țara și numărul de înmatriculare; la contracte pentru tipul serviciului).
 - `extensie` — extensia fișierului original (ex.: `.pdf`, `.jpg`).
 
@@ -79,24 +79,29 @@ Exemple: `contract_cargobox`, `contract_taxe_drum`, `contract_carbon`.
 
 Pachetul contractului Cargobox conține și:
 - Anexa 1 (oferta comercială) → `anexa 1`
+- Anexa 2 (documentul de instalare/predare echipament, provenit din documentele de șofer) → `anexa 2`
 - Anexa 3 (toll4europe, 6 pagini) → `anexa 3`
 - Anexa 4 (protecția datelor, 4 pagini) → `anexa 4`
+
+ATENȚIE — Anexa 2 a fost numită în trecut „Proces verbal" / „Proces verbal CargoBox", iar tipul
+primit în `tip_document` poate încă purta denumirea veche. Documentul se numește ACUM **Anexa 2**
+și nu mai are nicio legătură cu un proces verbal. Orice tip care conține „proces verbal" (în orice
+formă: „Proces verbal", „proces-verbal", „Anexa 2 - Proces verbal CargoBox", „PV") se redenumește
+`anexa 2`. **Nu produce NICIODATĂ un nume care conține „proces verbal".**
 
 Documente obligatorii la Cargobox și taxe de drum Polonia:
 - CUI firmă → `CUI firma`
 - Buletin administrator → `buletin administrator`
 
 ### C. Alte documente
-- Anexa 2 (contract carbon) → `anexa 2`
 - Formular de înregistrare (taxe drum) → `formular de înregistrare`
-- Proces verbal → `proces verbal`
 
 ## Reguli generale
 - Păstrează extensia originală a fișierului; nu o modifica.
 - La plăcuțe: MAJUSCULE, fără spații, cratime sau puncte.
 - Nu inventa date. Dacă nu poți extrage cu certitudine țara sau numărul de înmatriculare, marchează incertitudinea și lasă câmpul gol.
 - Nu schimba tipul primit de la sistem; doar redenumești.
-- Dacă tipul nu se încadrează în niciuna din reguli, returnează o variantă normalizată a denumirii tipului și semnalează în `incertitudini`.
+- Dacă tipul nu se încadrează în niciuna din reguli, returnează o variantă normalizată a denumirii tipului și semnalează în `incertitudini`. **Excepție**: denumirile istorice au prioritate față de această normalizare — un tip care conține „proces verbal" devine `anexa 2`, nu o normalizare a denumirii primite.
 
 ## Format de ieșire
 Răspunde DOAR cu un obiect JSON, fără alt text:
@@ -574,6 +579,34 @@ def _vehicle_std_name(db, email_id, att_id, part_no, detected_type, data):
     return "%s_%s_%s" % (tara, placa, tip)  # non-RO familia VP -> fara NRDOC
 
 
+# Denumirea istorica „Proces verbal (CargoBox)" a fost inlocuita de „Anexa 2" (cerere business
+# 2026-08-20): documentul vine din documentele de sofer si nu mai are nicio legatura cu un proces
+# verbal. `tip_document` primeste NUMELE tipului din `document_types` (vezi apelantii de la
+# `_save_extraction` si `reidentify`), iar acel nume poate purta inca varianta veche — fara backfill
+# in DB, decizie explicita. Promptul de redenumire are interzis sa produca „proces verbal", dar e un
+# prompt AI: garda de mai jos face rezultatul DETERMINIST, in acelasi spirit ca `_vehicle_std_name`
+# (introdus tot ca sa scoata AI-ul din calea numelor previzibile).
+_PV_LEGACY_RE = _re.compile(r"proces[\s_\-]*verbal(?:[\s_\-]*cargobox)?", _re.IGNORECASE)
+
+
+def _normalize_legacy_doc_name(name: str) -> str:
+    """Nume care conține denumirea istorică „proces verbal" -> exact „anexa 2" (+ extensia).
+
+    Se înlocuiește TOT numele, nu doar tokenul: numele standardizat al acestui document ESTE
+    `anexa 2`, iar o substituție locală ar produce dubluri când modelul repetă denumirea din DB
+    („Anexa 2 - Proces verbal CargoBox" -> „Anexa 2 - anexa 2"). Documentele de vehicul nu trec
+    pe aici (au calea determinista `_vehicle_std_name`), deci nu există nume legitim care să
+    conțină tokenul și să aibă nevoie de restul păstrat.
+    """
+    if not name:
+        return name
+    if not _PV_LEGACY_RE.search(name):
+        return name
+    import os as _os
+    _, ext = _os.path.splitext(name)
+    return "anexa 2" + (ext or "")
+
+
 def _rename_doc(db, att_id: int, part_no: int, tip_document: str, raw_text: str, att_name: str,
                 data=None, email_id=None):
     """Numele 'gata procesat' al documentului, scris in renamed_file SI part_label (campurile pe
@@ -611,7 +644,7 @@ def _rename_doc(db, att_id: int, part_no: int, tip_document: str, raw_text: str,
 
     if not renamed:
         return
-    renamed = renamed[:500]
+    renamed = _normalize_legacy_doc_name(renamed)[:500]
     # Numele final ajunge in AMBELE campuri citite de CTS: renamed_file (canonic) si part_label.
     db.execute(text(
         "UPDATE document_extractions SET renamed_file=:rf, part_label=:rf, updated_at=now() "

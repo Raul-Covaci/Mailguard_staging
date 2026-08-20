@@ -8,6 +8,57 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.5.1 - 2026-08-20
+
+### PATCH — Procesare documente: „Anexa 2" nu se mai redenumește „proces verbal"
+
+Documentul de instalare/predare echipament, provenit din documentele de șofer, se numește acum
+**Anexa 2** și nu mai are nicio legătură cu un proces verbal. Fișierul încărcat era corect, dar
+numele standardizat și explicația ieșeau ca „proces verbal".
+
+Cauza: promptul de redenumire `RENAME_SYSTEM_PROMPT` e **hardcodat în cod**
+(`app/api/v1/documents.py`), nu în baza de date — deci editarea prompturilor din interfață nu îl
+atingea. Avea trei probleme:
+- lista de tipuri din input includea `proces verbal`, tip care nu mai există;
+- secțiunea „C. Alte documente" conținea regula `Proces verbal → proces verbal`, adică exact numele
+  greșit;
+- Anexa 2 era descrisă drept „contract carbon" și stătea la „Alte documente", deși aparține
+  pachetului contractului carGObox, alături de Anexele 1, 3 și 4.
+
+Ștergerea regulii nu era suficientă: `tip_document` primește **numele tipului din
+`document_types`** (`detected_type` la salvarea extragerii, `tmap[tid]["name"]` la reidentificare),
+iar acel nume poate purta încă denumirea veche. Regula de fallback din prompt („returnează o
+variantă normalizată a denumirii tipului") ar fi reintrodus „proces verbal" pe altă cale.
+
+Corecția are două straturi:
+1. **Prompt** — Anexa 2 intră în pachetul contractului Cargobox, cu o regulă de alias explicită:
+   orice tip care conține „proces verbal" (în orice formă, inclusiv „Anexa 2 - Proces verbal
+   CargoBox" sau „PV") se redenumește `anexa 2`, iar aliasul are prioritate față de normalizarea
+   denumirii primite.
+2. **Gardă deterministă** — `_normalize_legacy_doc_name()`, aplicată pe numele întors de AI înainte
+   de scriere: un nume care conține denumirea istorică devine exact `anexa 2` + extensia. Promptul
+   e AI și poate aluneca; garda face rezultatul previzibil, în același spirit ca `_vehicle_std_name`
+   (introdus tot ca să scoată AI-ul din calea numelor deterministe). Se înlocuiește tot numele, nu
+   doar tokenul, altfel un model care repetă denumirea din DB producea dubluri („Anexa 2 - Proces
+   verbal CargoBox" → „Anexa 2 - anexa 2").
+
+Numele final ajunge în `document_extractions.renamed_file` **și** `part_label` — ambele citite de
+exportul CTS.
+
+Verificat local pe 16 cazuri de nume: toate variantele denumirii istorice (spațiu, underscore,
+cratimă, lipite, cu/fără „CargoBox", majuscule, cu/fără extensie) devin `anexa 2`, iar numele
+legitime (`anexa 2`, `anexa 3`, `contract_cargobox`, `RO_BH01CTS_VP_02`, `formular de înregistrare`)
+rămân neatinse.
+
+**Fără backfill** — decizie explicită: se aplică doar documentelor procesate de acum înainte.
+Extragerile existente păstrează numele vechi.
+
+⚠️ Rămas de decis separat: în `document_types`, rândul se numește încă „Anexa 2 - Proces verbal
+CargoBox", iar numele acela e afișat în UI, injectat în catalogul promptului de clasificare
+(`_types_catalog` → `_build_classify_system`, de unde vine textul explicației) și exportat la CTS
+prin `iris_docsvc`. Redenumirea lui nu s-a făcut niciodată printr-un fișier de migrație, deci pe
+producție tipul e probabil încă „Proces verbal CargoBox" în categoria `vehicul`.
+
 ## v3.5.0 - 2026-08-20
 
 ### MINOR — Satisfacție clienți: start neutru pe fiecare săptămână, scor lunar = media săptămânilor
