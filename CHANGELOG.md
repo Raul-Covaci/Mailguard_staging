@@ -8,6 +8,92 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.7.0 - 2026-08-20
+
+### MINOR — Redirect VATHUB: mailurile oficiale de recuperare TVA pleacă singure spre căsuța comună
+
+Autoritățile fiscale scriu pe adresa personală a persoanei care a depus declarația 318, nu pe o
+adresă de firmă. Până acum Diana forwarda manual fiecare decizie către Evelina, Nicoleta, Ana-Maria
+și Cristina. Mecanismul nou face redirectul automat spre `vathub@cargotrack.ro`, de unde le citește
+aplicația VATHUB — deci toate patru le văd în timp real, fără forward manual.
+
+**Lista de expeditori vine din trafic, nu din presupuneri.** Analiza a luat 392 de forwarduri între
+cele 5 adrese și 204 mailuri primite direct din exterior (15 iul – 13 aug 2026), a extras headerele
+`From:` din corpul mesajelor forwardate (inclusiv lanțurile `Fwd: Fw:`) și a scos 13 domenii de
+autoritate: `mfinante.ro` (369 mailuri), `financnasprava.sk` (126), `nav.gov.hu` (94), `nra.bg` (47),
+`fs.gov.cz` (20), `anaf.ro` (6), plus `aade.gr`, `correo.aeat.es`, `bmf.gv.at`, `mf.gov.pl`,
+`vmi.lt`, `at.gov.pt`, `porezna-uprava.hr`.
+
+Potrivirea se face **pe domeniu, cu subdomenii** — la SK, CZ, GR, AT și PL scriu inspectori
+nominali, de pe adrese care se schimbă de la dosar la dosar (`nav.gov.hu` prinde
+`elekafa@elekafa.nav.gov.hu`, `nra.bg` prinde `b.stoilova@ro22.nra.bg`). Boundary-ul e strict:
+`evilnav.gov.hu` NU potrivește `nav.gov.hu`.
+
+**Cele 13 domenii intră în migrație `muted`, adică inactive.** Sunt propuneri extrase din trafic,
+nu reguli — devin active abia după ce sunt validate din UI. Nimic nu se redirectează până când
+cineva nu bifează explicit, iar `enabled` din config e `false` la instalare.
+
+**Ce se trimite:** mesajul original BRUT, luat prin `BODY.PEEK[]` (deci rămâne necitit în căsuța
+proprietarei) și atașat intact ca `message/rfc822` — PDF-urile deciziilor, semnăturile și headerele
+originale ajung neatinse la VATHUB. Subiectul rămâne NESCHIMBAT, fără prefix „Fwd:", fiindcă VATHUB
+potrivește dosarele după numărul de referință din subiect. Expeditorul real ajunge în `Reply-To` și
+în headerele `X-Vathub-*`. Nu se rescrie `From` cu adresa autorității — ar pica la SPF.
+
+Forwardul pleacă prin SMTP-ul căsuței personale (câmpuri noi pe `personal_mailbox_accounts`, parolă
+criptată cu `credential_crypto`; parola SMTP lipsă = aceeași ca la IMAP, cazul obișnuit).
+
+**Gardă de destinație:** `vathub_send_guard.assert_forward_target_allowed()` se verifică per mail,
+chiar înainte de conectarea SMTP — nu la salvarea configului, fiindcă acesta se poate schimba din UI
+între două rulări. Singurele destinații acceptate sunt `vathub@cargotrack.ro` și cele două adrese de
+test. Garda din `feedback_send_guard` rămâne neatinsă: acolo whitelist-ul protejează clienții reali
+de mailuri de feedback, altă regulă de business.
+
+**Două siguranțe împotriva inundării VATHUB:** la prima activare se iau doar mailurile din ultimele
+`max_age_hours` (implicit 24), iar un mail examinat nu se reevaluează — o regulă adăugată azi se
+aplică de la mailurile următoare, nu retroactiv.
+
+UI, în „Căsuțe personale": buton **„Email-uri redirect VATHUB"** per căsuță, cu adresa țintă,
+comutatorul de activare, lista de domenii/adrese (Validează / Suspendă / Șterge), „Rulează acum"
+și ultimele mailuri potrivite, cu starea fiecăruia. Formularele de adăugare/editare a căsuței au
+acum și câmpurile SMTP.
+
+Rulează pe timer-ul existent de căsuțe personale (1 min), în continuarea pasului de detecție.
+
+### MINOR — Comutator de filtrare spam/carantină, per căsuță
+
+`personal_mailbox_accounts.filter_enabled` (implicit ON, deci comportamentul căsuțelor existente nu
+se schimbă). OFF = mailurile se ingerează în continuare și redirectul VATHUB merge, dar nu se
+scanează pentru spam/phishing și nu se mută nimic în SPAM/CARANTINA — cazul unei căsuțe care
+primește doar corespondență oficială și pe care filtrarea nu are ce să ajute.
+
+Oprirea închide și coada de scanare: rândurile rămase `pending` trec pe `verdict='filter_off'`.
+Altfel ar fi scanate retroactiv la repornirea filtrului — exact ce nu vrea cineva care l-a oprit
+deliberat. Filtrarea și redirectul VATHUB sunt comutatoare INDEPENDENTE.
+
+UI: coloană „Filtrare" cu buton ON/OFF în tabelul de căsuțe (cu confirmare la oprire), plus bifă în
+formularele de adăugare/editare. În modalul VATHUB există acum două comutatoare distincte —
+„Redirect activ (global)" și „Activ pe această căsuță". API: `POST /personal-mailboxes/{id}/toggles`.
+
+### PATCH — Corecții găsite la auditul propriu al redirectului
+
+Verificat cu teste care simulează SMTP-ul și IMAP-ul, pe un mail ostil (mai mulți destinatari, `Cc`,
+`Bcc`, `Reply-To` extern și tentativă de injectare de header prin `Subject`): forwardul pleacă doar
+spre `vathub@cargotrack.ro`, wrapper-ul nu are `Cc`/`Bcc`, subiectul injectat e tăiat la newline de
+parserul de mail, iar cu o destinație neaprobată în config se trimit ZERO mailuri (2 blocate).
+
+1. **`received_at` e nullable** (mail cu `Date` nevalid) — filtrul de vechime excludea aceste rânduri,
+   deci un asemenea mail n-ar fi fost examinat NICIODATĂ. Acum se folosește
+   `coalesce(received_at, created_at)`.
+2. **`smtp_port` era `SMALLINT`** (max 32767), deși API-ul acceptă porturi până la 65535 → eroare de
+   overflow la un port mare. Trecut pe `INTEGER`.
+3. **Numărătoarea încercărilor se făcea după trimitere.** Un proces oprit între SMTP și `COMMIT` ar
+   fi reluat mailul la infinit. Acum contorul crește ÎNAINTE de orice I/O, deci un eventual duplicat
+   e mărginit la `MAX_ATTEMPTS`; compromisul e deliberat — mai bine o copie în plus decât o decizie
+   318 pierdută. Ramurile de eroare nu mai incrementează a doua oară.
+4. **Câmp SMTP golit din UI** ajungea `''` în DB în loc de `NULL` (`_clean_host`).
+5. `BATCH_PER_POLL` coborât de la 25 la 12: fiecare forward costă 2 conexiuni IMAP + 1 SMTP, iar
+   poller-ul rulează la fiecare minut.
+
 ## v3.6.2 - 2026-08-21
 
 ### PATCH — Analitice apeluri: filtrul pe departament lipsea din „Top 10 clienți"

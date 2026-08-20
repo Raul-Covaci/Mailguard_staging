@@ -17,7 +17,7 @@ import psycopg2.extras
 
 from app.config import get_settings
 from app.services.credential_crypto import decrypt_credentials
-from app.services import personal_imap
+from app.services import personal_imap, vathub_forward
 
 logger = logging.getLogger("mailguard.personal_poller")
 settings = get_settings()
@@ -34,11 +34,28 @@ def _conn():
     )
 
 
+def _smtp_password(account: dict) -> Optional[str]:
+    """Parola SMTP separată, dacă a fost salvată.
+
+    None înseamnă „aceeași ca la IMAP" — vezi personal_smtp.resolve_smtp().
+    """
+    enc = account.get("smtp_cred_enc")
+    if not enc:
+        return None
+    try:
+        return decrypt_credentials(enc)["pass"]
+    except Exception as e:
+        logger.warning(f"account {account.get('id')}: cannot decrypt SMTP creds: {e}")
+        return None
+
+
 def _get_due_accounts(cur) -> list[dict]:
     """Return active accounts that are due for polling (last_poll_at + 60s <= now)."""
     cur.execute("""
         SELECT id, user_id, label, imap_host, imap_port, imap_ssl,
-               email_address, cred_enc, last_uid, last_poll_at
+               email_address, cred_enc, last_uid, last_poll_at,
+               smtp_host, smtp_port, smtp_tls, smtp_user, smtp_cred_enc,
+               vathub_enabled, filter_enabled
         FROM personal_mailbox_accounts
         WHERE status = 'active'
           AND (last_poll_at IS NULL
@@ -162,19 +179,39 @@ def _poll_one(account: dict, cur, conn) -> dict:
     if inserted:
         logger.info(f"account {account_id} ({email_addr}): +{inserted} mails (max_uid={max_uid})")
 
-    # T2: detection on newly ingested mails
+    # T2 + T4 rulează doar cu filtrarea pornită. Cu filtrul OFF mailurile se
+    # ingerează în continuare (metadata + redirect VATHUB), dar nu se scanează
+    # și nu se mută nimic în SPAM/CARANTINA. Rândurile rămase 'pending' se
+    # marchează 'filter_off', altfel ar fi scanate retroactiv la repornirea
+    # filtrului — exact ce nu vrea un utilizator care l-a oprit deliberat.
     detected = 0
-    try:
-        from app.services import personal_mail_processor
-        detected = personal_mail_processor.process_account_pending(account, password, cur, conn)
-    except Exception as e:
-        logger.exception(f"T2 detection failed account {account_id}: {e}")
+    moved = 0
+    if account.get("filter_enabled", True):
+        try:
+            from app.services import personal_mail_processor
+            detected = personal_mail_processor.process_account_pending(account, password, cur, conn)
+        except Exception as e:
+            logger.exception(f"T2 detection failed account {account_id}: {e}")
 
-    # T4: move spam/quarantined mails to IMAP folders
-    moved = _move_pending_folder_actions(account, password, cur, conn)
+        # T4: move spam/quarantined mails to IMAP folders
+        moved = _move_pending_folder_actions(account, password, cur, conn)
+    else:
+        cur.execute("""
+            UPDATE personal_mails
+            SET verdict='filter_off', folder_action='none'
+            WHERE account_id=%s AND verdict='pending'
+        """, (account_id,))
+        if cur.rowcount:
+            logger.info(f"account {account_id}: filtrare OFF — {cur.rowcount} mailuri nescanate")
+        conn.commit()
+
+    # VATHUB: redirect mailuri de la autorități fiscale spre căsuța generală
+    vathub = vathub_forward.process_account(
+        account, password, _smtp_password(account), cur, conn
+    )
 
     return {"account_id": account_id, "inserted": inserted, "detected": detected,
-            "moved": moved, "max_uid": max_uid}
+            "moved": moved, "max_uid": max_uid, "vathub": vathub}
 
 
 def run() -> dict:
@@ -220,12 +257,14 @@ def run() -> dict:
     total_inserted = sum(r.get("inserted", 0) for r in results)
     total_detected = sum(r.get("detected", 0) for r in results)
     total_moved = sum(r.get("moved", 0) for r in results)
+    total_vathub = sum((r.get("vathub") or {}).get("sent", 0) for r in results)
     elapsed_ms = int((time.time() - started) * 1000)
     return {
         "accounts_polled": len(results),
         "total_inserted": total_inserted,
         "total_detected": total_detected,
         "total_moved": total_moved,
+        "total_vathub_forwarded": total_vathub,
         "elapsed_ms": elapsed_ms,
         "details": results,
     }

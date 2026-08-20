@@ -471,3 +471,73 @@ def move_to_folder(account: dict, password: str, uid: int, folder: str) -> bool:
     except Exception as e:
         logger.warning(f"move_to_folder uid={uid} folder={folder}: {e}")
         return False
+
+
+# ── VATHUB redirect: mesaj brut + marcaj ─────────────────────────────────────
+
+MAX_RAW_BYTES = 25 * 1024 * 1024   # 25 MB — peste asta forwardul nu are rost
+VATHUB_KEYWORD = "$VathubForwarded"
+
+
+def fetch_raw_message(account: dict, password: str, uid: int) -> Optional[bytes]:
+    """Return the complete original message (headers + body + attachments) for one UID.
+
+    Uses BODY.PEEK[] so the mail stays unread in the owner's inbox — the whole
+    point of the redirect is that Diana still sees her mail as new.
+    Returns None on failure or if the message exceeds MAX_RAW_BYTES.
+    """
+    conn = None
+    try:
+        conn = _open_imap(account, timeout=60)
+        conn.login(account["email_address"], password)
+        conn.select("INBOX", readonly=True)
+        typ, data = conn.uid("FETCH", str(uid).encode(), "(BODY.PEEK[])")
+        if typ != "OK" or not data:
+            return None
+
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
+                raw = item[1]
+                if len(raw) > MAX_RAW_BYTES:
+                    logger.warning(
+                        f"fetch_raw_message: uid={uid} account={account.get('id')} "
+                        f"is {len(raw)} bytes — over MAX_RAW_BYTES, skipped"
+                    )
+                    return None
+                return raw
+        return None
+    except Exception as e:
+        logger.warning(f"fetch_raw_message failed account={account.get('id')} uid={uid}: {e}")
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+
+def add_keyword(account: dict, password: str, uid: int, keyword: str = VATHUB_KEYWORD) -> bool:
+    """Tag a message with an IMAP keyword, without marking it read.
+
+    Best-effort: servers that reject custom keywords (PERMANENTFLAGS without \\*)
+    return False and the caller carries on — the authoritative forward state is
+    the DB column, not the flag. The flag exists so the owner can see in her own
+    client which mails already went to VATHUB.
+    """
+    conn = None
+    try:
+        conn = _open_imap(account, timeout=15)
+        conn.login(account["email_address"], password)
+        conn.select("INBOX")
+        typ, _ = conn.uid("STORE", str(uid).encode(), "+FLAGS", f"({keyword})")
+        return typ == "OK"
+    except Exception as e:
+        logger.info(f"add_keyword failed account={account.get('id')} uid={uid}: {e}")
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.logout()
+            except Exception:
+                pass
