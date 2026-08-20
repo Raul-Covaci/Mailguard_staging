@@ -44,10 +44,19 @@ def _bl_filter() -> str:
 # vechi (`agent_extension IN (SELECT name ...)`) intorcea zero randuri pentru ORICE departament,
 # de unde bug-ul „doar Operational (toate) incarca date".
 #
-# Se refolosesc treptele din `productivity.py` (_APEL_AGENT_CTE / _APEL_AGENT_JOIN):
+# Se aplica aceleasi trei trepte ca in `productivity.py`:
 #   1. maparea invatata din suprapunerea cu CTS (numele agentului -> angajatul dominant);
 #   2. potrivirea de nume tolerata la ordine si la prefixe de 4 litere;
 #   3. assignee-ul CTS, doar pentru apelurile fara nume de agent in CDR.
+#
+# ⚠️ REGULA EXISTA IN DOUA LOCURI SI TREBUIE SCHIMBATA IN OGLINDA:
+#   * `productivity._APEL_AGENT_CTE` + `_APEL_AGENT_JOIN` / `_APEL_AGENT_JOIN_LEFT` — fragmente
+#     SQL de JOIN, folosite de raportul de productivitate si de lista din `calls.py`;
+#   * `_AGENT_MAP_SQL` de mai jos — aceleasi trepte, dar rezolvate O SINGURA DATA per interogare
+#     intr-o mapare nume->angajat, tinuta in cache 5 minute, din care se construieste un IN.
+# Forma difera fiindca aici filtram (avem nevoie de lista de nume), nu imbogatim randuri. Daca se
+# schimba regula de potrivire (ex. prefixul de 4 litere), se schimba in AMBELE. Refolosirea
+# directa a fragmentelor din productivity ar elimina duplicarea — vezi nota din CLAUDE.md.
 # Treptele 1-2 depind doar de numele agentului, deci se rezolva o singura data si se tin in cache
 # scurt: cele 4 interogari ale dashboard-ului pleaca simultan si ar reface altfel aceeasi munca.
 _AGENT_MAP_TTL_SEC = 300
@@ -294,6 +303,11 @@ def analytics_top_clients(
     else:
         date_filter = "c.started_at >= NOW() - (INTERVAL '1 day' * :days)"
         params["days"] = days
+    # Endpointul accepta `department`/`agent` de la inceput si UI-ul le trimite (buildQ), dar
+    # pana la 2026-08-21 nu le folosea deloc: pe dashboard, cu un departament selectat, KPI-urile
+    # si scorurile se filtrau, iar cardul „Top 10 clienti" ramanea pe toata firma — doua seturi
+    # de cifre necomparabile, unul langa altul, fara nimic care sa indice diferenta.
+    agent_filter = _agent_dept_filter(agent, department, params, db)
     sql = f"""
         SELECT cl.id AS client_id,
                cl.name AS client_name,
@@ -305,7 +319,7 @@ def analytics_top_clients(
         JOIN clients cl ON cl.id = c.client_id
         WHERE {date_filter}
           AND c.client_id IS NOT NULL
-          {bl_sql} {dup_sql}
+          {agent_filter} {bl_sql} {dup_sql}
         GROUP BY cl.id, cl.name
         ORDER BY call_count DESC
         LIMIT :lim
@@ -432,6 +446,17 @@ def analytics_agent_calls(
     """
     rows = db.execute(text(sql), params).fetchall()
 
+    # Totalul REAL, inainte de LIMIT: randul agentului din tabelul de deasupra arata
+    # `call_count` complet, deci o lista tacut trunchiata ar parea ca nu se potrivesc.
+    total = db.execute(text(f"""
+        SELECT COUNT(*)
+        FROM calls c
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        WHERE {date_filter}
+          AND c.agent_extension = :agent
+          {bl_sql} {dup_sql}
+    """), params).scalar() or 0
+
     calls = []
     for r in rows:
         d = dict(r._mapping)
@@ -440,6 +465,8 @@ def analytics_agent_calls(
     return {
         "agent": agent_name,
         "count": len(calls),
+        "total": int(total),
+        "truncated": int(total) > len(calls),
         "binary_labels": _binary_labels(db),
         "calls": calls,
     }

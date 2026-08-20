@@ -8,6 +8,38 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.6.2 - 2026-08-21
+
+### PATCH — Analitice apeluri: filtrul pe departament lipsea din „Top 10 clienți"
+
+Completare la v3.4.0. Filtrul de departament/operator (atribuirea în trei trepte) fusese aplicat la
+patru din cele cinci endpointuri ale paginii Analitice. **`/calls/analytics/top-clients` declara
+parametrii `department` și `agent`, iar UI-ul îi trimitea, dar SQL-ul nu îi folosea deloc.**
+
+Efectul pe dashboard: cu un departament selectat, KPI-urile, scorurile și donuturile se filtrau
+corect, dar cardul „Top 10 clienți" continua să arate toată firma — două seturi de cifre
+necomparabile, unul lângă altul, fără nimic care să indice diferența. Nu era o eroare vizibilă:
+tabelul se încărca, doar că răspundea la altă întrebare decât restul ecranului.
+
+Verificat apoi sistematic, prin parcurgerea AST a ambelor module: toate endpointurile din
+`calls_analytics.py` și `calls.py` care declară `department`/`agent` îl folosesc acum efectiv.
+`calls.py` (lista Apeluri) era deja corect — folosea de la început fragmentele de atribuire din
+`productivity`, deci nu avea bug-ul de potrivire exactă pe nume.
+
+**Drill-down: trunchiere tăcută.** `/calls/analytics/agent-calls` returnează maximum 200 de apeluri
+(`LIMIT`), dar rândul agentului din tabelul de deasupra arată `call_count` complet — pentru un agent
+cu peste 200 de apeluri scorate, lista părea că nu se potrivește cu totalul. Endpointul întoarce
+acum și `total` (numărat înainte de LIMIT) și `truncated`, iar antetul panoului scrie explicit
+„primele 200 din N apeluri scorate (cele mai slabe)".
+
+**Documentat, nu rezolvat:** regula de atribuire agent→angajat există acum în două forme —
+fragmentele SQL din `productivity` (folosite de raportul de productivitate și de lista Apeluri) și
+`_AGENT_MAP_SQL` din `calls_analytics` (aceleași trepte, rezolvate o dată per interogare într-o
+mapare cu cache de 5 minute, din care se construiește un `IN`). Formele diferă fiindcă una
+îmbogățește rânduri și cealaltă filtrează. Comentariul din cod marca greșit relația ca „refolosire";
+acum spune corect că e o oglindă și că orice schimbare de regulă (ex. prefixul de 4 litere) se face
+în ambele locuri.
+
 ## v3.6.1 - 2026-08-21
 
 ### PATCH — Satisfacție: aliniere config DB + două incoerențe găsite la auditul pre-live

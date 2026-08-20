@@ -59,6 +59,12 @@ pentru cardurile donut, pentru ordinea lor și pentru maparea în `call_ai_score
 `call_ai_scores.binary_evidence` (jsonb) — o întrebare binară nouă nu cere migrație, statisticile
 o citesc din jsonb când nu are coloană proprie. `issueResolution` NU e binar (are 4 câmpuri).
 
+⚠️ Regula de atribuire agent→angajat există în DOUĂ forme, de schimbat în OGLINDĂ:
+`productivity._APEL_AGENT_CTE` + `_APEL_AGENT_JOIN`/`_APEL_AGENT_JOIN_LEFT` (fragmente de JOIN,
+folosite de raportul de productivitate și de lista Apeluri din `calls.py`) și
+`calls_analytics._AGENT_MAP_SQL` (aceleași trepte, rezolvate o dată per interogare într-o mapare
+nume→angajat cu cache 5 min, din care se construiește un `IN` — forma cerută de filtrare).
+
 **Atribuire apel → angajat: NICIODATĂ pe egalitate de nume.** `calls.agent_extension` e
 `user_fullname` din CDR-ul While1, scris altfel decât `employee_department_mapping.name`
 ("Oana Lasca" vs "Lasca Oana-Maria"). Se folosesc cele 3 trepte din `productivity.py`
@@ -676,7 +682,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.6.1` (staging, 2026-08-21)
+**Versiunea curentă:** `v3.6.2` (staging, 2026-08-21)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:

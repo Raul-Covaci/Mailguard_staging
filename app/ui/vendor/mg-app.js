@@ -14542,7 +14542,10 @@ function AgentCallsPanel({ busy, err, data, onOpenCall }) {
 
   return h('div', { style: { padding: '10px 14px 14px' } }, [
     h('div', { key: 'hd', style: { fontSize: 11, color: 'var(--t3)', marginBottom: 8 } },
-      calls.length + ' apeluri scorate — click pe un rand deschide apelul (tab „Analiza AI"). Sortate crescator dupa scor.'),
+      (data && data.truncated
+        ? ('primele ' + calls.length + ' din ' + data.total + ' apeluri scorate (cele mai slabe)')
+        : (calls.length + ' apeluri scorate'))
+      + ' — click pe un rand deschide apelul (tab „Analiza AI"). Sortate crescator dupa scor.'),
     h('div', { key: 'tbl', className: 'table-wrap', style: { marginTop: 0 } },
       h('table', null, [
         h('thead', null, h('tr', null, [
