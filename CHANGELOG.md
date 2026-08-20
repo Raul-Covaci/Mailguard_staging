@@ -8,6 +8,94 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.6.1 - 2026-08-21
+
+### PATCH — Satisfacție: aliniere config DB + două incoerențe găsite la auditul pre-live
+
+Audit înainte de punerea pe producție, după trei schimbări de direcție pe același modul.
+
+**1. Configul din DB bătea codul (cel mai important).** `20260818_satisfaction_v6.sql` inserase
+`settings.satisfaction.v6` cu `ON CONFLICT (key) DO NOTHING`, iar `_load_v6_config` dă prioritate
+valorilor din DB față de `_V6_DEFAULTS`. Pe orice bază unde rândul exista deja — sau unde cineva
+editase configul între v3.5.0 și v3.6.0 — codul nou ar fi fost livrat, dar comportamentul ar fi
+rămas cel intermediar (start fix la 50 + media simplă). Migrația `20260821_satisfaction_v6_carry_config.sql`
+forțează `carry_start_state=true`, `month_aggregation='last_week_final'` și adaugă `max_workers=6`,
+păstrând restul cheilor. Șterge și `start_lookback_months` (rămăsese cu valoarea 3, deși lookback-ul
+e nelimitat din v3.6.0 — codul nu o mai citește, dar mințea pe oricine inspecta configul).
+
+**2. Conflict în tabelul de amplitudine.** Tabelul nou pusese `multumire_generala` (+2) în banda
+mică (5-15 puncte), dar nota din taxonomie spune explicit că e un semnal **mai puternic** decât
+`confirmare_rezolvare_multumire` (+3, banda medie). Mutat în banda medie, cu regula explicită că
+atunci când tabelul de intensități și nota din taxonomie diferă, nota decide.
+
+**3. Comentariu înșelător la `max_workers`.** Justifica paralelizarea prin „nu se mai reportează
+stare între săptămâni" — fals din v3.6.0. Corectat: clienții sunt independenți între ei, dar
+săptămânile unui client se înlănțuie și NU trebuie paralelizate.
+
+Verificat la audit și găsit corect: pragul de 60% e consistent în tot backend-ul
+(`_UNSATISFIED_BELOW`, fallback-ul din `clients.py`, bucket-urile de distribuție 40/60/75/90) și în
+UI; graficul de trend din dashboard e deja pe 12 luni, iar istoricul per client pe 24; o lună cu
+`satisfaction_pct` NULL nu rupe lanțul (`_previous_month_state` filtrează `IS NOT NULL` și merge
+mai în urmă); rândurile de carry-forward propagă corect scorul pentru clienții fără activitate.
+
+## v3.6.0 - 2026-08-21
+
+### MINOR — Satisfacție clienți: traiectorie continuă între luni (+ regula de amplitudine care lipsea)
+
+Cerință: dacă un client încheie luna la 80%, luna următoare pornește de la 80% și urcă/scade de
+acolo — ca graficul pe 12 luni să arate evoluția graduală, nu o resetare la 50% în fiecare lună.
+
+Asta reactivează reportarea eliminată în v3.5.0, **dar nu în forma în care nu funcționa**. Prima
+versiune (v3.3.x) eșua pentru un motiv diagnosticabil: promptul dă intensitățile evenimentelor pe
+scala `-5 … +5` și starea pe `0 … 100`, fără nicio regulă de conversie. Modelul avea două ieșiri,
+ambele rupeau continuitatea — fie mișca starea cu câteva puncte dintr-o sută (dintr-un start de 80,
+o reclamație gravă dădea 75, deci o linie aproape plată), fie re-ancora în banda care descria luna
+și arunca startul complet. De aceea reportarea se reintroduce **împreună cu regula de amplitudine**,
+care era piesa lipsă.
+
+**Regula de calcul:**
+- luna pornește din **ultimul scor cunoscut** al clientului, oricât de vechi (lookback nelimitat);
+  neutru (50) doar dacă nu există niciun scor anterior;
+- fiecare **săptămână pornește din starea în care s-a încheiat cea precedentă**; o săptămână fără
+  scor (N/A / IRIS eșuat) nu rupe lanțul;
+- **scorul lunii = starea la finalul ultimei săptămâni scorate**, iar aceea se reportează mai
+  departe. Revenire de la media simplă introdusă în v3.5.0: o medie nu descrie „unde a ajuns
+  clientul", deci nu e o valoare care se poate reporta coerent. Mediile rămân calculate și expuse
+  în `month_avg_detail` pentru comparație;
+- prag nesatisfăcut nemodificat (sub 60%), benzile de segment nemodificate.
+
+**Regula de amplitudine, nouă în prompt** (secțiunea „Cum se traduce intensitatea în mișcare pe
+scala 0-100"). Taxonomia și intensitățile nu se schimbă — se adaugă doar conversia care lipsea:
+intensitate mică (±1..±2) = 5-15 puncte, medie (±3) = 15-25, mare (±4..±5) = 25-40; valoarea din
+interiorul benzii se alege după modificatorii de severitate; recuperarea confirmată rămâne
+neplafonată și poate depăși banda; starea saturează la 0 și 100; evenimentele se aplică în ordine
+cronologică, fiecare peste starea rezultată din cel anterior.
+
+**Auditul de start rămâne și devine mai util:** `start_state_drift` se calculează acum față de
+startul TRIMIS pe fiecare săptămână (nu față de 50), iar `breakdown.start_audit` are și
+`sent_per_week`. Un `drift_max` nenul înseamnă că modelul nu a pornit din starea reportată — adică
+exact simptomul care a dus la eliminarea primei versiuni. UI-ul îl semnalează explicit în fișa
+clientului.
+
+⚠️ **Ordinea lunilor contează la rescorare.** Luna N citește scorul lunii N-1 din snapshot, deci o
+rescorare pe mai multe luni se face cronologic crescător. În interiorul unei luni clienții rămân
+independenți, deci paralelizarea din v3.5.0 e nemodificată și sigură; săptămânile unui client se
+scorează secvențial, cum cere înlănțuirea.
+
+Config (`settings.satisfaction.v6`, fără redeploy): `carry_start_state` (implicit `true`),
+`month_aggregation` (implicit `last_week_final`; `avg_weeks` / `weighted_avg_weeks` rămân ca revert,
+dar reportează o medie).
+
+Verificat local, cu IRIS și DB stubuite — iulie încheiat la 80, august cu trei săptămâni:
+```
+W32  start 80.0  <- snapshot lunar 2026-07     -> 45.0
+W33  start 45.0  <- saptamana 2026-W32         -> 70.0
+W35  start 70.0  <- saptamana 2026-W33         -> 70.0
+scor august = 70.0  (media simpla ar fi dat 61.7)   -> septembrie porneste de la 70.0
+```
+Verificate și: fără istoric → start 50 („neutru implicit"); model care raportează start 50 când i
+s-a trimis 80 → `drift_max = 30.0`.
+
 ## v3.5.1 - 2026-08-20
 
 ### PATCH — Procesare documente: „Anexa 2" nu se mai redenumește „proces verbal"

@@ -7,6 +7,11 @@ Logică:
 - Procesare batch pentru volum mare de clienți.
 
 Activitate = cel puțin un email sau un apel sau un task în intervalul lunii.
+
+⚠️ ORDINEA LUNILOR CONTEAZĂ. Motorul reportează starea: luna N pornește din scorul lunii N-1,
+citit din `client_satisfaction_snapshots`. O rescorare pe mai multe luni trebuie făcută în ordine
+CRONOLOGICĂ CRESCĂTOARE (ian → dec), altfel luna N se calculează din date vechi și lanțul devine
+incoerent. În interiorul unei singure luni clienții sunt independenți, deci paralelizarea e sigură.
 """
 
 import json

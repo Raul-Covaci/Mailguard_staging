@@ -125,7 +125,7 @@ operațiuni = doar nume (`device_operations.client_id` e NULL). Reclamațiile nu
 
 ---
 
-## 🔴 SATISFACȚIE CLIENȚI — motor curent: traiectorie V6 (2026-08-20)
+## 🔴 SATISFACȚIE CLIENȚI — motor curent: traiectorie V6 (2026-08-21)
 
 Motorul activ NU mai e cel cu 5 factori de mai jos (rămas ca istoric) — e traiectoria IRIS:
 
@@ -134,45 +134,69 @@ Motorul activ NU mai e cel cu 5 factori de mai jos (rămas ca istoric) — e tra
 - **Scorul vine EXCLUSIV din răspunsul promptului V6.** Codul nu ajustează, nu plafonează și nu
   injectează stare. Nu există piloni, boost, floor sau factori.
 
-### Regula de calcul (decizie business 2026-08-20)
+### Regula de calcul (decizie business 2026-08-21)
 
-- 1 apel IRIS per **săptămână ISO** cu interacțiuni.
-- **Fiecare săptămână pornește de la 50 (neutru), pe scala 0-100, și se evaluează independent.**
-  NU se reportează stare — nici între săptămâni, nici din luna precedentă.
-- Săptămânile fără interacțiuni **se sar complet** (nu intră în medie, nu contează ca 50).
-- **Scor lunar = media SIMPLĂ a săptămânilor scorate.** O săptămână cu 1 interacțiune cântărește
-  cât una cu 20. O singură săptămână scorată ⇒ scorul ei e scorul lunii.
-- **Prag nesatisfăcut: sub 60%** (`_UNSATISFIED_BELOW`) — granița dintre „Satisfăcut" (60-74) și
-  „Neutru" (45-59) din tabelul de benzi al promptului. `_segment()` folosește aceleași benzi:
-  `sanatos` ≥60, `neutru` 45-59, `la_risc` 30-44, `critic` <30.
+**Traiectorie CONTINUĂ** — scopul e ca graficul pe 12 luni să arate evoluția graduală, nu o
+resetare lunară la 50.
 
-⚠️ **Reportarea între luni a fost eliminată.** A existat între 2026-08-18 și 2026-08-20
-(`carry_start_state`, `start_lookback_months`, `_previous_month_state`, înlănțuirea săptămânilor)
-și nu funcționa: promptul mixează scala de intensitate a evenimentelor (`-5 … +5`) cu starea
-(`0 … 100`) fără regulă de conversie, deci startul reportat era fie ignorat (modelul re-ancora în
-banda care descria săptămâna), fie mișcat cu câteva puncte dintr-o sută. Nu o reintroduce fără să
-rezolvi întâi conversia de scală în prompt.
+- 1 apel IRIS per **săptămână ISO** cu interacțiuni; săptămânile fără interacțiuni se sar complet.
+- **Luna pornește din ultimul scor cunoscut al clientului**, oricât de vechi (lookback NELIMITAT —
+  `_previous_month_state`, comparație lexicografică pe `month_key`). Neutru (50, `_NEUTRAL_START`)
+  doar dacă nu există niciun scor anterior.
+- **Fiecare săptămână pornește din starea în care s-a încheiat cea precedentă** (`chain_state`).
+  O săptămână fără scor (N/A / IRIS eșuat) nu rupe lanțul.
+- **Scor lunar = starea la finalul ultimei săptămâni scorate**, și aceea se reportează în luna
+  următoare. E singura agregare coerentă cu reportarea: valoarea dusă mai departe trebuie să fie
+  „unde a ajuns clientul", nu o medie. Mediile rămân calculate în `month_avg_detail` pentru
+  comparație.
+- **Prag nesatisfăcut: sub 60%** (`_UNSATISFIED_BELOW`). `_segment()`: `sanatos` ≥60,
+  `neutru` 45-59, `la_risc` 30-44, `critic` <30 — benzile din tabelul promptului.
+
+⚠️ **Amplitudinea din prompt e piesa fără care reportarea nu funcționează.** Promptul dă
+intensitățile evenimentelor pe `-5 … +5` și starea pe `0 … 100`. Prima versiune a reportării
+(2026-08-18) nu avea regulă de conversie, deci modelul fie mișca starea cu câteva puncte dintr-o
+sută (traiectorie plată, imună la evenimente), fie re-ancora în banda care descria perioada și
+arunca startul — exact „resetarea" raportată de admini. Reportarea a fost scoasă pe 2026-08-20 și
+reactivată pe 2026-08-21 **împreună cu** secțiunea „Cum se traduce intensitatea în mișcare pe scala
+0-100" din prompt: intensitate mică (±1..±2) = 5-15 puncte, medie (±3) = 15-25, mare (±4..±5) =
+25-40, recuperarea confirmată neplafonată, saturare la 0/100. Nu scoate acea secțiune fără să scoți
+și reportarea.
+
+⚠️ **Ordinea lunilor contează la rescorare.** Luna N citește scorul lunii N-1 din
+`client_satisfaction_snapshots`, deci o rescorare pe mai multe luni se face CRONOLOGIC CRESCĂTOR.
+În interiorul unei luni clienții sunt independenți (paralelizarea e sigură); săptămânile unui
+client NU sunt — se scorează secvențial, în ordine.
 
 ### Audit start — de citit înainte de a debuga scoruri „ciudate"
 
 Promptul cere obligatoriu `start_state` + `start_state_source` în JSON tocmai ca startul să fie
 verificabil. Până la 2026-08-20 câmpul era **ignorat**, iar breakdown-ul stoca valoarea trimisă de
 noi — deci arăta mereu „corect", orice făcea modelul. Acum se stochează ambele:
-`weekly_trajectories[].start_state` (intenția: mereu 50) și `start_state_model` /
+`weekly_trajectories[].start_state` (startul TRIMIS) și `start_state_model` /
 `start_state_drift` (ce a raportat modelul), agregat în `breakdown.start_audit`.
 
-**`drift_max` diferit de 0 ⇒ promptul nu a respectat startul neutru**, scorurile nu mai sunt
-comparabile între clienți, iar UI-ul afișează un avertisment în fișa clientului. Nu ignora.
+**`drift_max` diferit de 0 ⇒ promptul nu a pornit din starea reportată**, deci continuitatea față
+de luna precedentă e ruptă pe luna respectivă. UI-ul afișează un avertisment în fișa clientului.
+Nu ignora — e exact simptomul care a dus la eliminarea primei versiuni a reportării.
 
 ### Config/revert (fără redeploy), cheia `settings.satisfaction.v6`
 
-- `month_aggregation`: `avg_weeks` (implicit) | `weighted_avg_weeks` (media ponderată pe
-  interacțiuni, comportamentul V4) | `last_week_final` (starea finală a ultimei săptămâni).
+- `month_aggregation`: `last_week_final` (implicit) | `avg_weeks` (media simplă) |
+  `weighted_avg_weeks` (media ponderată pe interacțiuni, comportamentul V4). ⚠️ Ultimele două
+  reportează o MEDIE în luna următoare, nu starea finală — folosite doar ca revert.
+- `carry_start_state`: `true` (implicit). `false` = fiecare lună pornește de la 50 (fără
+  continuitate în grafic).
 - `model_hint`: **`claude-sonnet-4-6`** (până la V6 se folosea implicitul gateway-ului = Claude
   Haiku 4.5, prea grosier pentru distincțiile din prompt).
 - `prompt_version`.
 - `max_workers`: câți clienți se procesează **în paralel** în snapshot-ul lunar (implicit 6, plafon 16).
-- Startul săptămânal NU e configurabil — e mereu `_NEUTRAL_START` = 50.
+- `max_workers`: câți CLIENȚI se procesează în paralel (implicit 6, plafon 16). Săptămânile
+  unui client NU se paralelizează — se înlănțuie.
+
+⚠️ **Configul din DB bate `_V6_DEFAULTS` din cod** (`_load_v6_config`). Înainte de orice
+release care schimbă comportamentul, verifică `SELECT value FROM settings WHERE
+key='satisfaction.v6'` — altfel codul nou rulează cu regulile vechi. Migrația
+`20260821_satisfaction_v6_carry_config.sql` forțează valorile decise.
 
 ### ⚡ Performanță snapshot (2026-08-20)
 
@@ -652,7 +676,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.4.0` (staging, 2026-08-19)
+**Versiunea curentă:** `v3.6.1` (staging, 2026-08-21)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:

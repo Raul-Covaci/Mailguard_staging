@@ -3835,7 +3835,7 @@ function ClientSatV4({ satHistory, assetEmpty }) {
         ? 'Luna selectată nu are evenimente — afișez traiectoria din toate lunile disponibile.'
         : 'După rularea IRIS, fiecare interacțiune scorată apare ca punct pe grafic.'))
     : chartGrain === 'weeks'
-      ? 'Scorul IRIS al fiecărei săptămâni cu interacțiuni. Fiecare săptămână pornește de la 50 (neutru) și se evaluează independent; scorul lunii e media simplă a săptămânilor scorate.'
+      ? 'Scorul IRIS al fiecărei săptămâni cu interacțiuni. Traiectorie continuă: fiecare săptămână pornește din starea în care s-a încheiat cea precedentă, iar prima din scorul lunii anterioare. Scorul lunii = starea la finalul ultimei săptămâni scorate.'
       : 'Scorul final pe lună calendaristică (aceeași vedere ca pe pagina Satisfacție clienți).';
 
   function scoreBar(pct, col) {
@@ -3874,6 +3874,9 @@ function ClientSatV4({ satHistory, assetEmpty }) {
                     weighted_avg_weeks: 'media ponderată pe interacțiuni',
                     last_week_final: 'starea finală a ultimei săptămâni scorate' };
     var avgFormula = AGG_LBL[bd.month_aggregation] || null;
+    var startLabel = (bd.month_start_state != null)
+      ? (Number(bd.month_start_state).toFixed(1) + '%' + (bd.month_start_source ? ' (' + bd.month_start_source + ')' : ''))
+      : null;
     var startDrift = (function() {
       var d = bd.start_audit && bd.start_audit.drift_max;
       return (d != null && Number(d) !== 0) ? Number(d) : null;
@@ -3895,13 +3898,13 @@ function ClientSatV4({ satHistory, assetEmpty }) {
         h('div', { key: 's', style: { fontSize: 11, color: 'var(--t3)', marginTop: 2 } }, 'Singurul KPI · ' + (bd.total_interactions || 0) + ' interacțiuni analizate')
       ]),
       h('div', { key: 'rule', style: { marginBottom: 10, padding: '6px 10px', background: 'color-mix(in srgb, #06b6d4 8%, transparent)', borderRadius: 4, borderLeft: '3px solid #06b6d4', fontSize: 11, color: 'var(--t2)' } },
-        'IRIS notează fiecare săptămână cu interacțiuni (1 apel/săptămână), pornind mereu de la 50 (neutru) — săptămânile sunt independente, fără stare reportată. Scorul lunii = ' + (avgFormula || 'media simplă a săptămânilor scorate') + '.'
+        'IRIS notează fiecare săptămână cu interacțiuni (1 apel/săptămână). Traiectoria e continuă: luna pornește din ultimul scor cunoscut al clientului, iar fiecare săptămână din starea în care s-a încheiat cea precedentă. Scorul lunii = ' + (avgFormula || 'starea finală a ultimei săptămâni scorate') + (startLabel ? ' · start lună: ' + startLabel : '') + '.'
       ),
       // Audit start (vezi `start_audit` din breakdown): promptul trebuie să pornească de la 50.
       // Dacă modelul raportează alt punct de start, scorul nu mai e comparabil între clienți —
       // se semnalează aici, nu doar în JSON.
       startDrift ? h('div', { key: 'drift', style: { marginBottom: 10, padding: '6px 10px', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 4, borderLeft: '3px solid #f59e0b', fontSize: 11, color: 'var(--t2)' } },
-        'Atenție: IRIS a raportat un punct de start diferit de 50 (abatere maximă ' + startDrift + ' puncte). Scorul acestei luni nu respectă regula de start neutru — semnalează-l echipei tehnice.'
+        'Atenție: IRIS a raportat un alt punct de start decât cel trimis (abatere maximă ' + startDrift + ' puncte). Continuitatea față de luna precedentă e ruptă pe această lună — semnalează-l echipei tehnice.'
       ) : null,
       category ? h('div', { key: 'cat', style: { marginBottom: 6, fontSize: 12 } }, [
         h('span', { key: 'l', style: { fontWeight: 700, color: 'var(--t3)' } }, 'Categorie: '),

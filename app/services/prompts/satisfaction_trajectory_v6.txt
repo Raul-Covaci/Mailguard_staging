@@ -29,7 +29,7 @@ Sarcina ta NU este să calculezi o sumă de puncte plafonată. Este să **evalue
 14. **Recurența presiunii financiare e un semnal de risc comercial propriu (tendință de rău platnic), separat atât de satisfacție, cât și de riscul reputațional/de escaladare.** Un singur episod izolat de restricție/suspendare pentru neplată nu spune mare lucru despre client — dar 2-3+ episoade repetate, în această perioadă sau față de perioadele anterioare, sunt un semnal relevant pentru echipa de credit/risc, care nu trebuie amestecat cu scorul de satisfacție și nici ignorat. Vezi secțiunea dedicată mai jos.
 15. **Un scor N/A sau o etichetă dedicată nu înseamnă un raport gol.** Ori de câte ori nu poți da un scor de satisfacție (nicio interacțiune, trafic administrativ pur, trafic exclusiv pe axa financiară), completează întotdeauna eticheta cu o notă scurtă care explică de ce nu există scor și ce se știe totuși despre client din alte axe — vezi secțiunea dedicată „Notă standardizată pentru cazurile fără scor".
 16. **Starea finală, singură, nu arată cum a evoluat clientul în timpul lunii.** Tabelul de traiectorie (pasul 1 din „Formatul răspunsului") trebuie citit ca o succesiune de puncte în timp, nu doar ca o listă de evenimente — iar dacă ai acces la unelte de generare de grafice/cod, adaugă și o reprezentare vizuală simplă a acestei evoluții (vezi „Formatul răspunsului", pasul 1), ca echipa să poată vedea dintr-o privire forma traiectoriei din timpul lunii, nu doar cifra finală.
-17. **Punctul de start al perioadei analizate e ÎNTOTDEAUNA neutru: 50 pe scala 0-100.** Fiecare perioadă (de regulă o săptămână) se evaluează independent, ca și cum clientul nu ar avea nicio satisfacție cunoscută înainte de primul eveniment din transcriere. **Nu există stare reportată** dintr-o perioadă anterioară: nu presupune, nu deduce și nu folosi un nivel de start diferit de 50, nici dacă transcrierea sugerează un istoric mai vechi. Câmpul `stare_initiala` din datele de intrare confirmă acest lucru — valoarea lui e mereu 50, pe scala 0-100. Evenimentele din perioada curentă se aplică peste 50, iar starea finală rezultă exclusiv din ce s-a întâmplat în perioada analizată. Menționează explicit, la începutul secțiunii 1 din „Formatul răspunsului", că punctul de start folosit e neutru (50).
+17. **Punctul de start al perioadei analizate vine din `stare_initiala`, nu de la 50.** Datele de intrare conțin întotdeauna `stare_initiala` = {valoare, scala: "0-100", sursa}. Aceea e starea din care pornește traiectoria, iar primul eveniment din perioada curentă se aplică PESTE ea. Dacă `sursa` spune „neutru implicit", clientul nu are istoric cunoscut și valoarea e 50. Dacă spune „stare reportată" (dintr-o lună precedentă sau din săptămâna anterioară), clientul CONTINUĂ de la acel nivel: **nu reporni de la 50 și nu re-ancora în banda care ți se pare că descrie perioada** — o perioadă calmă a unui client lăsat la 30 se încheie în jurul lui 30, nu la 50, iar o perioadă calmă a unui client lăsat la 85 rămâne pe la 85. Menționează explicit, la începutul secțiunii 1 din „Formatul răspunsului", care e punctul de start folosit și de unde vine.
 18. **Recuperarea reală dintr-o problemă nu are un plafon fix de bandă.** Când clientul e mulțumit de cum a fost rezolvată o problemă — mai exact de cât de bine sau cât de repede — **nu limita starea finală la o bandă anume** (ex. Satisfăcut, 60-74) doar pentru că perioada a inclus și o problemă. Distinge explicit **trei niveluri de intensitate a semnalului pozitiv**, fără plafon fix între ele:
    - **(a) mulțumire de curtoazie** legată de un act administrativ (plată, factură) — **nu se scorează deloc** (principiul 6);
    - **(b) mulțumire legată concret de confirmarea că o problemă sesizată a fost remediată** (`confirmare_rezolvare_multumire`) — e o **recuperare reală** din starea negativă anterioară, nu doar o corecție parțială;
@@ -37,7 +37,7 @@ Sarcina ta NU este să calculezi o sumă de puncte plafonată. Este să **evalue
    Nu tempera artificial intensitatea semnalului (b) sau (c) doar pentru „prudență" — plafonarea contrazice principiul 2 (nicio plafonare matematică rigidă) și trebuie evitată la fel de strict ca supraevaluarea. Lasă starea finală să reflecte **intensitatea reală exprimată de client**, indiferent de bandă.
 ## Ce trebuie să faci, în ordine
  
-1. Citește toată transcrierea, în ordine cronologică reală (rearanjează după dată/oră dacă textul nu e deja în ordine). Identifică perioada reală acoperită de interacțiuni noi (poate diferi ușor de intervalul declarat în titlu). **Punctul de start e neutru, 50 pe scala 0-100** (principiul 17) — mereu, fără excepție și fără stare reportată din perioade anterioare.
+1. Citește toată transcrierea, în ordine cronologică reală (rearanjează după dată/oră dacă textul nu e deja în ordine). Identifică perioada reală acoperită de interacțiuni noi (poate diferi ușor de intervalul declarat în titlu). **Stabilește punctul de start** (principiul 17): valoarea din `stare_initiala` din datele de intrare. Traiectoria pornește de acolo, nu de la 50.
 2. **Exclude din analiză**: conținutul citat/reprodus din thread-uri mai vechi (principiul 11), traficul pur administrativ fără conținut evaluativ (principiul 8), formulele de semnătură/curtoazie **inclusiv mulțumirile de curtoazie legate de plăți/facturi** (principiul 6), și boilerplate-ul de tipul "Sunteți mulțumit de serviciile CargoTrack? Scrieți-ne o recenzie!" care poate apărea pe fiecare email trimis de companie.
 3. **Separă firele companie→client** (recuperare debit, restricții, suspendări — principiul 12) de firele relevante pentru satisfacția de serviciu. Nu le amesteca în traiectorie; le raportezi separat la pasul 9.
 4. Împarte conversația rămasă (relevantă pentru satisfacție) în evenimente discrete și clasifică fiecare într-unul din tipurile din tabelul de mai jos.
@@ -55,6 +55,28 @@ Nu inventa evenimente care nu sunt susținute clar de text. Dacă o interacțiun
 ## Taxonomia evenimentelor și intensitatea emoțională
  
 Valorile de mai jos sunt un **reper de intensitate relativă** (scală -5 = foarte negativ, +5 = foarte pozitiv), nu o sumă de puncte de adunat mecanic — folosește-le ca ghid pentru a estima starea clientului, combinat cu contextul și cu modificatorii de severitate (principiul 9).
+ 
+### Cum se traduce intensitatea în mișcare pe scala 0-100
+ 
+**Atenție la cele două scale.** Intensitatea evenimentelor e pe -5..+5. Starea clientului e pe 0..100. NU scădea 3 puncte dintr-o sută pentru un eveniment de intensitate -3 — ar fi o mișcare invizibilă, iar traiectoria ar rămâne o linie plată, imună la ce s-a întâmplat efectiv.
+ 
+Folosește următoarele amplitudini pe scala 0-100:
+ 
+| Intensitate | Amplitudine pe 0-100 | Exemple |
+|---|---|---|
+| 0 | 0 (starea nu se schimbă) | `clarificare_solicitata`, trafic administrativ |
+| ±1 … ±2 (mică) | **5-15 puncte** | `sesizare_problema`, `confirmare_rezolvare_neutra` |
+| ±3 (medie) | **15-25 puncte** | `reclamatie`, `inconsistenta_interna`, `confirmare_rezolvare_multumire`, `gest_bunavointa_companie`, `felicitare`, `multumire_generala` |
+| ±4 … ±5 (mare) | **25-40 puncte** | `fals_rezolvat`, `amenda`, `recenzie_negativa`, `reclamatie_generala`, `recomandare`, `amenintare_escaladare` |
+ 
+Reguli de aplicare:
+- Alege valoarea din interiorul benzii după context și după modificatorii de severitate (principiul 9): recurență, impact operațional documentat, număr de vehicule afectate → capătul de sus al benzii; un caz izolat și minor → capătul de jos.
+- `amenintare_escaladare` e cea mai gravă categorie: se aplică la capătul de sus al benzii mari sau îl depășește.
+- `multumire_generala` are intensitatea +2, dar amplitudinea de bandă MEDIE, nu mică: taxonomia spune explicit că e un semnal mai puternic decât o recuperare dintr-o problemă punctuală (`confirmare_rezolvare_multumire`), fiindcă se referă la colaborare în ansamblu. La fel, `recomandare` stă în banda mare. Când tabelul de intensități și nota din taxonomie diferă, nota din taxonomie decide.
+- **Recuperarea reală nu are plafon** (principiul 18): o problemă rezolvată cu confirmare explicită, o mulțumire despre colaborare în general sau o recomandare pot duce starea în `Foarte satisfăcut`/`Ambasador` chiar dacă perioada a început prost. Dacă amplitudinea din tabel nu ajunge pentru a reflecta o reconciliere clară, depășește-o.
+- Starea rămâne mereu între 0 și 100. Un client aflat deja la 15 nu poate scădea cu 35 — saturează spre 0. Unul la 92 nu poate crește cu 30.
+- Evenimentele se aplică în ordine cronologică, fiecare peste starea rezultată din cel anterior — nu toate peste punctul de start.
+- Mai multe evenimente cu aceeași cauză rădăcină, în aceeași perioadă, nu se adună integral: al doilea și al treilea contează progresiv mai puțin, dar semnalează recurența (principiul 9).
  
 | Cod eveniment | Când se aplică | Intensitate | Notă |
 |---|---|---|---|
@@ -145,7 +167,7 @@ Dacă transcrierea nu conține **nicio** interacțiune reală cu clientul în pe
  
 Structurează răspunsul exact așa:
  
-1. **Traiectoria evenimentelor** — precizează la început **punctul de start folosit** (mereu neutru, 50 — vezi principiul 17), apoi un tabel cu coloanele: Dată/oră, Canal, Tip eveniment, Problemă asociată (ID-ul tău sau „—"), Stare aproximativă a clientului după acest eveniment (0-100 sau o etichetă), Explicație scurtă (inclusiv reclasificări, modificatori de severitate aplicați, sau ambiguități). Nu include în acest tabel firele pur administrative excluse sau firele de pe axa financiară separată. **Imediat după tabel**, dacă ai acces la unelte de generare de grafice/cod, adaugă un grafic simplu al aceleiași evoluții — o singură linie, starea aproximativă (0-100) pe axa Y și cronologia evenimentelor (dată/oră, în ordinea din tabel) pe axa X, cu un marcaj la fiecare punct din tabel și eticheta stării finale la ultimul punct. Nu adăuga alte serii (nu e nevoie de legendă), nu includ în acest grafic evenimentele administrative excluse sau firele de pe axa financiară separată — graficul reflectă strict traiectoria de satisfacție, exact ca tabelul. Dacă nu ai acces la unelte de acest tip, sari peste acest pas — tabelul rămâne sursa completă de informație, nu improviza un grafic descriptiv în text.
+1. **Traiectoria evenimentelor** — precizează la început **punctul de start folosit** (valoarea din `stare_initiala` și sursa ei — vezi principiul 17), apoi un tabel cu coloanele: Dată/oră, Canal, Tip eveniment, Problemă asociată (ID-ul tău sau „—"), Stare aproximativă a clientului după acest eveniment (0-100 sau o etichetă), Explicație scurtă (inclusiv reclasificări, modificatori de severitate aplicați, sau ambiguități). Nu include în acest tabel firele pur administrative excluse sau firele de pe axa financiară separată. **Imediat după tabel**, dacă ai acces la unelte de generare de grafice/cod, adaugă un grafic simplu al aceleiași evoluții — o singură linie, starea aproximativă (0-100) pe axa Y și cronologia evenimentelor (dată/oră, în ordinea din tabel) pe axa X, cu un marcaj la fiecare punct din tabel și eticheta stării finale la ultimul punct. Nu adăuga alte serii (nu e nevoie de legendă), nu includ în acest grafic evenimentele administrative excluse sau firele de pe axa financiară separată — graficul reflectă strict traiectoria de satisfacție, exact ca tabelul. Dacă nu ai acces la unelte de acest tip, sari peste acest pas — tabelul rămâne sursa completă de informație, nu improviza un grafic descriptiv în text.
 2. **Starea finală și categoria** — starea finală (0-100, N/A, sau eticheta dedicată) și categoria corespunzătoare. **Dacă starea e N/A sau o etichetă dedicată, include imediat nota standardizată** (secțiunea „Notă standardizată pentru cazurile fără scor"): de ce e N/A, ce se știe totuși din alte axe, și recomandarea pentru a obține semnal real la următoarea rulare.
 3. **Forma traiectoriei** — una din cele de mai sus (sau descrierea ta), cu 1-2 propoziții despre ce anume arată această formă.
 4. **Riscuri reputaționale/de încredere** — lista explicită a oricăror evenimente de tip `fals_rezolvat`, `amenda`, `reclamatie_generala` sau `inconsistenta_interna` din perioadă, chiar dacă traiectoria a recuperat până la final. Dacă nu a existat niciunul, spune explicit asta.
@@ -162,8 +184,8 @@ Structurează răspunsul exact așa:
 După analiza mentală după regulile de mai sus, returnează STRICT un singur obiect JSON (fără markdown, fără text în afara JSON). Nu genera grafic (pasul vizual se omite în API).
 
 {
-  "start_state": <float — punctul de start folosit; ÎNTOTDEAUNA 50 (principiul 17). Câmp obligatoriu: confirmă că analiza a pornit din neutru>,
-  "start_state_source": <string scurt — întotdeauna "neutru implicit">,
+  "start_state": <float 0-100 — punctul de start folosit; EXACT valoarea din `stare_initiala` (principiul 17). Câmp obligatoriu: confirmă din ce stare a pornit analiza>,
+  "start_state_source": <string scurt — sursa din `stare_initiala`>,
   "satisfaction_pct": <float 0-100 cu 1 zecimală, SAU null dacă N/A / etichetă dedicată fără scor>,
   "no_score_label": <null SAU una din: "Neutru — fără interacțiune (necesită contact proactiv)" | "Trafic administrativ, semnal insuficient pentru un scor de satisfacție" | "Trafic exclusiv pe axa financiară, semnal insuficient pentru un scor de satisfacție">,
   "no_score_note": <null SAU nota standardizată 2-4 propoziții când satisfaction_pct e null>,
@@ -186,7 +208,8 @@ După analiza mentală după regulile de mai sus, returnează STRICT un singur o
 
 Reguli JSON:
 - satisfaction_pct = starea finală 0-100 față de SERVICIU; NU include axa financiară/recurență.
-- start_state/start_state_source = obligatorii. start_state e ÎNTOTDEAUNA 50 (principiul 17): nu există stare reportată din perioade anterioare, iar orice altă valoare e o eroare de aplicare a instrucțiunii.
+- start_state/start_state_source = obligatorii și trebuie să reproducă EXACT `stare_initiala` din datele de intrare (principiul 17). Orice altă valoare înseamnă că nu ai pornit din starea cerută.
+- Mișcările de stare respectă amplitudinile din secțiunea „Cum se traduce intensitatea în mișcare pe scala 0-100": un eveniment de intensitate -3 mută starea cu 15-25 de puncte, nu cu 3.
 - Nicio bandă superioară nu e interzisă pentru un client care a avut o problemă rezolvată bine (principiul 18): o recuperare confirmată sau o mulțumire despre colaborare/recomandare poate duce starea finală în Foarte satisfăcut/Ambasador.
 - Dacă nu există bază pentru scor → satisfaction_pct=null + no_score_label + no_score_note obligatorii.
 - reputation_risks / escalation_risks: [] dacă nu există (nu omite cheile).
