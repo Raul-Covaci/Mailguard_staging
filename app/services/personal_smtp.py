@@ -11,6 +11,7 @@ la SPF și ar putea fi respins sau marcat spam.
 """
 import logging
 import smtplib
+import email.policy
 from email import message_from_bytes
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
@@ -75,7 +76,9 @@ def build_forward(raw_original: bytes, from_address: str, to_address: str,
     referință din subiect (`RO2026…`), deci un prefix „Fwd:" l-ar strica.
     Expeditorul real ajunge în `Reply-To` și în headerele `X-Vathub-*`.
     """
-    original = message_from_bytes(raw_original)
+    # policy=default: `add_attachment` are nevoie de un obiect EmailMessage ca să
+    # producă o parte `message/rfc822` corectă (vezi nota de la add_attachment).
+    original = message_from_bytes(raw_original, policy=email.policy.default)
     orig_from = original.get("From", "") or ""
     orig_date = original.get("Date", "") or ""
     orig_to = original.get("To", "") or ""
@@ -116,8 +119,13 @@ def build_forward(raw_original: bytes, from_address: str, to_address: str,
         f"Căsuță sursă       : {source_mailbox}\n\n"
         "Mesajul original, cu atașamente și headere intacte, e atașat mai jos."
     )
-    msg.add_attachment(raw_original, maintype="message", subtype="rfc822",
-                       filename="original.eml")
+    # Atașamentul se adaugă ca MESAJ deja parsat, nu ca bytes. Cu bytes, biblioteca
+    # standard pune `Content-Transfer-Encoding: base64` pe partea `message/rfc822` —
+    # interzis de RFC 2046 §5.2.1, care admite doar 7bit/8bit/binary. Efectul măsurat:
+    # cititorul nu mai vede o parte de tip mesaj, ci un bloc de base64, deci nu poate
+    # scoate din el expeditorul, data sau atașamentele originale. Cu obiectul `Message`,
+    # partea iese pe `8bit` și se re-parsează corect la destinație.
+    msg.add_attachment(original, filename="original.eml")
     return msg
 
 

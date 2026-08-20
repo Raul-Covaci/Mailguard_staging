@@ -93,6 +93,15 @@ parserul de mail, iar cu o destinație neaprobată în config se trimit ZERO mai
 4. **Câmp SMTP golit din UI** ajungea `''` în DB în loc de `NULL` (`_clean_host`).
 5. `BATCH_PER_POLL` coborât de la 25 la 12: fiecare forward costă 2 conexiuni IMAP + 1 SMTP, iar
    poller-ul rulează la fiecare minut.
+6. **Atașamentul `message/rfc822` ieșea codat base64** — găsit abia la integrarea cu VATHUB, prin
+   parsarea unui forward real cu codul consumatorului. `add_attachment()` cu `bytes` pune
+   `Content-Transfer-Encoding: base64` pe partea `message/rfc822`, ceea ce RFC 2046 §5.2.1
+   interzice (doar 7bit/8bit/binary). Efectul măsurat: cititorul nu mai vedea o parte de tip
+   mesaj, ci un bloc de base64 — deci nici expeditorul original, nici data, nici PDF-urile
+   deciziilor nu se puteau extrage, iar mailul apărea ca fiind de la Diana, cu textul de rezumat
+   în loc de decizie. Se atașează acum obiectul `Message` deja parsat (`policy=default`), iar
+   partea iese pe `8bit` și se re-parsează corect. Fără testul de contract între cele două
+   aplicații, bug-ul ar fi ajuns pe producție arătând ca o problemă de partea VATHUB.
 
 ## v3.6.2 - 2026-08-21
 

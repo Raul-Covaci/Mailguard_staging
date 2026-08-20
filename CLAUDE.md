@@ -111,7 +111,12 @@ analiza traficului (15 iul – 13 aug 2026) și sunt inactive; se activează doa
 cu echipa. `enabled=false` la instalare — nimic nu pleacă până nu se bifează explicit.
 
 **Mesajul se trimite INTACT.** Original luat cu `personal_imap.fetch_raw_message()` (`BODY.PEEK[]`,
-deci rămâne NECITIT în căsuța proprietarei), atașat ca `message/rfc822`. Subiectul NU se prefixează
+deci rămâne NECITIT în căsuța proprietarei), atașat ca `message/rfc822`.
+
+⚠️ `add_attachment()` primește obiectul `Message` deja parsat, NU bytes. Cu bytes, biblioteca
+standard pune `Content-Transfer-Encoding: base64` pe partea `message/rfc822` — interzis de
+RFC 2046 §5.2.1 — iar cititorul (VATHUB) primește un bloc de base64 în loc de un mesaj, deci nu
+poate scoate expeditorul, data sau atașamentele originale. Nu schimba înapoi. Subiectul NU se prefixează
 cu „Fwd:" — VATHUB potrivește dosarele după numărul de referință din subiect (`RO2026…`). `From`
 rămâne adresa proprietarei (rescrierea cu adresa autorității ar pica la SPF); expeditorul real merge
 în `Reply-To` + `X-Vathub-Original-From`. Cap de mărime: `personal_imap.MAX_RAW_BYTES` (25 MB).
