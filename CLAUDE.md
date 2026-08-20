@@ -125,21 +125,79 @@ operațiuni = doar nume (`device_operations.client_id` e NULL). Reclamațiile nu
 
 ---
 
-## 🔴 SATISFACȚIE CLIENȚI — motor curent: traiectorie V6 (2026-08-18)
+## 🔴 SATISFACȚIE CLIENȚI — motor curent: traiectorie V6 (2026-08-20)
 
 Motorul activ NU mai e cel cu 5 factori de mai jos (rămas ca istoric) — e traiectoria IRIS:
 
 - Prompt: `app/services/prompts/satisfaction_trajectory_v6.txt` — **singurul**; V4 și motoarele vechi (v1/v2 piloni, v3 holistic) au fost șterse.
 - Cod: `compute_satisfaction_v6()` din `app/services/satisfaction_engine.py`.
-- 1 apel IRIS per **săptămână ISO** cu interacțiuni; fiecare apel primește `stare_initiala`
-  (prima săptămână = ultima lună cu scor din `client_satisfaction_snapshots`, restul = săptămâna
-  precedentă). Scor lunar = **starea finală a ultimei săptămâni scorate** (nu media).
-- **Model: `claude-sonnet-4-6`** (până la V6 se folosea implicitul gateway-ului = Claude Haiku 4.5).
-  Se schimbă din `settings.satisfaction.v6` → `model_hint`, fără redeploy.
-- Config/revert (fără redeploy), cheia `settings.satisfaction.v6`:
-  `month_aggregation` (`last_week_final` | `weighted_avg_weeks`), `carry_start_state`,
-  `start_lookback_months`, `model_hint`, `prompt_version`.
-- Sursa datelor: `cts_ground_truth` (mailuri) + `cts_calls_ground_truth` (apeluri), lună calendaristică.
+- **Scorul vine EXCLUSIV din răspunsul promptului V6.** Codul nu ajustează, nu plafonează și nu
+  injectează stare. Nu există piloni, boost, floor sau factori.
+
+### Regula de calcul (decizie business 2026-08-20)
+
+- 1 apel IRIS per **săptămână ISO** cu interacțiuni.
+- **Fiecare săptămână pornește de la 50 (neutru), pe scala 0-100, și se evaluează independent.**
+  NU se reportează stare — nici între săptămâni, nici din luna precedentă.
+- Săptămânile fără interacțiuni **se sar complet** (nu intră în medie, nu contează ca 50).
+- **Scor lunar = media SIMPLĂ a săptămânilor scorate.** O săptămână cu 1 interacțiune cântărește
+  cât una cu 20. O singură săptămână scorată ⇒ scorul ei e scorul lunii.
+- **Prag nesatisfăcut: sub 60%** (`_UNSATISFIED_BELOW`) — granița dintre „Satisfăcut" (60-74) și
+  „Neutru" (45-59) din tabelul de benzi al promptului. `_segment()` folosește aceleași benzi:
+  `sanatos` ≥60, `neutru` 45-59, `la_risc` 30-44, `critic` <30.
+
+⚠️ **Reportarea între luni a fost eliminată.** A existat între 2026-08-18 și 2026-08-20
+(`carry_start_state`, `start_lookback_months`, `_previous_month_state`, înlănțuirea săptămânilor)
+și nu funcționa: promptul mixează scala de intensitate a evenimentelor (`-5 … +5`) cu starea
+(`0 … 100`) fără regulă de conversie, deci startul reportat era fie ignorat (modelul re-ancora în
+banda care descria săptămâna), fie mișcat cu câteva puncte dintr-o sută. Nu o reintroduce fără să
+rezolvi întâi conversia de scală în prompt.
+
+### Audit start — de citit înainte de a debuga scoruri „ciudate"
+
+Promptul cere obligatoriu `start_state` + `start_state_source` în JSON tocmai ca startul să fie
+verificabil. Până la 2026-08-20 câmpul era **ignorat**, iar breakdown-ul stoca valoarea trimisă de
+noi — deci arăta mereu „corect", orice făcea modelul. Acum se stochează ambele:
+`weekly_trajectories[].start_state` (intenția: mereu 50) și `start_state_model` /
+`start_state_drift` (ce a raportat modelul), agregat în `breakdown.start_audit`.
+
+**`drift_max` diferit de 0 ⇒ promptul nu a respectat startul neutru**, scorurile nu mai sunt
+comparabile între clienți, iar UI-ul afișează un avertisment în fișa clientului. Nu ignora.
+
+### Config/revert (fără redeploy), cheia `settings.satisfaction.v6`
+
+- `month_aggregation`: `avg_weeks` (implicit) | `weighted_avg_weeks` (media ponderată pe
+  interacțiuni, comportamentul V4) | `last_week_final` (starea finală a ultimei săptămâni).
+- `model_hint`: **`claude-sonnet-4-6`** (până la V6 se folosea implicitul gateway-ului = Claude
+  Haiku 4.5, prea grosier pentru distincțiile din prompt).
+- `prompt_version`.
+- `max_workers`: câți clienți se procesează **în paralel** în snapshot-ul lunar (implicit 6, plafon 16).
+- Startul săptămânal NU e configurabil — e mereu `_NEUTRAL_START` = 50.
+
+### ⚡ Performanță snapshot (2026-08-20)
+
+~94% din durata snapshot-ului e **latență IRIS serializată** (300 clienți × ~3 apeluri × ~4s ≈ 1h);
+sleep-urile și interogările DB erau împreună ~7%. Din 2026-08-20 clienții se procesează în paralel
+(`ThreadPoolExecutor`, `max_workers` din settings) → ~10 min la 6 fire.
+
+Reguli de respectat dacă atingi `satisfaction_snapshot.py`:
+- **Fiecare fir are conexiunea lui** (`_worker_conn`, `threading.local`) — psycopg2 NU e
+  thread-safe pe o conexiune partajată, iar motorul face ~11 interogări per client. Conexiunile
+  firelor sunt pe `autocommit` (doar citiri), altfel ar ține tranzacții deschise cât durează IRIS.
+- **Scrierea rămâne pe un singur fir** — `_process_client` întoarce rândul, nu îl inserează.
+  `BATCH_SIZE=1` se păstrează: flush după fiecare client, ca UI-ul să vadă progresul.
+- **Numărul de fire ESTE rate-limit-ul.** Pauzele fixe (`AI_CALL_SPACING_SECONDS`, sleep-ul dintre
+  săptămâni) au fost scoase; `iris_ai` are deja retry cu backoff pe 429/5xx (`iris_ai.py:38`).
+  Gateway-ul e partajat cu clasificarea mailurilor și scorarea apelurilor — nu urca `max_workers`
+  fără să te uiți la ele.
+- `_process_client` **nu ridică excepții niciodată** — un client stricat incrementează `errors` și
+  rularea continuă.
+
+⚠️ `POST /clients/satisfaction-snapshot` rulează **sincron** în request. La ~10 min tot e mult
+pentru HTTP: adminii pornesc rularea și urmăresc progresul din UI (care citește tabela), chiar dacă
+requestul moare pe timeout. Mutarea pe job de fundal e un task separat.
+
+Sursa datelor: `cts_ground_truth` (mailuri) + `cts_calls_ground_truth` (apeluri), lună calendaristică.
 
 ---
 
@@ -157,7 +215,7 @@ Motorul activ NU mai e cel cu 5 factori de mai jos (rămas ca istoric) — e tra
 | Task-uri deschise | `open_tasks` | 10% | `cts_task_ground_truth` deschise >7 zile |
 | Frecvență contact | `contact_frequency` | 10% | nr emailuri + apeluri în 30 zile (target max 1.5/zi) |
 
-**Threshold nesatisfăcut: 90%** (sub 90% = client nesatisfăcut)
+**Threshold nesatisfăcut: 90%** (sub 90% = client nesatisfăcut) — ⚠️ ISTORIC, valabil doar pentru motorul cu 5 factori descris în această secțiune. Motorul activ (V6, mai sus) folosește **60%**.
 
 **Bug critic rezolvat**: `ai_tone` în DB are valori `prietenos`/`neutru`/`tensionat` (nu `pozitiv`/`negativ` cum presupunea engine-ul anterior). Fix: `_TONE_VALUE = {"prietenos": 1.0, "neutru": 0.5, "tensionat": 0.0}`.
 
@@ -190,7 +248,7 @@ Dashboard complet în `SatisfactieDashboard`:
 - HBarChart: distribuție scoruri + variații lunare top clienți
 - Tabel expandabil clienți nesatisfăcuți cu `BreakdownPanel` per factor
 - Buton „?" popup Swal cu explicații complete pentru fiecare factor
-- Popup explicativ actualizat: threshold 90% menționat explicit
+- Popup explicativ: threshold 90% (istoric — motorul V6 activ folosește 60%)
 
 ### Sidebar client (secțiunea Satisfacție)
 

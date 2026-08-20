@@ -3588,7 +3588,7 @@ function Strict() {
 // Clients
 function satBadge(pct) {
   if (pct == null) return h('span', { style: { color: 'var(--t3)', fontSize: 12 } }, '—');
-  var bg = pct >= 90 ? 'var(--gn)' : pct >= 70 ? 'var(--yw)' : 'var(--rd)';
+  var bg = pct >= 60 ? 'var(--gn)' : pct >= 45 ? 'var(--yw)' : 'var(--rd)';
   return h('span', { style: { display: 'inline-block', padding: '1px 8px', borderRadius: 4, background: bg, color: '#fff', fontWeight: 600, fontSize: 11 } }, pct + '%');
 }
 
@@ -3631,15 +3631,15 @@ function SatTrajectoryChart({ title, series, note, height }) {
             pointBackgroundColor: series.map(function(r) {
               var p = r.pct;
               if (p == null) return '#94a3b8';
-              return p >= 70 ? '#10b981' : p >= 45 ? '#f59e0b' : '#ef4444';
+              return p >= 60 ? '#10b981' : p >= 45 ? '#f59e0b' : '#ef4444';
             }),
             tension: 0.25,
             fill: true,
             spanGaps: false
           },
           {
-            label: 'Prag 70%',
-            data: series.map(function() { return 70; }),
+            label: 'Prag 60%',
+            data: series.map(function() { return 60; }),
             borderColor: '#ef4444',
             borderDash: [5, 4],
             borderWidth: 1.5,
@@ -3666,7 +3666,7 @@ function SatTrajectoryChart({ title, series, note, height }) {
                 return (r && (r.tip || r.day)) || '';
               },
               label: function(ctx) {
-                if (ctx.dataset.label === 'Prag 70%') return '  Prag: 70%';
+                if (ctx.dataset.label === 'Prag 60%') return '  Prag: 60%';
                 var r = series[ctx.dataIndex] || {};
                 var v = ctx.raw;
                 var base = '  Satisfacție: ' + (v != null ? Number(v).toFixed(1) + '%' : '—');
@@ -3835,7 +3835,7 @@ function ClientSatV4({ satHistory, assetEmpty }) {
         ? 'Luna selectată nu are evenimente — afișez traiectoria din toate lunile disponibile.'
         : 'După rularea IRIS, fiecare interacțiune scorată apare ca punct pe grafic.'))
     : chartGrain === 'weeks'
-      ? 'Ultima stare de satisfacție din fiecare săptămână (agregat din interacțiuni).'
+      ? 'Scorul IRIS al fiecărei săptămâni cu interacțiuni. Fiecare săptămână pornește de la 50 (neutru) și se evaluează independent; scorul lunii e media simplă a săptămânilor scorate.'
       : 'Scorul final pe lună calendaristică (aceeași vedere ca pe pagina Satisfacție clienți).';
 
   function scoreBar(pct, col) {
@@ -3869,6 +3869,15 @@ function ClientSatV4({ satHistory, assetEmpty }) {
     var esc = bd.escalation_risks || [];
     var fin = bd.financial_risk;
     var suggestions = bd.suggestions || [];
+    var avgDetail = bd.month_avg_detail || {};
+    var AGG_LBL = { avg_weeks: 'media simplă a săptămânilor scorate',
+                    weighted_avg_weeks: 'media ponderată pe interacțiuni',
+                    last_week_final: 'starea finală a ultimei săptămâni scorate' };
+    var avgFormula = AGG_LBL[bd.month_aggregation] || null;
+    var startDrift = (function() {
+      var d = bd.start_audit && bd.start_audit.drift_max;
+      return (d != null && Number(d) !== 0) ? Number(d) : null;
+    })();
     function riskList(title, items, col) {
       if (!items || !items.length) return null;
       return h('div', { key: title, style: { marginTop: 8 } }, [
@@ -3882,12 +3891,18 @@ function ClientSatV4({ satHistory, assetEmpty }) {
     }
     return h('div', { key: 'iris-block', style: { border: '1px solid var(--bd)', borderRadius: 6, padding: '12px 14px', background: 'var(--bg3)' } }, [
       h('div', { key: 'hd', style: { marginBottom: 8 } }, [
-        h('div', { key: 't', style: { fontSize: 13, fontWeight: 700, color: 'var(--tx)' } }, 'Interpretare IRIS (traiectorie V4)'),
+        h('div', { key: 't', style: { fontSize: 13, fontWeight: 700, color: 'var(--tx)' } }, 'Interpretare IRIS (traiectorie V6)'),
         h('div', { key: 's', style: { fontSize: 11, color: 'var(--t3)', marginTop: 2 } }, 'Singurul KPI · ' + (bd.total_interactions || 0) + ' interacțiuni analizate')
       ]),
       h('div', { key: 'rule', style: { marginBottom: 10, padding: '6px 10px', background: 'color-mix(in srgb, #06b6d4 8%, transparent)', borderRadius: 4, borderLeft: '3px solid #06b6d4', fontSize: 11, color: 'var(--t2)' } },
-        'IRIS notează fiecare săptămână cu interacțiuni (1 apel/săptămână). Scorul lunii = medie ponderată pe interacțiuni — fără apel IRIS separat pe lună.'
+        'IRIS notează fiecare săptămână cu interacțiuni (1 apel/săptămână), pornind mereu de la 50 (neutru) — săptămânile sunt independente, fără stare reportată. Scorul lunii = ' + (avgFormula || 'media simplă a săptămânilor scorate') + '.'
       ),
+      // Audit start (vezi `start_audit` din breakdown): promptul trebuie să pornească de la 50.
+      // Dacă modelul raportează alt punct de start, scorul nu mai e comparabil între clienți —
+      // se semnalează aici, nu doar în JSON.
+      startDrift ? h('div', { key: 'drift', style: { marginBottom: 10, padding: '6px 10px', background: 'color-mix(in srgb, #f59e0b 10%, transparent)', borderRadius: 4, borderLeft: '3px solid #f59e0b', fontSize: 11, color: 'var(--t2)' } },
+        'Atenție: IRIS a raportat un punct de start diferit de 50 (abatere maximă ' + startDrift + ' puncte). Scorul acestei luni nu respectă regula de start neutru — semnalează-l echipei tehnice.'
+      ) : null,
       category ? h('div', { key: 'cat', style: { marginBottom: 6, fontSize: 12 } }, [
         h('span', { key: 'l', style: { fontWeight: 700, color: 'var(--t3)' } }, 'Categorie: '),
         h('span', { key: 'v', style: { color: 'var(--tx)' } }, category)
@@ -3970,7 +3985,7 @@ function ClientSatV4({ satHistory, assetEmpty }) {
     var scoreFinal = sel.satisfaction_pct;
     var segment = bd.segment || '';
     var SEG_COL2 = { sanatos: '#10b981', neutru: '#f59e0b', la_risc: '#f97316', critic: '#ef4444' };
-    var SEG_LBL2 = { sanatos: 'Sănătos ≥70%', neutru: 'Neutru 45–69%', la_risc: 'La risc 25–44%', critic: 'Critic <25%' };
+    var SEG_LBL2 = { sanatos: 'Sănătos ≥60%', neutru: 'Neutru 45–59%', la_risc: 'La risc 30–44%', critic: 'Critic <30%' };
     var segCol = SEG_COL2[segment] || 'var(--t3)';
     var scoreLabel = scoreFinal == null ? 'N/A' : (Number(scoreFinal).toFixed(1) + '%');
     return h('div', { key: 'final-block', style: { border: '2px solid var(--am)', borderRadius: 6, padding: '12px 14px', background: 'var(--bg3)' } }, [
@@ -4013,14 +4028,14 @@ function ClientSatV4({ satHistory, assetEmpty }) {
         note: grainNote,
         height: 230
       }),
-      h('div', { key: 'thr', style: { fontSize: 11, color: 'var(--t3)', marginTop: 6 } }, 'Sănătos ≥70% · Neutru 45–69% · La risc 25–44% · Critic <25% · pagina generală Satisfacție rămâne pe medie lunară')
+      h('div', { key: 'thr', style: { fontSize: 11, color: 'var(--t3)', marginTop: 6 } }, 'Sănătos ≥60% · Neutru 45–59% · La risc 30–44% · Critic <30% · pagina generală Satisfacție rămâne pe scorul lunar')
     ]),
     // ── Pills luni clickable ─────────────────────────────────────────────
     h('div', { key: 'month-sel', style: { padding: '12px 16px', display: 'flex', gap: 6, flexWrap: 'wrap', borderBottom: '1px solid var(--bd)' } },
       items.map(function(s, i) {
         var active = i === selIdx;
         var pct = s.satisfaction_pct;
-        var col = pct == null ? 'var(--t3)' : (pct >= 70 ? '#10b981' : pct >= 45 ? '#f59e0b' : '#ef4444');
+        var col = pct == null ? 'var(--t3)' : (pct >= 60 ? '#10b981' : pct >= 45 ? '#f59e0b' : '#ef4444');
         var pctLbl = pct == null ? 'N/A' : (pct.toFixed(1) + '%');
         return h('button', { key: s.month_key, onClick: function() { setSelMonthIdx(i); },
           style: { padding: '4px 14px', fontSize: 12, fontWeight: active ? 700 : 400, borderRadius: 20, border: '1px solid ' + (active ? col : 'var(--bd)'), background: active ? 'color-mix(in srgb,' + col + ' 12%, transparent)' : 'transparent', color: active ? col : 'var(--t2)', cursor: 'pointer', fontVariantNumeric: 'tabular-nums' } },
@@ -16700,7 +16715,7 @@ function SatisfactieDashboard({ onNavigateClient }) {
       + '<div style="font-size:12px;color:var(--t2,#8b9ab5);line-height:1.6">'
       + '<strong>Scorul lunar</strong> = Σ (scor_săptămână × nr_interacțiuni) / Σ nr_interacțiuni — fără reinterpretare IRIS pe lună.<br>'
       + 'Categorii tipice: Ambasador 90–100 · Foarte satisfăcut 75–89 · Satisfăcut 60–74 · Neutru 45–59 · Nemulțumit 30–44 · Critic 0–29.<br>'
-      + 'Segment intern UI: <strong>Sănătos</strong> ≥70% · <strong>Neutru</strong> 45-69% · <strong>La risc</strong> 25-44% · <strong>Critic</strong> &lt;25%. Prag nesatisfăcut: sub 70%.<br>'
+      + 'Segment intern UI: <strong>Sănătos</strong> ≥60% · <strong>Neutru</strong> 45-59% · <strong>La risc</strong> 30-44% · <strong>Critic</strong> &lt;30%. Prag nesatisfăcut: sub 60%.<br>'
       + '<strong>Sursa datelor</strong>: CTS ground-truth (mailuri + apeluri) pe luna calendaristică, grupate pe săptămâni ISO.'
       + '</div>';
     Swal.fire({
@@ -17002,7 +17017,7 @@ function SatisfactieDashboard({ onNavigateClient }) {
       kpiCard('k1', 'Media satisfacție', summary.avg_pct != null ? summary.avg_pct.toFixed(1) + '%' : '—', summary.last_month || '', avgColor),
       kpiCard('k2', 'Clienți nesatisfăcuți', summary.total_unsatisfied != null ? String(summary.total_unsatisfied) : '—', unsatPct + '% din total', unsatPct > 40 ? '#ef4444' : unsatPct > 20 ? '#f59e0b' : '#10b981'),
       kpiCard('k3', 'Clienți cu snapshot', summary.total_with_snapshot != null ? String(summary.total_with_snapshot) : '—', 'luna ' + (summary.last_month || '—'), '#3b82f6'),
-      kpiCard('k4', 'Satisfăcuți (≥70%)', summary.total_with_snapshot != null ? String((summary.total_with_snapshot || 0) - (summary.total_unsatisfied || 0)) : '—', Math.round(100 - unsatPct) + '% din total', '#10b981'),
+      kpiCard('k4', 'Satisfăcuți (≥60%)', summary.total_with_snapshot != null ? String((summary.total_with_snapshot || 0) - (summary.total_unsatisfied || 0)) : '—', Math.round(100 - unsatPct) + '% din total', '#10b981'),
       kpiCard('k5', 'La risc / Critic', String(totalAtRisk), 'segment real (indiferent de scor)', totalAtRisk > 0 ? '#f97316' : '#10b981'),
       kpiCard('k6', 'Trend descendent', String(totalDeclining), 'clienți în declin activ', totalDeclining > 0 ? '#ef4444' : '#10b981'),
     ]),
@@ -17044,7 +17059,7 @@ function SatisfactieDashboard({ onNavigateClient }) {
     trendSeries.length > 1
       ? h('div', { key: 'trend-row', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 } }, [
           h(MultiLineChart, { key: 'trend-avg', title: 'Satisfacție medie (%)', series: trendSeries, lines: [{ key: 'avg', color: '#06b6d4', label: 'Satisfacție medie' }], yMax: 100, height: 210, note: 'Media satisfacției pentru toți clienții cu snapshot, pe lună.' }),
-          h(MultiLineChart, { key: 'trend-unsat', title: 'Clienți nesatisfăcuți pe lună', series: trendSeries, lines: [{ key: 'unsat', color: '#ef4444', label: 'Nesatisfăcuți (<70%)' }], height: 210, note: 'Numărul de clienți cu scor sub 70% în fiecare lună.' })
+          h(MultiLineChart, { key: 'trend-unsat', title: 'Clienți nesatisfăcuți pe lună', series: trendSeries, lines: [{ key: 'unsat', color: '#ef4444', label: 'Nesatisfăcuți (<60%)' }], height: 210, note: 'Numărul de clienți cu scor sub 60% în fiecare lună.' })
         ])
       : h('div', { key: 'trend-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Date insuficiente pentru grafic (minim 2 luni cu snapshot).'),
 
@@ -17110,12 +17125,12 @@ function SatisfactieDashboard({ onNavigateClient }) {
         ])
       : h('div', { key: 'top-sat-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Nicio dată disponibilă.'),
 
-    // ── Clienți nesatisfăcuți (scor <70) ─────────────────────────────────
-    secHdr('s-unsat', 'Clienți nesatisfăcuți — scor sub 70%', '#ef4444', 26, helpBtn),
+    // ── Clienți nesatisfăcuți (scor <60) ─────────────────────────────────
+    secHdr('s-unsat', 'Clienți nesatisfăcuți — scor sub 60%', '#ef4444', 26, helpBtn),
     unsatisfied.length > 0
       ? h('div', { key: 'unsat', className: 'card', style: { padding: 0, overflow: 'hidden' } }, [
           h('div', { key: 'sub', style: { padding: '10px 16px', fontSize: 11, color: 'var(--t3)', borderBottom: '1px solid var(--bd)' } },
-            unsatisfied.length + ' clienți sub 70% satisfacție — ' + (summary.last_month || '—') + '. Click pe rând pentru defalcarea factorilor.'),
+            unsatisfied.length + ' clienți sub 60% satisfacție — ' + (summary.last_month || '—') + '. Click pe rând pentru defalcarea factorilor.'),
           h('table', { key: 'tbl', style: { width: '100%', borderCollapse: 'collapse', fontSize: 13 } }, [
             h('thead', { key: 'hd' }, h('tr', { style: { background: 'var(--bg2)', borderBottom: '1px solid var(--bd)' } }, [
               h('th', { key: 'exp', style: { width: 28, padding: '8px' } }),
@@ -17172,7 +17187,7 @@ function SatisfactieDashboard({ onNavigateClient }) {
             )
           ])
         ])
-      : h('div', { key: 'unsat-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Niciun client nesatisfăcut (sub 70%) în ultima lună cu snapshot.'),
+      : h('div', { key: 'unsat-empty', className: 'card', style: { padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Niciun client nesatisfăcut (sub 60%) în ultima lună cu snapshot.'),
   ]);
 }
 // Procesare documente — modul nou (Phase 1: tab „Tipuri de documente")

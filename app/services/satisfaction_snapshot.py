@@ -11,7 +11,8 @@ Activitate = cel puțin un email sau un apel sau un task în intervalul lunii.
 
 import json
 import logging
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -25,9 +26,55 @@ logger = logging.getLogger("mailguard.satisfaction_snapshot")
 
 BATCH_SIZE = 1  # flush imediat — UI vede fiecare client după IRIS
 
-# Rate-limit apeluri IRIS AI: pauză între clienți ca să nu bombardăm gateway-ul
-# (fiecare client cu activitate face 1 apel IRIS in compute_satisfaction_v6 / traiectorie V4).
-AI_CALL_SPACING_SECONDS = 0.3
+# Câți clienți se procesează în paralel. Sursa de adevăr e `settings.satisfaction.v6` →
+# `max_workers`; valoarea de aici e doar plasa de siguranță când settings-ul lipsește.
+#
+# De ce paralel (2026-08-20): ~94% din durata snapshot-ului e latență IRIS serializată — 300 de
+# clienți × ~3 apeluri × ~4s ≈ o oră, din care sleep-urile și interogările DB erau ~7%.
+# Clienții sunt complet independenți (nu se mai reportează stare între ei), deci singura limită
+# reală e gateway-ul IRIS, folosit în același timp și de clasificarea mailurilor și de scorarea
+# apelurilor. Numărul de fire ESTE rate-limit-ul; `iris_ai` are deja retry cu backoff pe 429/5xx,
+# deci pauzele fixe de dinainte au fost scoase.
+DEFAULT_MAX_WORKERS = 6
+MAX_WORKERS_CAP = 16
+
+# Conexiune DB per fir: psycopg2 NU e thread-safe pe o conexiune partajată, iar motorul face
+# ~11 interogări per client. Firele fac doar CITIRI; scrierea rămâne pe conexiunea principală,
+# într-un singur fir, ca să nu apară contenție pe INSERT.
+_tls = threading.local()
+_worker_conns = []
+_worker_conns_lock = threading.Lock()
+
+
+def _worker_conn():
+    """Conexiunea firului curent (creată la prima folosire, reutilizată apoi)."""
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and not conn.closed:
+        return conn
+    s = get_settings()
+    conn = psycopg2.connect(
+        host=s.db_host, port=s.db_port,
+        dbname=s.db_name, user=s.db_user, password=s.db_password,
+    )
+    # Doar citiri — autocommit ca să nu țină o tranzacție deschisă cât durează apelurile IRIS
+    # (altfel 6 tranzacții „idle in transaction" de câteva minute fiecare).
+    conn.autocommit = True
+    _tls.conn = conn
+    with _worker_conns_lock:
+        _worker_conns.append(conn)
+    return conn
+
+
+def _close_worker_conns():
+    """Închide conexiunile firelor după terminarea pool-ului."""
+    with _worker_conns_lock:
+        conns, _worker_conns[:] = list(_worker_conns), []
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+    _tls.conn = None
 
 
 def _month_interval(month_key: str):
@@ -141,6 +188,78 @@ def _get_previous_snapshot(client_id: int, month_key: str, cur) -> Optional[dict
     return None
 
 
+def _process_client(client_id: int, iris_client_id: Optional[int], month_key: str,
+                    start: datetime, end: datetime, force: bool, computed_at: str) -> dict:
+    """Calculează snapshot-ul unui client. Rulează pe firul lui, cu conexiunea lui.
+
+    NU ridică excepții și NU scrie în DB — întoarce rândul de inserat, ca scrierea să rămână
+    într-un singur fir (vezi `run_monthly_snapshot`). `kind` spune apelantului ce s-a întâmplat:
+    'scored' (motorul a produs scor), 'carry' (carry-forward din luna precedentă),
+    'skipped' (fără activitate și fără istoric), 'error'.
+    """
+    try:
+        cur = _worker_conn().cursor()
+        try:
+            # force=True: recalculăm indiferent de activitatea calendaristică
+            has_act = force or _has_activity(client_id, iris_client_id, cur, start, end)
+            ai_calls = 0
+            pct = None
+            carry_forward = False
+            source_month_key = None
+            breakdown = {}
+            is_unsatisfied = False
+            config_used = {}
+
+            if has_act:
+                result = satisfaction_engine.compute_satisfaction_v6(
+                    client_id, iris_client_id, cur, start, end)
+                mode = (result.get("breakdown") or {}).get("scoring_mode") or ""
+                if str(mode).startswith("v6_trajectory"):
+                    ai_calls = int((result.get("breakdown") or {}).get("iris_calls") or 1)
+                pct = result.get("satisfaction_pct")
+                breakdown = result.get("breakdown", {})
+                is_unsatisfied = result.get("is_unsatisfied", False)
+                config_used = result.get("config_used", {})
+                if pct is None and not (breakdown or {}).get("store_null"):
+                    # Motorul a rulat, dar fără date utilizabile — încearcă carry-forward
+                    has_act = False
+
+            kind = "scored"
+            if not has_act:
+                prev = _get_previous_snapshot(client_id, month_key, cur)
+                if prev is None:
+                    return {"client_id": client_id, "kind": "skipped", "ai_calls": ai_calls, "row": None}
+                pct = prev["satisfaction_pct"]
+                is_unsatisfied = prev["is_unsatisfied"]
+                breakdown = prev["breakdown"]
+                carry_forward = True
+                source_month_key = prev["source_month_key"]
+                config_used = {}
+                kind = "carry"
+
+            return {
+                "client_id": client_id,
+                "kind": kind,
+                "ai_calls": ai_calls,
+                "row": {
+                    "client_id": client_id,
+                    "month_key": month_key,
+                    "satisfaction_pct": pct,
+                    "is_unsatisfied": is_unsatisfied,
+                    "breakdown": json.dumps(breakdown) if breakdown else None,
+                    "carry_forward": carry_forward,
+                    "source_month_key": source_month_key,
+                    "config_used": json.dumps(config_used) if config_used else None,
+                    "computed_at": computed_at,
+                },
+            }
+        finally:
+            cur.close()
+    except Exception:
+        logger.exception("satisfaction_snapshot: eroare client_id=%s", client_id)
+        return {"client_id": client_id, "kind": "error", "ai_calls": 0, "row": None}
+
+
 def run_monthly_snapshot(
     month_key: Optional[str] = None,
     client_ids: Optional[list] = None,
@@ -190,69 +309,56 @@ def run_monthly_snapshot(
         clients = cur.fetchall()
         logger.info("satisfaction_snapshot: start month=%s clients=%d dry_run=%s", month_key, len(clients), dry_run)
 
+        # Numărul de fire vine din settings (`satisfaction.v6` → `max_workers`), ca să se
+        # poată urca/coborî fără redeploy dacă gateway-ul IRIS o cere.
+        try:
+            _cfg = satisfaction_engine._load_v6_config(cur)
+            workers = int(_cfg.get("max_workers") or DEFAULT_MAX_WORKERS)
+        except Exception:
+            workers = DEFAULT_MAX_WORKERS
+        workers = max(1, min(MAX_WORKERS_CAP, workers))
+        if dry_run:
+            workers = 1     # dry-run e pentru inspecție, nu pentru viteză
+        logger.info("satisfaction_snapshot: %d clienți, %d fire în paralel", len(clients), workers)
+
+        # Clienții se procesează în paralel (citiri + IRIS), dar SCRIEREA rămâne aici, pe un
+        # singur fir: se păstrează `BATCH_SIZE=1` (flush după fiecare client, ca UI-ul să vadă
+        # progresul) fără contenție pe INSERT și fără tranzacții concurente.
         batch = []
-        for client_id, iris_client_id in clients:
-            try:
-                # force=True: recalculăm indiferent de activitatea calendaristică
-                # (engine-ul folosește fereastra proprie 90 zile)
-                has_act = force or _has_activity(client_id, iris_client_id, cur, start, end)
+        computed_at = now.isoformat()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_process_client, client_id, iris_client_id,
+                                month_key, start, end, force, computed_at)
+                    for client_id, iris_client_id in clients
+                ]
+                done = 0
+                for fut in as_completed(futures):
+                    res = fut.result()      # _process_client nu ridică niciodată
+                    kind = res["kind"]
+                    stats["ai_calls"] = stats.get("ai_calls", 0) + res.get("ai_calls", 0)
 
-                if has_act:
-                    # v4: fereastră strict calendaristică [start, end)
-                    result = satisfaction_engine.compute_satisfaction_v6(client_id, iris_client_id, cur, start, end)
-                    mode = (result.get("breakdown") or {}).get("scoring_mode") or ""
-                    # v6_trajectory = IRIS pe săptămâni înlănțuite, fără cache (singurul motor)
-                    if str(mode).startswith("v6_trajectory"):
-                        n_calls = int((result.get("breakdown") or {}).get("iris_calls") or 1)
-                        stats["ai_calls"] = stats.get("ai_calls", 0) + n_calls
-                        # Rate-limit: pauză după fiecare client (apelurile intra-client au deja spacing în engine)
-                        time.sleep(AI_CALL_SPACING_SECONDS)
-                    pct = result.get("satisfaction_pct")
-                    carry_forward = False
-                    source_month_key = None
-                    breakdown = result.get("breakdown", {})
-                    is_unsatisfied = result.get("is_unsatisfied", False)
-                    config_used = result.get("config_used", {})
-
-                    if pct is None and not (breakdown or {}).get("store_null"):
-                        # Motor a calculat dar fără date — încearcă carry-forward
-                        has_act = False
-
-                if not has_act:
-                    prev = _get_previous_snapshot(client_id, month_key, cur)
-                    if prev is None:
+                    if kind == "error":
+                        stats["errors"] += 1
+                    elif kind == "skipped":
                         stats["skipped"] += 1
-                        continue
-                    pct = prev["satisfaction_pct"]
-                    is_unsatisfied = prev["is_unsatisfied"]
-                    breakdown = prev["breakdown"]
-                    carry_forward = True
-                    source_month_key = prev["source_month_key"]
-                    config_used = {}
-                    stats["carry_forward"] += 1
+                    else:
+                        if kind == "carry":
+                            stats["carry_forward"] += 1
+                        batch.append(res["row"])
+                        stats["processed"] += 1
+                        if len(batch) >= BATCH_SIZE and not dry_run:
+                            _flush_batch(cur, batch, force=force)
+                            conn.commit()
+                            batch.clear()
 
-                batch.append({
-                    "client_id": client_id,
-                    "month_key": month_key,
-                    "satisfaction_pct": pct,
-                    "is_unsatisfied": is_unsatisfied,
-                    "breakdown": json.dumps(breakdown) if breakdown else None,
-                    "carry_forward": carry_forward,
-                    "source_month_key": source_month_key,
-                    "config_used": json.dumps(config_used) if config_used else None,
-                    "computed_at": now.isoformat(),
-                })
-                stats["processed"] += 1
-
-                # Flush batch
-                if len(batch) >= BATCH_SIZE and not dry_run:
-                    _flush_batch(cur, batch, force=force)
-                    conn.commit()
-                    batch.clear()
-
-            except Exception:
-                logger.exception("satisfaction_snapshot: eroare client_id=%s", client_id)
-                stats["errors"] += 1
+                    done += 1
+                    if done % 50 == 0:
+                        logger.info("satisfaction_snapshot: %d/%d clienți procesați (%s)",
+                                    done, len(clients), stats)
+        finally:
+            _close_worker_conns()
 
         # Flush final
         if batch and not dry_run:

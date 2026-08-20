@@ -817,7 +817,9 @@ def estimate_satisfaction(client_id: int, month: str = None, db: Session = Depen
         raise HTTPException(400, "Date insuficiente pentru calculul satisfacției (nicio activitate înregistrată)")
 
     breakdown = result.get("breakdown", {})
-    is_unsatisfied = result.get("is_unsatisfied", pct < 70.0)
+    # Fallback aliniat cu motorul (`satisfaction_engine._UNSATISFIED_BELOW`): granița dintre
+    # „Satisfăcut" (60-74) și „Neutru" (45-59) din tabelul de benzi al promptului V6.
+    is_unsatisfied = result.get("is_unsatisfied", pct < 60.0)
 
     # Sursă unică: scrie direct în client_satisfaction_snapshots (aceeași tabelă citită
     # de sidebar și de dashboard-ul de evoluție) — altfel cele două UI-uri divergeau.

@@ -3,12 +3,16 @@
 Un singur KPI: starea finală 0-100 (sau N/A), estimată de IRIS după promptul
 `prompts/satisfaction_trajectory_v6.txt`, pe interacțiunile reale ale clientului.
 
-  * 1 apel IRIS per săptămână ISO cu interacțiuni, cu `stare_initiala` transmisă explicit:
-    prima săptămână pornește din ultima lună cu scor (`client_satisfaction_snapshots`),
-    fiecare săptămână următoare din starea în care s-a încheiat cea precedentă.
-  * Scorul lunii = starea finală a ultimei săptămâni scorate (recența decide).
+  * 1 apel IRIS per săptămână ISO cu interacțiuni. Fiecare săptămână pornește de la NEUTRU
+    (50 pe scala 0-100) și se evaluează independent — nu se reportează stare, nici între
+    săptămâni, nici din luna precedentă. Săptămânile fără interacțiuni se sar.
+  * Scorul lunii = media SIMPLĂ a săptămânilor scorate.
   * Sursa datelor: `cts_ground_truth` (mailuri) + `cts_calls_ground_truth` (apeluri),
     pe luna calendaristică [month_start, month_end).
+  * Săptămânile unui client sunt independente între ele, deci `compute_satisfaction_v6` poate
+    fi apelat în paralel pentru clienți diferiți — dar NU cu același cursor: psycopg2 nu e
+    thread-safe pe o conexiune partajată (vezi `satisfaction_snapshot`, care dă fiecărui fir
+    conexiunea lui).
 
 Motoarele vechi (v1/v2 pe piloni, v3 „AI holistic", agregarea V4 pe medie) au fost eliminate —
 o singură cale de încadrare, configurabilă din settings key `satisfaction.v6`.
@@ -59,11 +63,17 @@ def _row_get(row, *keys):
 
 
 def _segment(score: float) -> str:
-    if score >= 70:
+    """Segmentul intern (4 valori) — colapsul benzilor din tabelul promptului V6.
+
+    Granițele sunt exact cele din prompt (`Ambasador`/`Foarte satisfăcut`/`Satisfăcut` ≥60,
+    `Neutru` 45-59, `Nemulțumit` 30-44, `Critic` <30), ca să nu existe o a treia taxonomie
+    pe lângă benzile din prompt și pragul de nesatisfacție.
+    """
+    if score >= 60:
         return "sanatos"
     if score >= 45:
         return "neutru"
-    if score >= 25:
+    if score >= 30:
         return "la_risc"
     return "critic"
 
@@ -83,8 +93,16 @@ def _segment(score: float) -> str:
 _TRAJECTORY_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "satisfaction_trajectory_v6.txt"
 _TRAJECTORY_SYSTEM_CACHE: Optional[str] = None
 
-# Punctul de start implicit când clientul nu are istoric cunoscut (promptul V6, principiul 17).
+# Punctul de start al FIECĂREI săptămâni analizate (promptul V6, principiul 17). Nu se
+# reportează stare între săptămâni sau între luni: fiecare săptămână se evaluează independent,
+# pornind din neutru. Decizie business 2026-08-20 — reportarea între perioade s-a dovedit
+# imposibil de controlat (promptul mixa scala de intensitate -5..+5 cu starea 0-100), iar
+# scorul trebuie să vină exclusiv din ce evaluează promptul pe săptămâna respectivă.
 _NEUTRAL_START = 50.0
+
+# Sub acest scor clientul e considerat nesatisfăcut — granița dintre „Satisfăcut" (60-74) și
+# „Neutru" (45-59) din tabelul de benzi al promptului V6.
+_UNSATISFIED_BELOW = 60.0
 
 # Config motor (cheile numerice legacy sunt neutre — nu se mai ponderează piloni)
 _V6_DEFAULTS = {
@@ -96,18 +114,20 @@ _V6_DEFAULTS = {
     "recovery_max": 0.0,
     "mode": "iris_trajectory_v6",
     "prompt_version": "V6",
-    # V6 — traiectoria e continuă: fiecare săptămână pornește din starea în care s-a
-    # încheiat cea precedentă, iar prima săptămână din starea finală a lunii anterioare.
-    "carry_start_state": True,
-    "start_lookback_months": 3.0,
-    # "last_week_final" = starea finală a ultimei săptămâni scorate (recența decide, principiul 1);
-    # "weighted_avg_weeks" = comportamentul V4 (medie ponderată pe interacțiuni), păstrat ca revert
-    # fără redeploy din settings key `satisfaction.v6`.
-    "month_aggregation": "last_week_final",
+    # "avg_weeks" = media SIMPLĂ a săptămânilor scorate (o săptămână cu 1 interacțiune
+    # cântărește cât una cu 20). Celelalte două rămân acceptate ca revert fără redeploy din
+    # settings key `satisfaction.v6`: "weighted_avg_weeks" (medie ponderată pe interacțiuni,
+    # comportamentul V4) și "last_week_final" (starea finală a ultimei săptămâni scorate).
+    "month_aggregation": "avg_weeks",
     # Modelul care rulează promptul de traiectorie. Până la V6 se folosea implicitul
     # gateway-ului (Claude Haiku 4.5) — prea grosier pentru distincțiile din V6 (cele trei
     # niveluri de mulțumire, plafon interzis). Se schimbă din settings fără redeploy.
     "model_hint": "claude-sonnet-4-6",
+    # Câți clienți se procesează în PARALEL în snapshot-ul lunar. Clienții sunt complet
+    # independenți (din 2026-08-20 nu se mai reportează stare între ei sau între săptămâni),
+    # deci singura limită reală e gateway-ul IRIS — folosit în același timp și de clasificarea
+    # mailurilor și de scorarea apelurilor. Se urcă/coboară din settings, fără redeploy.
+    "max_workers": 6.0,
 }
 
 
@@ -124,8 +144,8 @@ _CARGOTRACK_PHONE_PREFIXES = ("037443006",)
 def _load_v6_config(cur) -> dict:
     """Config motor din settings, cheia `satisfaction.v6` (singura citită).
 
-    Permite, fără redeploy: agregarea lunii (`month_aggregation`), reportarea stării de start
-    (`carry_start_state`, `start_lookback_months`) și modelul IRIS (`model_hint`).
+    Permite, fără redeploy: agregarea lunii (`month_aggregation`) și modelul IRIS
+    (`model_hint`). Startul săptămânal NU e configurabil — e mereu neutru (`_NEUTRAL_START`).
     """
     cfg = dict(_V6_DEFAULTS)
     try:
@@ -521,9 +541,10 @@ def _salvage_satisfaction_json(text: str) -> Optional[dict]:
             pass
 
     out: Dict[str, Any] = {}
-    m = re.search(r'"satisfaction_pct"\s*:\s*(null|-?\d+(?:\.\d+)?)', t)
-    if m:
-        out["satisfaction_pct"] = None if m.group(1) == "null" else float(m.group(1))
+    for numeric_key in ("satisfaction_pct", "start_state"):
+        m = re.search(rf'"{numeric_key}"\s*:\s*(null|-?\d+(?:\.\d+)?)', t)
+        if m:
+            out[numeric_key] = None if m.group(1) == "null" else float(m.group(1))
 
     def _str_field(name: str) -> Optional[str]:
         mm = re.search(rf'"{name}"\s*:\s*"((?:\\.|[^"\\])*)"', t)
@@ -534,7 +555,8 @@ def _salvage_satisfaction_json(text: str) -> Optional[dict]:
         except Exception:
             return mm.group(1)
 
-    for key in ("no_score_label", "no_score_note", "category", "trajectory_shape", "reasoning"):
+    for key in ("no_score_label", "no_score_note", "category", "trajectory_shape",
+                "reasoning", "start_state_source"):
         val = _str_field(key)
         if val is not None:
             out[key] = val
@@ -545,7 +567,8 @@ def _salvage_satisfaction_json(text: str) -> Optional[dict]:
     out.setdefault("reputation_risks", [])
     out.setdefault("escalation_risks", [])
     out.setdefault("suggestions", [])
-    if any(k in out for k in ("satisfaction_pct", "no_score_label", "reasoning", "category")):
+    if any(k in out for k in ("satisfaction_pct", "no_score_label", "reasoning", "category",
+                              "start_state")):
         out["_salvaged"] = True
         return out
     return None
@@ -605,44 +628,6 @@ def _iris_call(system: str, payload: dict, max_tokens: int = 500,
     return None
 
 
-def _previous_month_state(cur, client_id: int, month_start: datetime, lookback: int = 3) -> Tuple[Optional[float], Optional[str]]:
-    """Starea finală cunoscută dinaintea lunii curente (prompt V6, principiul 17).
-
-    Caută în `client_satisfaction_snapshots` ultima lună cu scor, mergând înapoi cel mult
-    `lookback` luni. Fără istoric → (None, None), iar apelantul pornește de la neutru (50).
-    Repornirea de la neutru la fiecare lună ștergea continuitatea: un client lăsat nemulțumit în
-    iunie apărea în iulie ca și cum relația ar fi început de la zero.
-    """
-    try:
-        y, m = month_start.year, month_start.month
-        keys = []
-        for _ in range(max(1, int(lookback))):
-            m -= 1
-            if m == 0:
-                m, y = 12, y - 1
-            keys.append(f"{y:04d}-{m:02d}")
-        cur.execute(
-            """
-            SELECT month_key, satisfaction_pct
-            FROM client_satisfaction_snapshots
-            WHERE client_id = %s AND month_key = ANY(%s) AND satisfaction_pct IS NOT NULL
-            ORDER BY month_key DESC
-            LIMIT 1
-            """,
-            (client_id, keys),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None, None
-        mk, pct = _row_get(row, "month_key", "satisfaction_pct")
-        if pct is None:
-            return None, None
-        return round(_clamp(float(pct)), 1), f"snapshot lunar {mk}"
-    except Exception:
-        logger.warning("satisfaction v6: _previous_month_state eroare client_id=%s", client_id, exc_info=True)
-        return None, None
-
-
 def _iris_payload_interactions(received: List[dict], sent: List[dict] = None, *, text_limit: int = 600) -> list:
     """Serializează interacțiunile pentru IRIS (câmpuri relevante, text trunchiat)."""
     out = []
@@ -680,16 +665,18 @@ def compute_satisfaction_v6(
     use_ai: bool = True,
     skip_exclude_check: bool = False,
 ) -> dict:
-    """Scor satisfacție v6 — 1 apel IRIS per săptămână cu interacțiuni; traiectorie continuă.
+    """Scor satisfacție v6 — 1 apel IRIS per săptămână ISO cu interacțiuni.
 
-    Diferă de v4 prin două lucruri, ambele cerute de promptul V6:
-      * fiecare săptămână primește un punct de start (`stare_initiala`) — prima săptămână
-        din starea finală a ultimei luni cu scor, restul din starea săptămânii precedente;
-      * scorul lunii = starea finală a ultimei săptămâni scorate (recența decide), nu media
-        ponderată pe interacțiuni. Media rămâne calculată și expusă în breakdown pentru
-        comparație, iar `month_aggregation="weighted_avg_weeks"` în settings readuce v4.
+    Regulile de calcul (business, 2026-08-20):
+      * fiecare săptămână pornește de la NEUTRU (50 pe scala 0-100) și se evaluează
+        independent — nu se reportează stare între săptămâni sau între luni;
+      * săptămânile fără interacțiuni se sar complet (nu intră nici în medie, nici ca 50);
+      * scorul lunii = media SIMPLĂ a săptămânilor scorate (o săptămână cu o interacțiune
+        cântărește cât una cu douăzeci); o singură săptămână scorată ⇒ scorul ei e scorul lunii;
+      * scorul provine EXCLUSIV din răspunsul promptului V6 — codul nu ajustează, nu plafonează
+        și nu injectează stare. `month_aggregation` din settings permite revert la
+        `weighted_avg_weeks` (comportamentul V4) sau `last_week_final`, fără redeploy.
     """
-    import time as _time
     import re
 
     now = month_end
@@ -741,7 +728,7 @@ def compute_satisfaction_v6(
             "financial_risk": None,
             "suggestions": [],
             "iris_calls": 0,
-            "month_aggregation": "weighted_avg_weeks",
+            "month_aggregation": "avg_weeks",
         }
         if extra:
             breakdown.update(extra)
@@ -775,7 +762,7 @@ def compute_satisfaction_v6(
                 "weekly_trajectories": [],
                 "trajectory_events": [],
                 "iris_calls": 0,
-                "month_aggregation": "weighted_avg_weeks",
+                "month_aggregation": "avg_weeks",
             },
             "config_used": config_used,
             "computed_at": now.isoformat(),
@@ -853,21 +840,14 @@ def compute_satisfaction_v6(
     # starea înapoi în timp.
     order = sorted(buckets, key=lambda k: buckets[k]["start"])
 
-    # Punctul de start al lunii (prompt V6, principiul 17): starea finală a ultimei luni
-    # cu scor, dacă există; altfel neutru. Fără asta, o lună calmă a unui client lăsat
-    # nemulțumit luna trecută repornea de la 50 și „vindeca" clientul din calcul.
-    start_state: Optional[float] = None
-    start_source = "neutru implicit (fără istoric cunoscut)"
-    if cfg.get("carry_start_state"):
-        prev_pct, prev_src = _previous_month_state(
-            cur, client_id, ms, lookback=int(cfg.get("start_lookback_months") or 3)
-        )
-        if prev_pct is not None:
-            start_state = prev_pct
-            start_source = f"stare reportată: {prev_src}"
-    month_start_state = start_state if start_state is not None else _NEUTRAL_START
-    chain_state = month_start_state
-    chain_source = start_source
+    # Punctul de start (prompt V6, principiul 17): NEUTRU, identic pentru fiecare săptămână.
+    # Nu se reportează stare — nici între săptămâni, nici din luna precedentă. Reportarea a
+    # existat până la 2026-08-20 și a fost eliminată: promptul mixa scala de intensitate
+    # (-5..+5) cu starea (0-100) fără regulă de conversie, deci startul reportat era fie
+    # ignorat (modelul re-ancora în banda care descria săptămâna), fie mișcat cu câteva puncte
+    # dintr-o sută. Scorul vine acum exclusiv din ce evaluează promptul pe săptămâna dată.
+    month_start_state = _NEUTRAL_START
+    start_source = "neutru implicit (start fix pe săptămână)"
 
     weekly_rows: List[dict] = []
     merged_events: List[dict] = []
@@ -877,7 +857,7 @@ def compute_satisfaction_v6(
     all_sug: List = []
     last_fin = None
 
-    for i, wk in enumerate(order):
+    for wk in order:
         wb = buckets[wk]
         w_recv, w_sent = wb["received"], wb["sent"]
         n_w = len(w_recv) + len(w_sent)
@@ -894,12 +874,19 @@ def compute_satisfaction_v6(
             "instructiune": (
                 "Analizează traiectoria de satisfacție DOAR pentru această SĂPTĂMÂNĂ (prompt V6). "
                 "Interacțiunile = [TRANSCRIEREA CONVERSAȚIEI]. Fără cache. "
-                "Pornește de la `stare_initiala` (principiul 17), nu de la 50, și nu plafona o "
-                "recuperare reală sau o mulțumire despre colaborare/recomandare (principiul 18). "
+                "Pornește de la 50 pe scala 0-100 (neutru) — săptămâna se evaluează independent, "
+                "fără stare reportată din altă perioadă — și nu plafona o recuperare reală sau o "
+                "mulțumire despre colaborare/recomandare (principiul 18). "
                 "JSON COMPACT: trajectory_events maxim 10 (explanation ≤1 propoziție); "
                 "satisfaction_pct = starea finală a săptămânii."
             ),
-            "stare_initiala": {"valoare": round(chain_state, 1), "sursa": chain_source},
+            # Unitatea e scrisă explicit: un `50.0` gol, lângă o taxonomie de intensități
+            # -5..+5, invita exact confuzia puncte/procente pentru care s-a scos reportarea.
+            "stare_initiala": {
+                "valoare": _NEUTRAL_START,
+                "scala": "0-100",
+                "sursa": "neutru implicit — fiecare săptămână pornește de la neutru",
+            },
             "total_interactiuni": n_w,
             "interactiuni": _iris_payload_interactions(w_recv, w_sent, text_limit=1400),
         }
@@ -912,8 +899,11 @@ def compute_satisfaction_v6(
                 "week_start": period["week_start"],
                 "week_end_exclusive": period["week_end_exclusive"],
                 "n_interactions": n_w,
-                "start_state": round(chain_state, 1),
-                "start_state_source": chain_source,
+                "start_state": _NEUTRAL_START,
+                "start_state_source": start_source,
+                "start_state_model": None,
+                "start_state_source_model": None,
+                "start_state_drift": None,
                 "satisfaction_pct": None,
                 "category": "IRIS eșuat pe săptămână",
                 "trajectory_shape": None,
@@ -931,13 +921,22 @@ def compute_satisfaction_v6(
                     ev["week_key"] = wk
                     merged_events.append(ev)
             reasoning = parsed.get("reasoning") or parsed.get("no_score_note") or ""
+            # AUDIT: promptul cere obligatoriu `start_state` în răspuns tocmai ca startul să
+            # fie verificabil. Până la 2026-08-20 câmpul era ignorat și breakdown-ul stoca
+            # valoarea trimisă de noi, deci arăta mereu „corect", orice făcea modelul. Acum se
+            # stochează AMBELE: intenția (`start_state`, mereu 50) și ce a raportat modelul.
+            start_model = _parse_pct(parsed.get("start_state"))
             row = {
                 "week_key": wk,
                 "week_start": period["week_start"],
                 "week_end_exclusive": period["week_end_exclusive"],
                 "n_interactions": n_w,
-                "start_state": round(chain_state, 1),
-                "start_state_source": chain_source,
+                "start_state": _NEUTRAL_START,
+                "start_state_source": start_source,
+                "start_state_model": start_model,
+                "start_state_source_model": parsed.get("start_state_source") or None,
+                "start_state_drift": (round(start_model - _NEUTRAL_START, 1)
+                                      if start_model is not None else None),
                 "satisfaction_pct": pct_w,
                 "category": parsed.get("category") or parsed.get("no_score_label"),
                 "trajectory_shape": parsed.get("trajectory_shape"),
@@ -954,16 +953,11 @@ def compute_satisfaction_v6(
                 all_sug.extend(parsed["suggestions"][:3])
             if isinstance(parsed.get("financial_risk"), dict):
                 last_fin = parsed["financial_risk"]
-            # Traiectorie continuă: săptămâna următoare pornește din starea în care s-a
-            # încheiat aceasta. O săptămână fără scor (N/A sau IRIS eșuat) nu rupe lanțul.
-            if pct_w is not None:
-                chain_state = pct_w
-                chain_source = f"stare reportată: săptămâna {wk}"
         weekly_rows.append(row)
-        if i < len(order) - 1:
-            _time.sleep(0.25)
 
-    # Luna = medie ponderată pe interacțiuni (fără apel IRIS lunar)
+    # Luna = media SIMPLĂ a săptămânilor scorate (fără apel IRIS lunar). Săptămânile fără
+    # interacțiuni nu există în `weekly_rows`, deci nu intră în medie; cele care au rulat dar
+    # nu au produs scor (N/A / IRIS eșuat) se exclud tot aici.
     scored = [(r["satisfaction_pct"], r["n_interactions"]) for r in weekly_rows if r.get("satisfaction_pct") is not None]
     if not scored:
         # toate săptămânile N/A / eșec
@@ -984,20 +978,24 @@ def compute_satisfaction_v6(
             },
         )
 
+    week_pcts = [p for p, _ in scored]
     weight_sum = sum(w for _, w in scored) or 1
+    simple_avg_pct = round(_clamp(sum(week_pcts) / len(week_pcts)), 1)
     weighted_avg_pct = round(_clamp(sum(p * w for p, w in scored) / weight_sum), 1)
     last_week_pct = next(
         r["satisfaction_pct"] for r in reversed(weekly_rows) if r.get("satisfaction_pct") is not None
     )
-    aggregation = str(cfg.get("month_aggregation") or "last_week_final")
+    # Media simplă e implicită: o săptămână cântărește cât alta, indiferent câte interacțiuni a
+    # avut (o singură reclamație gravă nu trebuie diluată de un thread administrativ lung).
+    # Celelalte două variante rămân accesibile din settings, ca revert fără redeploy.
+    aggregation = str(cfg.get("month_aggregation") or "avg_weeks")
     if aggregation == "weighted_avg_weeks":
         month_pct = weighted_avg_pct
-    else:
-        aggregation = "last_week_final"
-        # Recența decide (prompt V6, principiile 1 și 18): media ponderată dilua exact
-        # recuperările pe care promptul cere să nu fie plafonate — o criză în săptămâna 1
-        # trăgea în jos o lună încheiată cu reconciliere confirmată.
+    elif aggregation == "last_week_final":
         month_pct = round(_clamp(float(last_week_pct)), 1)
+    else:
+        aggregation = "avg_weeks"
+        month_pct = simple_avg_pct
 
     # raționament agregat (nu IRIS lunar)
     parts = []
@@ -1008,19 +1006,22 @@ def compute_satisfaction_v6(
             f"{r['week_key']}: {r['satisfaction_pct']}% ({r['n_interactions']} interacțiuni)"
             + (f" — {(r.get('iris_reasoning') or '')[:160]}" if r.get("iris_reasoning") else "")
         )
-    if aggregation == "last_week_final":
-        head = (
-            f"Scor lunar = starea finală a ultimei săptămâni scorate ({month_pct}%; "
-            f"{len(scored)} săptămâni scorate, {weight_sum} interacțiuni; "
-            f"medie ponderată pentru comparație: {weighted_avg_pct}%). "
-            f"Punct de start lună: {month_start_state}% ({start_source}). "
-        )
-    else:
-        head = (
-            f"Scor lunar = medie ponderată pe interacțiuni din scorurile săptămânale IRIS "
-            f"({month_pct}%; {len(scored)} săptămâni scorate, {weight_sum} interacțiuni). "
-            f"Punct de start lună: {month_start_state}% ({start_source}). "
-        )
+    _AGG_FORMULA = {
+        "avg_weeks": "sum(week_pct) / weeks_scored",
+        "weighted_avg_weeks": "sum(week_pct * n_interactions) / sum(n_interactions)",
+        "last_week_final": "starea finală a ultimei săptămâni scorate",
+    }
+    _AGG_LABEL = {
+        "avg_weeks": "media simplă a săptămânilor scorate",
+        "weighted_avg_weeks": "media ponderată pe interacțiuni a săptămânilor scorate",
+        "last_week_final": "starea finală a ultimei săptămâni scorate",
+    }
+    head = (
+        f"Scor lunar = {_AGG_LABEL.get(aggregation, aggregation)} ({month_pct}%; "
+        f"{len(scored)} săptămâni scorate din {len(weekly_rows)} cu interacțiuni, "
+        f"{weight_sum} interacțiuni). "
+        f"Fiecare săptămână pornește de la {month_start_state}% ({start_source}). "
+    )
     reasoning = (head + " | ".join(parts))[:1200]
 
     # Sinteză lunară AI — apel suplimentar după scorarea săptămânilor.
@@ -1032,15 +1033,16 @@ def compute_satisfaction_v6(
         "și raționamentele lor pentru o lună. Generează un rezumat lunar de maxim 3 propoziții, "
         "orientat pe acțiune:\n"
         "1. Starea generală a clientului în această lună și principalele probleme sau aspecte pozitive identificate.\n"
-        "2. Trendul față de startul lunii sau față de luna anterioară dacă există.\n"
+        "2. Trendul în interiorul lunii (cum diferă săptămânile între ele).\n"
         "3. Cel mai important risc sau oportunitate de acțiune imediată pentru echipă.\n"
         "NU include calcule, ponderi, numere de apeluri sau explicații metodologice. "
         'Răspunde JSON: {"iris_reasoning": "<rezumat>"}'
     )
     _summary_payload = {
         "scor_final_luna": month_pct,
-        "scor_start_luna": month_start_state,
-        "sursa_start": start_source,
+        "scala": "0-100",
+        "start_fiecare_saptamana": month_start_state,
+        "mod_agregare": _AGG_LABEL.get(aggregation, aggregation),
         "saptamani": [
             {
                 "saptamana": r["week_key"],
@@ -1103,13 +1105,22 @@ def compute_satisfaction_v6(
         "month_start_source": start_source,
         "month_aggregation": aggregation,
         "month_avg_detail": {
+            "weeks_with_interactions": len(weekly_rows),
             "weeks_scored": len(scored),
+            "week_pcts": week_pcts,
             "weight_interactions": weight_sum,
-            "last_week_final_pct": last_week_pct,
+            "simple_avg_pct": simple_avg_pct,
             "weighted_avg_pct": weighted_avg_pct,
-            "formula": ("starea finală a ultimei săptămâni scorate"
-                        if aggregation == "last_week_final"
-                        else "sum(week_pct * n_interactions) / sum(n_interactions)"),
+            "last_week_final_pct": last_week_pct,
+            "formula": _AGG_FORMULA.get(aggregation, aggregation),
+        },
+        # AUDIT start: dacă modelul a raportat alt punct de start decât neutrul trimis, se vede
+        # aici (și în UI). Un drift nenul înseamnă că promptul nu a respectat instrucțiunea.
+        "start_audit": {
+            "sent": month_start_state,
+            "model_reported": [r.get("start_state_model") for r in weekly_rows],
+            "drift_max": (max((abs(d) for d in (r.get("start_state_drift") for r in weekly_rows)
+                               if d is not None), default=None)),
         },
         "iris_holistic": {
             "reasoning": reasoning,
@@ -1119,7 +1130,7 @@ def compute_satisfaction_v6(
     }
     return {
         "satisfaction_pct": month_pct,
-        "is_unsatisfied": month_pct < 70.0,
+        "is_unsatisfied": month_pct < _UNSATISFIED_BELOW,
         "breakdown": breakdown,
         "config_used": config_used,
         "computed_at": now.isoformat(),

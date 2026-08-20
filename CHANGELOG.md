@@ -8,6 +8,86 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.5.0 - 2026-08-20
+
+### MINOR — Satisfacție clienți: start neutru pe fiecare săptămână, scor lunar = media săptămânilor
+
+Adminii au raportat că reportarea stării între luni nu se comporta cum a fost gândită („dacă în
+iulie clientul a ieșit cu 30%, august ar trebui să pornească de la 30%"). Investigația a găsit trei
+probleme, dintre care una face imposibilă chiar și diagnoza:
+
+1. **Promptul mixează două scale fără regulă de conversie.** Taxonomia evenimentelor e pe `-5 … +5`,
+   starea pe `0 … 100`, iar promptul nu spune niciodată cât mișcă un `-3` pe axa 0-100. Modelul
+   inventa conversia: fie citea intensitatea ca puncte pe 0-100 (`reclamatie_generala` = -5 peste
+   50 → 45, adică „Neutru", absurd), fie re-ancora în banda care descria săptămâna și arunca
+   startul reportat.
+2. **Răspunsul modelului despre startul folosit era aruncat.** Promptul cere obligatoriu
+   `start_state` în JSON tocmai ca startul să fie auditabil, dar codul nu îl citea niciodată —
+   scria înapoi valoarea trimisă de noi. Breakdown-ul arăta *mereu* ca dacă reportarea ar fi
+   funcționat, orice ar fi făcut modelul.
+3. **`stare_initiala` din payload nu avea unitate** — un `30.0` gol, fără „scala 0-100", lângă o
+   taxonomie de intensități `-5..+5`.
+
+**Regula de calcul nouă (decizie business):**
+- fiecare **săptămână ISO** cu interacțiuni pornește de la **50 (neutru)** și se evaluează
+  independent — nu se mai reportează stare, nici între săptămâni, nici din luna precedentă;
+- săptămânile fără interacțiuni se sar complet (nu intră în medie, nu contează ca 50);
+- **scorul lunii = media simplă a săptămânilor scorate** — o săptămână cu 1 interacțiune cântărește
+  cât una cu 20; o singură săptămână scorată ⇒ scorul ei e scorul lunii;
+- **scorul vine exclusiv din răspunsul promptului V6** — codul nu ajustează, nu plafonează, nu
+  injectează stare;
+- **prag nesatisfăcut: sub 60%**, granița dintre „Satisfăcut" (60-74) și „Neutru" (45-59) din
+  tabelul de benzi al promptului. Până acum coexistau trei valori: 70 în cod, 90 în documentație
+  (rămas din motorul vechi cu 5 factori) și benzile din prompt. `_segment()` folosește acum
+  aceleași benzi (`sanatos` ≥60, `neutru` 45-59, `la_risc` 30-44, `critic` <30).
+
+**Auditul startului**, adăugat ca să nu se mai repete cazul 2: se stochează atât intenția
+(`weekly_trajectories[].start_state`, mereu 50) cât și ce a raportat modelul
+(`start_state_model`, `start_state_drift`, agregat în `breakdown.start_audit`). Un `drift_max`
+diferit de 0 înseamnă că promptul nu a pornit din neutru — fișa clientului afișează un avertisment
+explicit, nu se mai ascunde în JSON.
+
+**Scala de intensitate din prompt nu a fost atinsă** (decizie explicită: satisfacția e determinată
+exclusiv de promptul V6 și de ce conține el). Dacă un incident grav aterizează la ~45 dintr-un
+start de 50, confuzia de scală de la punctul 1 e confirmată și se rezolvă separat, pe cifre reale.
+
+Cod eliminat: `_previous_month_state()`, `carry_start_state`, `start_lookback_months`, înlănțuirea
+`chain_state` între săptămâni.
+
+### PERFORMANȚĂ — snapshot-ul lunar: de la ~1h la ~10 min pentru 300 de clienți
+
+Descompunerea orei: ~94% era **latență IRIS serializată** (300 clienți × ~3 apeluri × ~4s), din
+care apelurile săptămânale ~79% și sinteza lunară ~15%; sleep-urile fixe erau 5% și interogările
+DB 2% — adică optimizarea lor separată n-ar fi schimbat nimic.
+
+Clienții sunt complet independenți (după eliminarea reportării de stare), deci se procesează acum
+în paralel cu `ThreadPoolExecutor`. Numărul de fire vine din `settings.satisfaction.v6` →
+`max_workers` (implicit **6**, plafon 16), ca să se poată ajusta fără redeploy: gateway-ul IRIS e
+partajat cu clasificarea mailurilor și scorarea apelurilor.
+
+Detalii de implementare:
+- fiecare fir primește **conexiunea lui** psycopg2 (`threading.local`), pe autocommit — o conexiune
+  partajată nu e thread-safe, iar tranzacțiile lungi ar sta deschise cât durează apelurile IRIS;
+- **scrierea rămâne pe un singur fir**: workerul întoarce rândul, nu îl inserează. `BATCH_SIZE=1`
+  se păstrează, deci UI-ul vede în continuare progresul client cu client;
+- pauzele fixe (`AI_CALL_SPACING_SECONDS` de 0.3s după fiecare client, 0.25s între săptămâni) au
+  fost scoase — numărul de fire e acum rate-limit-ul, iar `iris_ai` are deja retry cu backoff pe
+  429/5xx;
+- un client care eșuează incrementează `errors` și rularea continuă (workerul nu propagă excepții).
+
+Verificat local pe 60 de clienți cu IRIS și DB stubuite: **6.0x accelerare** la 6 fire, concurență
+maximă observată exact 6 (plafonul respectat), toate rândurile scrise, iar o excepție injectată pe
+un client a fost izolată corect (59 procesați, 1 eroare).
+
+Sinteza lunară a rămas neschimbată (produce rezumatul afișat în UI).
+
+Migrație: `20260820_satisfaction_unsat_threshold_60.sql` — re-derivă **doar** flagul boolean
+`is_unsatisfied` din `satisfaction_pct`-ul deja stocat (fără apel IRIS, fără schimbare de scor),
+altfel graficul de nesatisfăcuți ar amesteca luni evaluate cu prag 70 și luni cu prag 60.
+**Istoricul nu se rescorează automat** — snapshot-urile de dinainte de 2026-08-20 rămân cu
+valorile produse de logica înlănțuită; rescorarea rămâne disponibilă client-cu-client din
+interfață.
+
 ## v3.4.0 - 2026-08-19
 
 ### MINOR — Analiza apelurilor: întrebări binare reale, filtru pe departament funcțional, scor per apel
