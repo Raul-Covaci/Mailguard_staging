@@ -8,6 +8,24 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.7.1 - 2026-08-24
+
+### PATCH — Confirmarile de inregistrare Urban & Asociatii pleaca toate direct pe SOLVED
+
+Pana acum regula prindea un singur subiect exact (`Inregistrare: Dosar CARGO TRACK SOLUTIONS SRL`),
+dar confirmarile reale vin cu numar de dosar, data, CUI si debitor diferite de fiecare data
+(`UA2018424-10079899/24.08.2026/1 - Inregistrare: Adresa de semnat si stampilat ... debitorul AMAD
+EXPEDITII SRL CUI 47197880`), deci majoritatea intrau ca mailuri normale. Continutul e mereu acelasi
+text de confirmare din arhiva — nu cere raspuns.
+
+Regula prinde acum ORICE mail de la `secretariat@urbansiasociatii.ro` care are „Inregistrare" in
+subiect. Substringul potrivit e `nregistrare`, ca sa prinda si varianta scrisa cu diacritice
+(„Înregistrare"). Restul mailurilor de la aceeasi adresa (oferte, corespondenta reala) raman
+normale.
+
+Migratie: `migrations/20260824_cts_auto_solved_urban.sql` (actualizeaza
+`settings['cts.auto_solved_rules']`, respecta kill-switch-ul `[]`).
+
 ## v3.7.0 - 2026-08-20
 
 ### MINOR — Redirect VATHUB: mailurile oficiale de recuperare TVA pleacă singure spre căsuța comună

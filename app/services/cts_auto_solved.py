@@ -24,7 +24,9 @@ _RULES_KEY = "cts.auto_solved_rules"
 # Editabile din DB FARA deploy prin settings['cts.auto_solved_rules']. [] in DB => dezactivat.
 _DEFAULT_RULES: List[Dict[str, Any]] = [
     {"senders": ["noreply@itsbulgaria.com"], "subject_contains": ["Daily summary for toll products for"]},
-    {"senders": ["secretariat@urbansiasociatii.ro"], "subject_contains": ["Inregistrare: Dosar CARGO TRACK SOLUTIONS SRL"]},
+    # Urban & Asociatii: confirmarile de inregistrare in arhiva (numar dosar/CUI/debitor difera
+    # de fiecare data). Substring fara initiala ca sa prinda si "Înregistrare" cu diacritice.
+    {"senders": ["secretariat@urbansiasociatii.ro"], "subject_contains": ["nregistrare"]},
     {"senders": ["noreply@hu-go.hu"], "subject_contains": ["Vélelmezett jogosulatlan úthasználat miatti riasztás"]},
     {"senders": ["support@expert-erp.net"], "subject_contains": []},
     {"senders": ["notificari@euplatesc.ro", "mis.batch@btrl.ro", "notificari@europayment.services",

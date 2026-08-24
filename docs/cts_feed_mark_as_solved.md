@@ -33,7 +33,7 @@ Reguli (config în `settings['cts.auto_solved_rules']`, editabile fără deploy;
 | # | Expeditor(i) | Subiect conține (oricare) | Exemple |
 |---|---|---|---|
 | 1 | `noreply@itsbulgaria.com` | `Daily summary for toll products for` | #39333, #38071 |
-| 2 | `secretariat@urbansiasociatii.ro` | `Inregistrare: Dosar CARGO TRACK SOLUTIONS SRL` | #36481, #36486 |
+| 2 | `secretariat@urbansiasociatii.ro` | `nregistrare` (orice subiect cu „Inregistrare"/„Înregistrare") | #36481, #36486 |
 | 3 | `noreply@hu-go.hu` | `Vélelmezett jogosulatlan úthasználat miatti riasztás` | #39325, #39082 |
 | 4 | `support@expert-erp.net` | *(orice subiect — doar pe expeditor)* | #39191, #38714 |
 | 5 | `notificari@euplatesc.ro`, `mis.batch@btrl.ro`, `notificari@europayment.services` | `Tranzactii zilnice` **sau** `Tranzactii ecomm` | #38242, #38250, #39284, #39341 |
