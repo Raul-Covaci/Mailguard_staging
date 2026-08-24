@@ -160,12 +160,32 @@ Traseul unui mail prin departamente. Sursa: **`cts_department_moves`** — un r�
 `trg_cts_gt_department_move` pe `cts_ground_truth` (migrația `20260819_cts_department_moves.sql`,
 singurul trigger din proiect; face și backfill din `cts_department_prev`/`changed_at`).
 
-- API: `GET /cts-training/dept-report` (3 statistici + trasee) și `/dept-report/cases` (drill-down).
+- API: `GET /cts-training/dept-report` (3 statistici + trasee) și `/dept-report/cases` (drill-down),
+  ambele cu `source=auto|log|moves`; `GET /dept-report/mail-steps?message_id=` (alocările brute).
 - UI: `CtsMailsShell` (tab-uri) → `CtsDeptReport` în `app/ui/vendor/mg-app.js`.
 - Lanțul se reconstruiește per `message_id`; alocările inițiale ale **replicilor** (CTS face un tichet
   per destinatar) se colapsează la cea mai veche, altfel apar mutări inexistente.
-- Limitare: sync la ~5 min ⇒ mutările din același interval se văd ca una singură; istoricul complet
-  de alocări trebuie cerut de la CTS (task viitor). Cifrele sunt un minim, nu exact.
+- Limitare `cts_department_moves`: sync la ~5 min ⇒ mutările din același interval se văd ca una
+  singură, deci departamentele intermediare se pierd. Cifrele sunt un minim, nu exact.
+
+### 🧾 Sursa completă: `client_contact_email_log` (2026-08-24)
+
+Sursa preferată e acum log-ul CTS, sincronizat ca view IRIS Data Views („Surse date") în
+`cts_dv_client_contact_email_log` — **un rând per alocare**, deci lanțul complet, cu intermediari.
+Motor: `app/services/cts_email_log.py` (`chain_cte()` expune `mail` + `ch` cu ACELEAȘI coloane ca
+`_DEPT_REPORT_CTE`, de aceea endpoint-urile sunt comune). Migrație: `20260824_cts_email_log.sql`.
+
+- `_chain_source()` din `cts_training.py` alege sursa; `auto` = log dacă e sincronizat, altfel
+  `moves`. Nimic nu se strică înainte de primul sync.
+- Tabela e oglindă brută a view-ului: **toate coloanele TEXT**. Cast-urile sunt defensive
+  (`0000-00-00` din MySQL → NULL), iar `%` e evitat în SQL (`left(x,4)` în loc de `LIKE '0000%'`)
+  pentru că procentul e placeholder de parametru la psycopg2.
+- ⚠️ `department_id` e ID CTS, nu slug. Se traduce prin departamentul dominant al angajaților din
+  acel ID (`cts_dv_employee` → `employee_department_mapping`), NICIODATĂ pe egalitate de nume. Un ID
+  netradus apare ca pseudo-slug `cts_<id>` („Departament CTS #id") — nu se aruncă, altfel lanțul ar
+  pierde pași reali; numărul lor e în `coverage.unmapped_departments`.
+- Sync-ul DV creează tabela la runtime cu coloanele primului rând; `_create_local_table_if_needed`
+  face acum și `ADD COLUMN IF NOT EXISTS`, altfel o coloană nouă în view pica sync-ul.
 
 ---
 

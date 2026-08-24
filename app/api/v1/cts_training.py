@@ -20,6 +20,7 @@ from app.database import get_db
 from app.api.v1.auth import get_current_admin
 from app.api.v1.sorting import sort_dir
 from app.services import cts_groundtruth_sync as SYNC
+from app.services import cts_email_log
 from app.services.department_classifier import DEPT_LABELS
 
 logger = logging.getLogger("mailguard.cts_training")
@@ -804,6 +805,30 @@ ch AS (
 """
 
 
+# Sursa lantului de departamente:
+#   'moves' — `cts_department_moves` (trigger pe cts_ground_truth): vede doar tranzitiile prinse
+#             intre doua sincronizari (~5 min) => departamentele intermediare se pierd;
+#   'log'   — `cts_dv_client_contact_email_log` (view IRIS Data Views, pagina „Surse date"):
+#             un rand per alocare, deci lantul complet, cu tot cu intermediari;
+#   'auto'  — 'log' daca view-ul e sincronizat, altfel 'moves' (implicit).
+SOURCES = ("auto", "log", "moves")
+
+
+def _chain_source(db, source: str) -> tuple:
+    """(CTE-ul de folosit, sursa efectiva, disponibilitatea log-ului). Nu arunca daca log-ul
+    lipseste — cade pe 'moves', ca raportul sa functioneze si inainte de primul sync."""
+    src = (source or "auto").strip().lower()
+    if src not in SOURCES:
+        src = "auto"
+    log_ok = cts_email_log.available(db)
+    if src == "log" and not log_ok:
+        return _DEPT_REPORT_CTE, "moves", False
+    if src == "log" or (src == "auto" and log_ok):
+        cts_email_log.ensure_indexes(db)
+        return cts_email_log.chain_cte(), "log", True
+    return _DEPT_REPORT_CTE, "moves", log_ok
+
+
 def _dept_report_params(date_from: str, date_to: str, department: str, only_solved: int) -> dict:
     """Normalizeaza filtrele comune ale raportului (date invalide -> ignorate, nu 400)."""
     from datetime import date as _date
@@ -823,6 +848,10 @@ def _dept_report_params(date_from: str, date_to: str, department: str, only_solv
 
 
 def _lbl(slug):
+    """Eticheta unui departament. `cts_<id>` = department_id din CTS pentru care nu avem inca
+    niciun angajat mapat — se arata ca atare, nu se ascunde: altfel lantul ar sari pasi reali."""
+    if slug and slug.startswith("cts_") and slug[4:].isdigit():
+        return "Departament CTS #" + slug[4:]
     return DEPT_LABELS.get(slug, slug or "—")
 
 
@@ -837,14 +866,16 @@ def cts_training_dept_report(
     department: str = Query("", description="doar mailurile care au trecut prin acest departament"),
     only_solved: int = Query(0, description="1 = doar mailurile inchise (solved)"),
     top: int = Query(10, ge=3, le=30),
+    source: str = Query("auto", description="auto | log (client_contact_email_log) | moves (cts_department_moves)"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
     """Cele 3 statistici de mutari intre departamente + perechile din-in (pentru drill-down)."""
     params = _dept_report_params(date_from, date_to, department, only_solved)
+    CTE, src, log_ok = _chain_source(db, source)
 
     # 1) Distributia mailurilor dupa numarul de mutari (0 / 1 / 2 / 3+)
-    dist_rows = db.execute(text(_DEPT_REPORT_CTE + """
+    dist_rows = db.execute(text(CTE + """
         SELECT LEAST(steps - 1, 3) AS bucket, count(*) AS emails, sum(steps - 1) AS moves
           FROM (SELECT message_id, max(steps) AS steps FROM ch GROUP BY message_id) t
          GROUP BY 1 ORDER BY 1
@@ -861,7 +892,7 @@ def cts_training_dept_report(
 
     # 2) Top departamente care fac mutari: la fiecare pas care NU e ultimul, departamentul
     #    de pe care pleaca mailul a initiat o mutare.
-    init_rows = db.execute(text(_DEPT_REPORT_CTE + """
+    init_rows = db.execute(text(CTE + """
         SELECT dep, count(*) AS n FROM ch WHERE step < steps GROUP BY dep ORDER BY n DESC
     """), params).fetchall()
     init_total = sum(int(r._mapping["n"]) for r in init_rows)
@@ -871,7 +902,7 @@ def cts_training_dept_report(
 
     # 3) Top departamente intermediare: pasi care nu sunt nici primul (alocarea initiala),
     #    nici ultimul (unde s-a oprit / s-a inchis mailul).
-    mid_rows = db.execute(text(_DEPT_REPORT_CTE + """
+    mid_rows = db.execute(text(CTE + """
         SELECT dep, count(*) AS n FROM ch WHERE step > 1 AND step < steps GROUP BY dep ORDER BY n DESC
     """), params).fetchall()
     mid_total = sum(int(r._mapping["n"]) for r in mid_rows)
@@ -880,7 +911,7 @@ def cts_training_dept_report(
                       for r in mid_rows][:top]
 
     # Perechile din -> in (traseele concrete), pentru tabelul de sub grafice.
-    pair_rows = db.execute(text(_DEPT_REPORT_CTE + """
+    pair_rows = db.execute(text(CTE + """
         SELECT f, t, count(*) AS n FROM (
             SELECT message_id, dep AS t,
                    lag(dep) OVER (PARTITION BY message_id ORDER BY step) AS f
@@ -892,12 +923,22 @@ def cts_training_dept_report(
               "n": int(r._mapping["n"]), "pct": _pct(int(r._mapping["n"]), total_moves)}
              for r in pair_rows]
 
-    # Acoperire: de cand avem captura completa (trigger) vs. ce s-a putut reconstitui la migrare.
-    cov = db.execute(text(
-        "SELECT count(*) FILTER (WHERE detected_by='trigger') AS live, "
-        "       count(*) FILTER (WHERE detected_by='backfill') AS backfilled, "
-        "       min(moved_at) FILTER (WHERE detected_by='trigger') AS live_since "
-        "  FROM cts_department_moves")).fetchone()
+    # Acoperire: pe 'moves' = captura din trigger vs. backfill; pe 'log' = cat cuprinde log-ul CTS.
+    if src == "log":
+        lc = cts_email_log.coverage(db)
+        coverage = {"source": "log", "rows": lc["rows"], "mails": lc["mails"],
+                    "first_at": lc["first_at"], "last_at": lc["last_at"],
+                    "unmapped_departments": lc["unmapped_departments"]}
+    else:
+        cov = db.execute(text(
+            "SELECT count(*) FILTER (WHERE detected_by='trigger') AS live, "
+            "       count(*) FILTER (WHERE detected_by='backfill') AS backfilled, "
+            "       min(moved_at) FILTER (WHERE detected_by='trigger') AS live_since "
+            "  FROM cts_department_moves")).fetchone()
+        coverage = {"source": "moves",
+                    "live_events": int(cov._mapping["live"] or 0),
+                    "backfilled_events": int(cov._mapping["backfilled"] or 0),
+                    "live_since": cov._mapping["live_since"]}
 
     moved = total_emails - (distribution[0]["emails"] if distribution else 0)
     return {
@@ -912,11 +953,9 @@ def cts_training_dept_report(
         "initiators": initiators,
         "intermediaries": intermediaries,
         "pairs": pairs,
-        "coverage": {
-            "live_events": int(cov._mapping["live"] or 0),
-            "backfilled_events": int(cov._mapping["backfilled"] or 0),
-            "live_since": cov._mapping["live_since"],
-        },
+        "coverage": coverage,
+        "source": src,
+        "log_available": log_ok,
         "filters": {"date_from": params["date_from"], "date_to": params["date_to"],
                     "department": params["dept"], "only_solved": params["only_solved"]},
     }
@@ -931,6 +970,7 @@ def cts_training_dept_report_cases(
     min_moves: int = Query(1, ge=0, le=10),
     dept_from: str = Query("", description="departamentul care a initiat o mutare"),
     dept_mid: str = Query("", description="departament aparut ca INTERMEDIAR pe lant"),
+    source: str = Query("auto", description="auto | log | moves"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -940,13 +980,14 @@ def cts_training_dept_report_cases(
 
     Filtrele `dept_from` / `dept_mid` corespund click-ului pe o linie din statistica 2 / 3."""
     params = _dept_report_params(date_from, date_to, department, only_solved)
+    CTE, src, _log_ok = _chain_source(db, source)
     d_from = (dept_from or "").strip() or None
     d_mid = (dept_mid or "").strip() or None
     params.update({"min_moves": min_moves,
                    "d_from": d_from if d_from in DEPT_LABELS else None,
                    "d_mid": d_mid if d_mid in DEPT_LABELS else None})
 
-    per_mail = _DEPT_REPORT_CTE + """
+    per_mail = CTE + """
     , agg AS (
         SELECT c.message_id,
                max(c.steps) - 1 AS moves,
@@ -987,4 +1028,55 @@ def cts_training_dept_report_cases(
         "solved_at": m["solved_at"], "is_solved": bool(m["is_solved"]),
         "subject": m["subject"], "from_address": m["from_address"], "received_at": m["received_at"],
     } for m in (r._mapping for r in rows)]
-    return {"total": int(total), "page": page, "page_size": page_size, "items": items}
+    return {"total": int(total), "page": page, "page_size": page_size,
+            "source": src, "items": items}
+
+
+@router.get("/cts-training/dept-report/mail-steps")
+def cts_training_dept_report_mail_steps(
+    message_id: str = Query(..., description="message_id al mailului (cheia de grupare din raport)"),
+    db: Session = Depends(get_db),
+    admin=Depends(get_current_admin),
+):
+    """Pasii BRUTI ai unui mail din `client_contact_email_log` — un rand per alocare, fara
+    colapsare: departament, cine l-a preluat, status, cand. Asta e nivelul la care se vede
+    „de ce s-a mutat" (inclusiv departamentele intermediare pierdute de raportul pe `moves`).
+
+    404 daca view-ul nu e sincronizat inca — raportul pe `moves` nu are datele astea."""
+    if not cts_email_log.available(db):
+        raise HTTPException(404, "View-ul client_contact_email_log nu e sincronizat "
+                                 "(Surse date → client_contact_email_log → Sincronizează).")
+    steps = cts_email_log.steps_for_mail(db, (message_id or "").strip())
+    out = []
+    prev = None
+    for st in steps:
+        dep = st.get("dep")
+        out.append({
+            "log_id": st.get("log_id"),
+            "department": dep,
+            "department_label": _lbl(dep),
+            "cts_department_id": st.get("dept_id"),
+            "folder_id": st.get("folder_id"),
+            "responsible_id": st.get("responsible_id"),
+            "responsible_name": st.get("responsible_name"),
+            "status": st.get("status"),
+            "title": st.get("title"),
+            "event_at": st.get("event_at"),
+            "assigned_at": st.get("assigned_at"),
+            "solved_at": st.get("solved_at"),
+            "updated_at": st.get("updated_at"),
+            # is_move=False pe replicile per destinatar (acelasi departament la rand)
+            "is_move": bool(prev is not None and dep != prev),
+        })
+        prev = dep
+    chain = []
+    for st in out:
+        if not chain or chain[-1] != st["department"]:
+            chain.append(st["department"])
+    return {
+        "message_id": message_id,
+        "steps": out,
+        "chain": chain,
+        "chain_labels": [_lbl(c) for c in chain],
+        "moves": max(len(chain) - 1, 0),
+    }

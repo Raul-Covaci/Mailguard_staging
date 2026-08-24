@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.8.0 - 2026-08-24
+
+### MINOR — „Raport departamente" citește log-ul CTS: apar și departamentele intermediare
+
+Până acum lanțul de departamente al unui mail se reconstruia din `cts_department_moves` — tabelă
+scrisă de trigger la fiecare schimbare **observată de sync**. Sync-ul rulează la ~5 minute, deci
+două mutări făcute între două rulări se vedeau ca una singură și departamentul din mijloc dispărea:
+`Suport 1 → Contabilitate → Taxe drum` apărea ca `Suport 1 → Taxe drum`. De aceea INDICE 3
+(„Departamente intermediare") raporta mult sub realitate.
+
+Sursă nouă: **`client_contact_email_log`** din CTS, sincronizat ca orice view IRIS Data Views din
+pagina „Surse date" în `cts_dv_client_contact_email_log`. Are un rând per alocare (mail × folder),
+deci lanțul e complet în date, nu dedus din diferențe.
+
+- Selector „Sursă" în bara de filtre: **Automată** (log dacă e sincronizat, altfel istoricul vechi),
+  **Log CTS (complet)**, **Istoric sync (vechi)**. Toate cele 3 statistici, traseele și lista de
+  cazuri concrete se recalculează pe sursa aleasă; badge-ul de lângă selector arată tabela folosită.
+- Buton **„Traseu"** pe fiecare mail din lista de cazuri → toate alocările brute din log:
+  departament, cine a preluat, status, când. Ăsta e nivelul la care se vede „de ce s-a mutat".
+- `department_id` din CTS se traduce în departamentul nostru prin angajații mapați
+  (`cts_dv_employee` → `employee_department_mapping`), aceeași treaptă ca la reclamații/productivitate
+  — niciodată pe egalitate de nume. Un `department_id` fără angajați mapați NU se aruncă: apare ca
+  „Departament CTS #id", altfel lanțul ar pierde exact pașii care ne interesează. Câte astfel de
+  ID-uri există se scrie în nota de acoperire de sub raport.
+- Replicile per destinatar (CTS scrie un rând per destinatar) se colapsează, ca să nu apară mutări
+  inexistente; rândurile șterse și datele MySQL invalide (`0000-00-00`) se ignoră.
+
+API: `GET /cts-training/dept-report` și `/dept-report/cases` acceptă `source=auto|log|moves`;
+`GET /cts-training/dept-report/mail-steps?message_id=…` întoarce alocările brute ale unui mail.
+Migrație: `migrations/20260824_cts_email_log.sql`.
+
+⚠️ Raportul rămâne pe sursa veche până la primul sync al view-ului („Surse date" →
+`client_contact_email_log` → Sincronizează). Nimic nu se strică între timp: „Automată" cade singură
+pe `cts_department_moves`.
+
 ## v3.7.1 - 2026-08-24
 
 ### PATCH — Confirmarile de inregistrare Urban & Asociatii pleaca toate direct pe SOLVED

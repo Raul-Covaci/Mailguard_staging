@@ -237,14 +237,19 @@ def _local_table_name(view_name: str) -> str:
 def _create_local_table_if_needed(db: Session, view_name: str, columns: list):
     tbl = _local_table_name(view_name)
     # gardă defensivă — apelantul filtrează deja, dar identificatorii nu pot fi bind params
-    col_defs = ", ".join(f'"{c}" TEXT' for c in columns
-                         if c != "id" and _IDENT_RE.match(c or ""))
+    safe_cols = [c for c in columns if c != "id" and _IDENT_RE.match(c or "")]
+    col_defs = ", ".join(f'"{c}" TEXT' for c in safe_cols)
     db.execute(text(f"""
         CREATE TABLE IF NOT EXISTS {tbl} (
             "id" TEXT NOT NULL PRIMARY KEY,
             {col_defs}
         )
     """))
+    # Drift de schemă: `CREATE TABLE IF NOT EXISTS` nu adaugă coloanele apărute în view DUPĂ
+    # prima sincronizare (sau declarate într-o migrație cu mai puține coloane), iar INSERT-ul
+    # de mai jos le enumeră pe toate -> sync-ul ar pica pe „column does not exist".
+    for c in safe_cols:
+        db.execute(text(f'ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS "{c}" TEXT'))
     db.commit()
 
 
