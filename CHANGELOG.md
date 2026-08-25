@@ -8,6 +8,18 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.2 - 2026-08-25
+
+### PATCH — donut-ul de la INDICE 1 ("Mutări per mail") era mereu gol
+
+Bug preexistent (introdus în `b1b9edf`, feature-ul inițial „Raport departamente" — nu ține de
+sesiunea curentă): `ProdPieChart` avea `if (bare) return h('div', ...)` **în interiorul**
+`useEffect`-ului care creează instanța Chart.js, nu în corpul de randare al componentei. Pentru
+`bare: true` (singurul loc unde e folosit: donut-ul INDICE 1 din „Raport departamente"), efectul
+ieșea înainte să apuce să creeze `new Chart(...)`, deci canvas-ul rămânea gol mereu, indiferent de
+date. Mutat `if (bare) return ...` din `useEffect` în return-ul componentei — efectul rulează
+acum normal și pentru `bare: true`.
+
 ## v3.9.1 - 2026-08-25
 
 ### PATCH — a treia sursă pentru „Raport departamente": log-ul de MUTĂRI

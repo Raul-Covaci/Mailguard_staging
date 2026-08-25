@@ -10727,7 +10727,6 @@ function ProdPieChart({ title, labels, data, colors, note, height, bare }) {
     if (!C || !canvasRef.current) return;
     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
     if (!labels || !labels.length) return;
-  if (bare) return h('div', { style: { height: (height || 220) + 'px', position: 'relative' } }, h('canvas', { ref: canvasRef }));
     var txt = prodCssVar('--t2') || 'gray';
     var cols = (colors && colors.length) ? colors : [prodCssVar('--bl'), prodCssVar('--gn'), prodCssVar('--yw'), prodCssVar('--rd'), prodCssVar('--am'), prodCssVar('--t3')];
     chartRef.current = new C(canvasRef.current, {
@@ -10746,6 +10745,7 @@ function ProdPieChart({ title, labels, data, colors, note, height, bare }) {
     return function() { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
   }, [sig]);
   if (!labels || !labels.length) return h('div', { className: 'card', style: { marginTop: 14, padding: '16px 18px', color: 'var(--t3)', fontSize: 13 } }, 'Nu sunt date suficiente.');
+  if (bare) return h('div', { style: { height: (height || 220) + 'px', position: 'relative' } }, h('canvas', { ref: canvasRef }));
   return h('div', { className: 'card', style: { marginTop: 14, padding: '14px 16px 10px' } }, [
     h('div', { key: 'hd', style: { marginBottom: note ? 4 : 10 } }, h('span', { style: { fontSize: 13, fontWeight: 700 } }, title)),
     note ? h('div', { key: 'nt', style: { fontSize: 12, color: 'var(--t3)', marginBottom: 10 } }, note) : null,
