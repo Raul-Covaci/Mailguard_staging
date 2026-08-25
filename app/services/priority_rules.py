@@ -20,6 +20,7 @@ RULE_PAYMENT = "pay_proof"      # dovada/confirmare de plata explicita
 RULE_OP = "pay_op"             # ordin de plata (OP) trimis de client
 RULE_ATTACHMENT = "pay_attachment"  # atasament cu nume clar de OP/dovada
 RULE_URGENCY = "urgency"       # disperare / urgenta clara
+RULE_SCOUT = "scout_report"     # raport intern "Email Scout Report" (office@cargotrack.ro)
 
 
 def _fold(s: str) -> str:
@@ -147,16 +148,41 @@ def _attachment_strict_hit(att_names: str) -> bool:
     return False
 
 
+# --- Raport intern "Email Scout Report" (office@cargotrack.ro) -> P4, FORTAT ---
+# E un raport generat de aplicatie, nu o cerere de client. Contine citate din mailuri (inclusiv
+# OP-uri / dovezi de plata), deci ajungea pe P2 prin regulile de plata sau prin seria OP extrasa
+# de vision AI. `match_forced` se evalueaza INAINTEA oricarui alt semnal (vezi
+# priority_classifier._classify_priority_core), deci nimic nu il mai poate urca.
+_SCOUT_FROM = "office@cargotrack.ro"
+_SCOUT_SUBJECT = "email scout report"
+
+
+def match_forced(email: dict):
+    """Reguli care bat ORICE alt semnal de prioritate (inclusiv ai_op_series). Altfel None."""
+    hay_from = _fold((email.get("from_address") or "") + " " + (email.get("from_name") or ""))
+    subj = _fold(email.get("subject") or "")
+    if _SCOUT_FROM in hay_from and _SCOUT_SUBJECT in subj:
+        return {"id": RULE_SCOUT, "tier": "P4",
+                "note": "Email Scout Report de la office@cargotrack.ro -> P4 (raport intern)."}
+    return None
+
+
 def match(email: dict, att_names: str = ""):
     """Returneaza dict {id, tier, note} pentru primul semnal determinist care loveste, altfel None.
 
     Precedenta P2 > P3: intai PLATILE (P2), apoi urgenta/furie fara plata (P3).
+      0.0) regula FORTATA (Email Scout Report) -> P4, inaintea oricarui alt semnal;
       0) mail automat/template CargoTrack -> None (decide AI);
       1) dovada/confirmare de plata explicita -> P2 (plata);
       2) subiect care e un OP (ordin de plata) trimis de client -> P2 (plata);
       3) atasament cu nume clar de OP/dovada de plata -> P2 (plata);
       4) disperare / urgenta clara, FARA plata -> P3 (sesizare/reclamatie).
     """
+    # 0.0) Reguli fortate (raport intern) — bat orice alt semnal.
+    forced = match_forced(email)
+    if forced:
+        return forced
+
     subj = _fold(email.get("subject") or "")
     body = _new_body(email)
 

@@ -79,6 +79,12 @@ DEFAULT_RULES = [
     {"department": "contabilitate", "from": "urbansiasociatii.ro", "subject": "", "note": "URBAN & ASOCIATII"},
     {"department": "contabilitate", "from": "mis.batch@btrl.ro", "subject": "", "note": "extrase BTRL"},
     {"department": "contabilitate", "from": "", "subject": "Tranzactii zilnice", "note": "tranzactii zilnice CARGOTRACK"},
+    # --- Suport 1 ---
+    # Raport intern generat de aplicatie, trimis de pe office@cargotrack.ro. NU e cerere de
+    # client: nu are serie de factura, dar contine citate din mailuri (inclusiv OP-uri), deci
+    # AI-ul il ducea pe Contabilitate. Regula pe from+subiect il tine FIX pe Suport 1.
+    {"id": "scout-report-01", "department": "suport_1", "from": "office@cargotrack.ro",
+     "subject": "Email Scout Report", "note": "Email Scout Report (office@) -> Suport 1"},
     # --- Suport 3 (Zoli Tyepak) ---
     {"department": "suport_3", "from": "zoli", "subject": "", "note": "Zoli Tyepak (nume)"},
     {"department": "suport_3", "from": "tyepak", "subject": "", "note": "Zoli Tyepak (nume)"},

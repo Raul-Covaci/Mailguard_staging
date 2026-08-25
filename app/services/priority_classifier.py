@@ -7,6 +7,8 @@ Schema unificata pe 4 niveluri (precedenta P2 > P3 > P4 > P5; cel mai mic numar 
   P5 = GENERAL / restul (pot astepta mai mult).
 
 Stocat in emails.ai_priority = "2"|"3"|"4"|"5". Decizia:
+  0) Reguli FORTATE (priority_rules.match_forced) — bat orice alt semnal, inclusiv seria OP
+     extrasa de vision AI. Azi: "Email Scout Report" de la office@cargotrack.ro -> P4.
   1) Reguli deterministe (priority_rules.match): plata -> P2; urgenta/furie -> P3 (confidence 1.0).
   2) Altfel AI: clasificare directa pe tier (NU scor de urgenta), folosind subiect + corp + numele
      atasamentelor + categoria deja stabilita (sesizare/reclamatie -> semnal puternic P3).
@@ -186,11 +188,25 @@ def _classify_priority_core(email: Dict[str, Any],
                             category: Optional[str] = None) -> Dict[str, Any]:
     """Rezultat brut (intern P2..P5).
 
+    0) Reguli fortate (Email Scout Report -> P4), inaintea oricarui alt semnal.
     1) Reguli deterministe (plata -> P2; urgenta/furie -> P3) — confidence 1.0.
     2) Altfel AI -> tier {P2|P3|P4|P5} (clasificare, nu scor).
     3) Orice esec / continut insuficient / AI neconfigurat -> P5 (fallback general).
     """
     att_names = _attachment_names(email, attachments)
+
+    # 0.0) Reguli FORTATE — inaintea oricarui alt semnal, inclusiv seria OP de la vision AI.
+    # Un raport intern ("Email Scout Report") citeaza mailuri de client, deci poate contine o
+    # serie OP care l-ar urca pe P2 desi nu e o plata a nimanui.
+    try:
+        forced = priority_rules.match_forced(email)
+    except Exception as e:
+        logger.warning("priority forced rules failed: %s", e)
+        forced = None
+    if forced:
+        return {"priority": forced.get("tier", "P4"),
+                "reason": forced.get("note") or "Regula determinista fortata de prioritate.",
+                "model": "rule", "rule_id": forced.get("id")}
 
     # 0.5) Daca vision AI a extras deja o serie OP (ai_op_series), e clar un ordin de plata -> P2.
     # ai_op_series e populat de op_extractor.py doar cand recunoaste o serie valida pe document;

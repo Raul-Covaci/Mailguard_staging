@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.8.2 - 2026-08-25
+
+### PATCH — „Email Scout Report" (office@cargotrack.ro): fortat pe Suport 1 + P4
+
+Raportul intern „Email Scout Report", trimis de pe `office@cargotrack.ro`, ajungea pe
+**Contabilitate** — citeaza mailuri de client, deci AI-ul vedea serii de factura si sume in corp
+si il incadra contabil. Nu e cerere de client, e raport intern.
+
+- **Departament**: regula determinista noua `scout-report-01` (`from=office@cargotrack.ro` +
+  `subject=Email Scout Report` -> `suport_1`). Doua criterii, deci bate regulile mai putin
+  specifice si e evaluata inaintea celor pe corp; prinde si `Re:` / `FW:` si subiectele cu sufix.
+- **Prioritate**: **P4**, fortat. Regulile de prioritate sunt in cod, nu editabile din UI:
+  `priority_rules.match_forced()` se evalueaza INAINTEA oricarui alt semnal — inclusiv inaintea
+  seriei OP extrase de vision AI (`ai_op_series`) si a regulilor de plata, care altfel urcau
+  raportul pe P2 din OP-urile citate in el.
+- Migratie `20260825_scout_report_rule.sql`: regulile de departament sunt seedate o singura data
+  in `settings['department_rules']`, deci adaugarea in `DEFAULT_RULES` nu ajunge pe o baza deja
+  initializata. Migratia adauga regula in store-ul existent, idempotent (dupa `id`).
+
+Regula de departament ramane editabila din Setari; cea de prioritate se schimba doar in cod.
+
 ## v3.8.1 - 2026-08-25
 
 ### PATCH — Incadrarea pe departament urmareste ULTIMUL reply intern, nu orice angajat din thread
