@@ -835,6 +835,10 @@ def _chain_source(db, source: str) -> tuple:
 
     if src == "deptlog" or (src == "auto" and dept_ok):
         cts_dept_log.ensure_indexes(db)
+        # Indexurile log-ului de alocari sint necesare SI pe sursa 'deptlog': de acolo se citesc
+        # responsabilii (cautare pe message_id / mid), altfel lookup-ul lor scaneaza toata tabela.
+        if log_ok:
+            cts_email_log.ensure_indexes(db)
         return cts_dept_log.chain_cte(db), "deptlog", log_ok
     if src == "log" or (src == "auto" and log_ok):
         cts_email_log.ensure_indexes(db)
@@ -1043,7 +1047,16 @@ def cts_training_dept_report_cases(
         "resp": resp,
     })
 
-    per_mail = CTE + """
+    # Filtrul pe responsabil: o LISTA de chei calculata cu O SINGURA scanare a log-ului, in loc
+    # de un EXISTS corelat per rand (vezi nota din cts_email_log.py — de acolo veneau cele ~21 s).
+    resp_cte = ""
+    resp_filter = ""
+    if resp:
+        resp_cte = ("\n    , " + cts_email_log.admin_map_cte().strip()
+                    + "\n    , " + cts_email_log.responsible_keys_cte().strip())
+        resp_filter = "AND a.message_id IN (SELECT message_id FROM resp_keys)"
+
+    per_mail = CTE + resp_cte + """
     , trans AS (
         SELECT message_id, dep AS t,
                lag(dep) OVER (PARTITION BY message_id ORDER BY step) AS f
@@ -1077,7 +1090,6 @@ def cts_training_dept_report_cases(
         SELECT a.message_id, a.moves, a.chain, a.first_dep, a.last_dep,
                a.first_at, a.last_move_at, m.email_id, m.solved_at, m.is_solved,
                e.subject, e.from_address, e.received_at
-               RESP_COL
           FROM agg a
           JOIN mail m ON m.message_id = a.message_id
           LEFT JOIN emails e ON e.id = m.email_id
@@ -1086,29 +1098,18 @@ def cts_training_dept_report_cases(
                 OR position(lower(CAST(:q AS text)) in lower(COALESCE(e.subject, ''))) > 0
                 OR position(lower(CAST(:q AS text)) in lower(COALESCE(e.from_address, ''))) > 0
                 OR position(lower(CAST(:q AS text)) in lower(a.message_id)) > 0)
-           RESP_FILTER
+           """ + resp_filter + """
     )
     """
-    # Responsabilul se citeste din `client_contact_email_log` (unde exista coloana), pe cheia
-    # comuna `message_id` — valabila si cand lantul principal vine din `deptlog`. Fara acel
-    # view sincronizat (indiferent de `src`), coloana si filtrul dispar din SQL.
-    if resp_ok:
-        per_mail = per_mail.replace(
-            "RESP_COL", ", " + cts_email_log.responsibles_select_sql("m.message_id") + " AS responsibles")
-        per_mail = per_mail.replace(
-            "RESP_FILTER",
-            ("AND (CAST(:resp AS text) IS NULL OR "
-             + cts_email_log.responsible_exists_sql("m.message_id") + ")"))
-    else:
-        per_mail = per_mail.replace("RESP_COL", "").replace("RESP_FILTER", "")
 
     order = {"recent": "last_move_at DESC NULLS LAST",
              "oldest": "first_at ASC NULLS LAST"}.get(
                  (sort or "").strip().lower(), "moves DESC, last_move_at DESC")
 
-    total = db.execute(text(per_mail + " SELECT count(*) FROM rowsq"), params).scalar() or 0
+    # O SINGURA executie a lantului: totalul vine din `count(*) OVER ()`, nu dintr-un al doilea
+    # `SELECT count(*)` peste acelasi CTE (care il recalcula integral).
     rows = db.execute(text(per_mail + f"""
-        SELECT * FROM rowsq
+        SELECT *, count(*) OVER () AS total_rows FROM rowsq
          ORDER BY {order}
          LIMIT :page_size OFFSET :offset
     """), dict(params, page_size=page_size, offset=(page - 1) * page_size)).fetchall()
@@ -1122,8 +1123,25 @@ def cts_training_dept_report_cases(
         "first_at": m["first_at"], "last_move_at": m["last_move_at"],
         "solved_at": m["solved_at"], "is_solved": bool(m["is_solved"]),
         "subject": m["subject"], "from_address": m["from_address"], "received_at": m["received_at"],
-        "responsibles": m.get("responsibles"),
+        "responsibles": None,
     } for m in (r._mapping for r in rows)]
+
+    # `count(*) OVER ()` se evalueaza INAINTE de LIMIT/OFFSET, deci e totalul real al setului.
+    # Singurul caz in care nu-l avem e o pagina goala (offset peste sfarsit) — atunci, si numai
+    # atunci, se mai face o interogare de numarare.
+    if rows:
+        total = int(rows[0]._mapping["total_rows"])
+    elif page > 1:
+        total = int(db.execute(text(per_mail + " SELECT count(*) FROM rowsq"), params).scalar() or 0)
+    else:
+        total = 0
+
+    # Responsabilii se aduc BATCH, doar pentru mailurile afisate (o interogare, chei indexate).
+    if resp_ok and items:
+        names = cts_email_log.responsibles_for_mails(db, [i["message_id"] for i in items])
+        for it in items:
+            it["responsibles"] = names.get(it["message_id"])
+
     return {"total": int(total), "page": page, "page_size": page_size,
             "source": src, "items": items,
             "responsible_filter_available": resp_ok,

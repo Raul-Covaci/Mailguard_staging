@@ -115,10 +115,15 @@ fi
 #    servita direct de aplicatie (_GZIP_FILES in app/main.py). Daca .gz rimine
 #    vechi, browserul primeste cod vechi desi sursa e noua — exact capcana
 #    "restartul nu recompileaza frontend-ul".
+#
+#    Verificarea e pe CONTINUT, nu pe mtime: `git pull` scrie fisierele cu ora
+#    checkout-ului, deci `-nt` poate raporta ".gz e la zi" peste un .gz vechi — exact
+#    cum s-a intimplat pe staging (25.08: .js nou, .gz din 19.08, interfata veche in
+#    browser fiindca aplicatia serveste .gz cind browserul accepta gzip).
 # ---------------------------------------------------------------------------
 if [ -f "$VENDOR_JS" ]; then
-  if [ ! -f "${VENDOR_JS}.gz" ] || [ "$VENDOR_JS" -nt "${VENDOR_JS}.gz" ]; then
-    log "regenerez mg-app.js.gz..."
+  if [ ! -f "${VENDOR_JS}.gz" ] || ! gzip -dc "${VENDOR_JS}.gz" 2>/dev/null | cmp -s - "$VENDOR_JS"; then
+    log "regenerez mg-app.js.gz (continut diferit de sursa)..."
     gzip -9 -c "$VENDOR_JS" > "${VENDOR_JS}.gz.tmp" && mv "${VENDOR_JS}.gz.tmp" "${VENDOR_JS}.gz"
     log "gzip ok ($(du -h "${VENDOR_JS}.gz" | cut -f1))"
   else

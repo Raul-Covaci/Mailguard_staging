@@ -1236,9 +1236,9 @@ function CtsDeptReport() {
   var statsRow = h('div', { key: 'stats', style: { display: 'flex', flexDirection: 'column', marginTop: 4 } }, [
     statPanel('s1', 1, 'Mutări per mail', 'De câte ori a schimbat mailul departamentul, de la intrare până la închidere.', '#3b82f6',
       miniTable(['Nr. mutări', 'Mailuri', '%'], distRows, 'Fără date.'),
-      h(ProdPieChart, { bare: true, height: 240, labels: DIST_SHORT,
-        data: [0, 1, 2, 3].map(function(b){ var r = dist.filter(function(x){ return x.bucket === b; })[0]; return r ? r.emails : 0; }),
-        colors: DIST_COLORS })),
+      // Bare orizontale (nu donut): aceeași citire ca INDICE 2/3, iar bucket-urile cu 0 mailuri
+      // rămân vizibile ca linie goală, în loc să dispară din cerc.
+      distRows.length ? barChartFor(distRows, '#3b82f6') : chartPlaceholder('Niciun mail cu departament alocat pe intervalul filtrat.')),
 
     statPanel('s2', 2, 'Cine face mutările', 'La fiecare mutare se numără departamentul de pe care pleacă mailul. Top 10.', '#a855f7',
       miniTable(['Departament', 'Mutări', '%'], initRows, 'Nicio mutare pe intervalul filtrat.'),

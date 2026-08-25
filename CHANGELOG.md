@@ -8,6 +8,44 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.10.0 - 2026-08-25
+
+### PATCH — /cases dura ~21 s: numele responsabililor se citeau cu un scan complet PER RÂND
+
+Coloana „Responsabili" (și filtrul după responsabil) potriveau mailul cu
+`l2."message_id" = <cheie> OR ('mid:' || l2."mid") = <cheie>` — un OR pe o expresie, deci
+neindexabil: Postgres scana toată tabela `cts_dv_client_contact_email_log` (~1,2 mil. rânduri pe
+staging, ~1,1 s) o dată pentru fiecare caz din raport. La 98 de cazuri ⇒ ~21 s per cerere.
+
+- numele se aduc acum **batch**, o singură dată, doar pentru rândurile paginii afișate, cu
+  `= ANY(...)` pe coloanele indexate (`responsibles_for_mails`);
+- filtrul pe responsabil devine o listă de chei calculată cu **o singură** scanare
+  (`responsible_keys_cte`), folosită apoi ca `IN`;
+- `admin_map` (admin CTS → nume angajat) se rezolvă o dată, nu printr-un LATERAL per rând;
+- totalul vine din `count(*) OVER ()` — lanțul de departamente se mai execută **o singură dată**
+  per cerere, nu de două ori (count + pagină);
+- `dept-report/mail-steps` și dropdown-ul de responsabili: aceleași scanări eliminate.
+
+Rezultatele sunt identice cu cele vechi (verificat pe filtru și pe coloana de nume).
+
+### PATCH — sursa `deptlog`: produs cartezian în CTE-ul `mail`
+
+`ev1 LEFT JOIN mv ON message_id` unea două seturi cu mai multe rânduri per mail (pași × mutări)
+doar ca să recalculeze aceleași agregate. Acum starea mailului se agregă o dată (`mail_attr`), iar
+`gt` se restrânge la tichetele care apar efectiv în log — nu mai agregă toată `cts_ground_truth`.
+
+### FIX — INDICE 1 „Mutări per mail": bare orizontale în loc de donut
+
+Aceeași citire ca la INDICE 2/3, iar bucket-urile cu 0 mailuri rămân vizibile ca linie goală.
+
+### FIX — deploy: `mg-app.js.gz` rămânea vechi, deci browserul primea interfața veche
+
+Verificarea „e la zi?" era pe **mtime** (`.js -nt .gz`), dar `git pull` scrie fișierele cu ora
+checkout-ului, așa că `.gz` din 19.08 trecea drept actual peste un `.js` din 25.08 — de aici
+modalul „Cazuri concrete" care nu se deschidea (se afișa cardul vechi de sub grafice) și graficul
+gol de la INDICE 1: cod vechi în browser, cod nou pe server. Comparația e acum pe **conținut**
+(`gzip -dc … | cmp -s - …`), iar `.gz` din repo a fost regenerat.
+
 ## v3.9.5 - 2026-08-25
 
 ### PATCH — /cases 500: ORDER BY folosea aliasul `a` din CTE, invizibil în query-ul final

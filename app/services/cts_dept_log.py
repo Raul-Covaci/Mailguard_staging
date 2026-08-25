@@ -173,6 +173,8 @@ mv1 AS (
 ),
 -- Ground truth per tichet CTS: de aici vin message_id, ID-ul local de mail si starea de inchidere.
 gt AS (
+    -- Doar tichetele care apar in log-ul de mutari — altfel se agrega toata `cts_ground_truth`
+    -- (sute de mii de randuri) la fiecare interogare a raportului.
     SELECT cts_ticket_id,
            min(message_id)                            AS message_id,
            min(email_id)                              AS email_id,
@@ -181,6 +183,7 @@ gt AS (
                    OR lower(COALESCE(cts_status, '')) IN ('solved', 'rezolvat', 'closed')) AS is_solved
       FROM cts_ground_truth
      WHERE cts_ticket_id IS NOT NULL
+       AND cts_ticket_id IN (SELECT ticket_id FROM mv1)
      GROUP BY cts_ticket_id
 ),
 mv AS (
@@ -211,20 +214,30 @@ ev1 AS (
       FROM ev0 e
       LEFT JOIN dept_map dm ON dm.cts_dept_id = e.dept_id
 ),
+-- Starea mailului (inchis / ID local), agregata O SINGURA DATA per mail.
+-- ⚠️ NU se face `ev1 LEFT JOIN mv ON message_id` inainte de GROUP BY: ambele au mai multe randuri
+-- per mail, deci join-ul producea produs cartezian (pasi × mutari) doar ca sa recalculeze
+-- aceleasi agregate.
+mail_attr AS (
+    SELECT message_id,
+           max(solved_at)                      AS solved_at,
+           COALESCE(bool_or(is_solved), false) AS is_solved,
+           min(email_id)                       AS email_id
+      FROM mv
+     GROUP BY message_id
+),
 mail AS (
-    SELECT v.message_id,
-           min(v.moved_at)                        AS started_at,
-           max(x.solved_at)                       AS solved_at,
-           COALESCE(bool_or(x.is_solved), false)  AS is_solved,
-           min(x.email_id)                        AS email_id
-      FROM ev1 v
-      LEFT JOIN mv x ON x.message_id = v.message_id
-     GROUP BY v.message_id
-    HAVING (CAST(:date_from AS date) IS NULL
-            OR min(v.moved_at) >= CAST(:date_from AS date))
+    SELECT e.message_id, e.started_at,
+           a.solved_at,
+           COALESCE(a.is_solved, false) AS is_solved,
+           a.email_id
+      FROM (SELECT message_id, min(moved_at) AS started_at FROM ev1 GROUP BY message_id) e
+      LEFT JOIN mail_attr a ON a.message_id = e.message_id
+     WHERE (CAST(:date_from AS date) IS NULL
+            OR e.started_at >= CAST(:date_from AS date))
        AND (CAST(:date_to AS date) IS NULL
-            OR min(v.moved_at) < CAST(:date_to AS date) + interval '1 day')
-       AND (NOT CAST(:only_solved AS boolean) OR COALESCE(bool_or(x.is_solved), false))
+            OR e.started_at < CAST(:date_to AS date) + interval '1 day')
+       AND (NOT CAST(:only_solved AS boolean) OR COALESCE(a.is_solved, false))
 ),
 ev AS (
     SELECT v.message_id, v.dep, v.moved_at, v.ord AS id,

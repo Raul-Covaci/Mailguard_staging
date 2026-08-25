@@ -238,10 +238,14 @@ def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
                LIMIT 1
           ) emp ON true
          WHERE (l."deleted_at" IS NULL OR l."deleted_at" = '' OR left(l."deleted_at", 4) = '0000')
-           AND (l."message_id" = :mid OR ('mid:' || NULLIF(l."mid", '')) = :mid)
+           -- `:mid` / `:raw_mid` in loc de `('mid:' || l."mid") = :mid`: o comparatie pe expresie
+           -- nu poate folosi indexul, deci se scana toata tabela (~1,2 mil. randuri pe staging).
+           AND (l."message_id" = :mid
+                OR (CAST(:raw_mid AS text) IS NOT NULL AND l."mid" = CAST(:raw_mid AS text)))
          ORDER BY event_at NULLS LAST, log_id
          LIMIT :lim
-    """), {"mid": message_id, "lim": limit}).fetchall()
+    """), {"mid": message_id, "lim": limit,
+           "raw_mid": message_id[4:] if (message_id or "").startswith("mid:") else None}).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
@@ -249,61 +253,124 @@ def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
 # Log-ul tine `responsible_id` = admin CTS. Traducerea in angajat trece prin
 # `cts_dv_employee.admin_id` -> email -> `employee_department_mapping`, NICIODATA pe egalitate
 # de nume (numele din CTS e scris altfel decat in mapping — vezi CLAUDE.md).
-_RESP_LATERAL = """
-    LEFT JOIN LATERAL (
-        SELECT e.name
-          FROM cts_dv_employee dv
-          JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
-         WHERE dv.admin_id = NULLIF(l2."responsible_id", '')
-         ORDER BY e.enabled DESC, e.id
-         LIMIT 1
-    ) emp ON true
+#
+# ⚠️ DE CE NU MAI E UN SUBQUERY CORELAT (2026-08-25). Prima varianta punea numele responsabililor
+# ca subquery scalar corelat in lista de cazuri, iar filtrul ca EXISTS corelat. Ambele potriveau
+# mailul cu `l2.message_id = <cheie> OR ('mid:' || l2.mid) = <cheie>` — un OR pe o expresie, deci
+# NEINDEXABIL: Postgres scana toata tabela log (pe staging ~1,2 mil. randuri) O DATA PER RAND din
+# raport. La 98 de cazuri = 98 de scanari complete => ~21 s pe /cases. Acum:
+#   * numele se iau BATCH, o singura data, doar pentru randurile paginii afisate, cu
+#     `= ANY(:keys)` (indexabil, vezi ensure_indexes);
+#   * filtrul pe responsabil devine o LISTA de chei calculata cu O SINGURA scanare
+#     (`responsible_keys_cte`), folosita apoi ca simplu `IN`.
+# `admin_map` inlocuieste si LATERAL-ul per rand: maparea admin CTS -> nume se rezolva o data.
+
+_ADMIN_MAP_CTE = """
+admin_map AS (
+    SELECT DISTINCT ON (dv.admin_id) dv.admin_id AS admin_id, e.name AS name
+      FROM cts_dv_employee dv
+      JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+     WHERE COALESCE(dv.admin_id, '') <> ''
+     ORDER BY dv.admin_id, e.enabled DESC, e.id
+)
 """
 
-_MID_MATCH = """(l2."message_id" = {mid} OR ('mid:' || NULLIF(l2."mid", '')) = {mid})"""
+# Un rand din log poate fi cheia mailului in doua feluri (message_id RFC sau 'mid:<mid>'), exact
+# ca in `chain_cte`. Le expandam pe amandoua ca sa nu pierdem potriviri.
+_KEYS_LATERAL = """
+    CROSS JOIN LATERAL (VALUES (s.mid_key), ('mid:' || s.raw_mid)) AS v(k)
+"""
 
 
-def responsible_exists_sql(mid_expr: str) -> str:
-    """EXISTS pentru filtrul pe responsabil: dupa nume (potrivire partiala, case-insensitive)
-    sau dupa id-ul CTS, ca sa mearga si cand angajatul nu e inca mapat local.
-    `position(... in ...)` in loc de ILIKE: `%` e placeholder de parametru la psycopg2, deci
-    orice `%` literal in SQL-ul asta ar trebui dublat — vezi nota de la `_ts`."""
-    return f"""EXISTS (
-        SELECT 1 FROM {TABLE} l2 {_RESP_LATERAL}
-         WHERE {_MID_MATCH.format(mid=mid_expr)}
-           AND (position(lower(CAST(:resp AS text)) in lower(emp.name)) > 0
-                OR NULLIF(l2."responsible_id", '') = CAST(:resp AS text))
-    )"""
+def _split_keys(keys):
+    """Cheile din raport -> (chei message_id, valori brute de `mid`). O cheie 'mid:<x>' se
+    cauta pe coloana `mid`, restul pe `message_id`."""
+    mids, raws = [], []
+    for k in keys or []:
+        if not k:
+            continue
+        if k.startswith("mid:"):
+            raws.append(k[4:])
+        else:
+            mids.append(k)
+    return mids, raws
 
 
-def responsibles_select_sql(mid_expr: str, max_chars: int = 200) -> str:
-    """Numele responsabililor unui mail, pentru coloana din lista de cazuri.
+def responsibles_for_mails(db, keys, max_chars: int = 200) -> dict:
+    """{cheie mail -> "Nume1, Nume2"} pentru randurile unei pagini. O singura interogare,
+    cu `= ANY(...)` pe coloanele indexate — vezi nota de mai sus."""
+    mids, raws = _split_keys(keys)
+    if not mids and not raws:
+        return {}
+    try:
+        rows = db.execute(text(f"""
+            WITH {_ADMIN_MAP_CTE},
+            src AS (
+                SELECT NULLIF(l2."message_id", '') AS mid_key,
+                       NULLIF(l2."mid", '')        AS raw_mid,
+                       NULLIF(l2."responsible_id", '') AS admin_id
+                  FROM {TABLE} l2
+                 WHERE l2."message_id" = ANY(CAST(:mids AS text[]))
+                    OR l2."mid"        = ANY(CAST(:raws AS text[]))
+            ),
+            named AS (
+                SELECT v.k AS mail_key, am.name AS name
+                  FROM src s {_KEYS_LATERAL}
+                  LEFT JOIN admin_map am ON am.admin_id = s.admin_id
+                 WHERE v.k IS NOT NULL AND am.name IS NOT NULL
+            )
+            SELECT mail_key, left(string_agg(DISTINCT name, ', '), {int(max_chars)}) AS names
+              FROM named GROUP BY mail_key
+        """), {"mids": mids, "raws": raws}).fetchall()
+        return {r._mapping["mail_key"]: r._mapping["names"] for r in rows}
+    except Exception as e:
+        logger.warning("cts_email_log.responsibles_for_mails: %s", e)
+        return {}
 
-    ⚠️ Trebuie sa ramana un subquery scalar CORELAT, fara subquery in FROM. Prima varianta
-    ambala selectul intr-un derived table (`FROM (SELECT ...) r`) ca sa poata pune un LIMIT pe
-    numarul de nume; in Postgres un subquery din FROM fara LATERAL NU vede coloanele query-ului
-    exterior, deci `mid_expr` (ex. `a.message_id`) ieșea nerezolvabil si tot endpointul /cases
-    cadea cu `missing FROM-clause entry for table "a"`. Un EXISTS/scalar corelat (ca aici si ca
-    in `responsible_exists_sql`) poate referenția exteriorul — un derived table nu.
-    Plafonarea se face pe TEXTUL rezultat (`left(...)`), nu pe numarul de rânduri, ca sa nu fie
-    nevoie de subquery in FROM. Alocarile per mail sunt oricum putine (una per destinatar)."""
-    return f"""(
-        SELECT left(string_agg(DISTINCT emp.name, ', '), {int(max_chars)})
-          FROM {TABLE} l2 {_RESP_LATERAL}
-         WHERE {_MID_MATCH.format(mid=mid_expr)}
-           AND emp.name IS NOT NULL
-    )"""
+
+def responsible_keys_cte(name: str = "resp_keys") -> str:
+    """CTE cu cheile mailurilor pe care le-a atins responsabilul cerut (`:resp` — nume partial
+    sau id CTS). O singura scanare a log-ului, in loc de un EXISTS corelat per rand.
+    `position(... in ...)` in loc de ILIKE: `%` e placeholder de parametru la psycopg2."""
+    return f"""
+{name} AS (
+    SELECT DISTINCT v.k AS message_id
+      FROM (
+          SELECT NULLIF(l2."message_id", '') AS mid_key,
+                 NULLIF(l2."mid", '')        AS raw_mid,
+                 NULLIF(l2."responsible_id", '') AS admin_id
+            FROM {TABLE} l2
+      ) s {_KEYS_LATERAL}
+      LEFT JOIN admin_map am ON am.admin_id = s.admin_id
+     WHERE v.k IS NOT NULL
+       AND (position(lower(CAST(:resp AS text)) in lower(COALESCE(am.name, ''))) > 0
+            OR s.admin_id = CAST(:resp AS text))
+)
+"""
+
+
+def admin_map_cte() -> str:
+    """`admin_map` pentru interogarile care il compun cu alte CTE-uri (vezi /cases)."""
+    return _ADMIN_MAP_CTE
 
 
 def responsible_options(db, limit: int = 200) -> list:
-    """Lista responsabililor care apar in log — pentru dropdown-ul de filtru."""
+    """Lista responsabililor care apar in log — pentru dropdown-ul de filtru.
+    Se agrega INTAI pe `responsible_id` (o singura scanare, fara lateral per rand) si abia apoi
+    se traduce id-ul in nume."""
     try:
         rows = db.execute(text(f"""
-            SELECT emp.name AS name, count(*) AS n
-              FROM {TABLE} l2 {_RESP_LATERAL}
-             WHERE emp.name IS NOT NULL
-             GROUP BY emp.name
-             ORDER BY n DESC, emp.name
+            WITH {_ADMIN_MAP_CTE},
+            per_admin AS (
+                SELECT NULLIF(l2."responsible_id", '') AS admin_id, count(*) AS n
+                  FROM {TABLE} l2
+                 GROUP BY 1
+            )
+            SELECT am.name AS name, sum(p.n) AS n
+              FROM per_admin p
+              JOIN admin_map am ON am.admin_id = p.admin_id
+             GROUP BY am.name
+             ORDER BY n DESC, am.name
              LIMIT :lim
         """), {"lim": limit}).fetchall()
         return [{"name": r._mapping["name"], "n": int(r._mapping["n"])} for r in rows]
