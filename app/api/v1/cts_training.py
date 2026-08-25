@@ -1102,9 +1102,9 @@ def cts_training_dept_report_cases(
     else:
         per_mail = per_mail.replace("RESP_COL", "").replace("RESP_FILTER", "")
 
-    order = {"recent": "a.last_move_at DESC NULLS LAST",
-             "oldest": "a.first_at ASC NULLS LAST"}.get(
-                 (sort or "").strip().lower(), "a.moves DESC, a.last_move_at DESC")
+    order = {"recent": "last_move_at DESC NULLS LAST",
+             "oldest": "first_at ASC NULLS LAST"}.get(
+                 (sort or "").strip().lower(), "moves DESC, last_move_at DESC")
 
     total = db.execute(text(per_mail + " SELECT count(*) FROM rowsq"), params).scalar() or 0
     rows = db.execute(text(per_mail + f"""

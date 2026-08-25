@@ -8,6 +8,14 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.5 - 2026-08-25
+
+### PATCH — /cases 500: ORDER BY folosea aliasul `a` din CTE, invizibil în query-ul final
+
+`SELECT * FROM rowsq ORDER BY a.moves DESC` eșua cu `missing FROM-clause entry for table "a"`
+deoarece aliasul `a` (din CTE-ul `agg`) nu e vizibil în afara CTE-urilor. `rowsq` expune
+coloanele direct, fără prefix — eliminat `a.` din toate cele 3 valori de sortare.
+
 ## v3.9.4 - 2026-08-25
 
 ### PATCH — /cases dădea 500: `missing FROM-clause entry for table "a"`
