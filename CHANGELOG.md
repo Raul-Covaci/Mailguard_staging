@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.8.1 - 2026-08-25
+
+### PATCH — Incadrarea pe departament urmareste ULTIMUL reply intern, nu orice angajat din thread
+
+Mailurile #72780 si #72453 (fir „Traseu vehicul taxe de drum") au ajuns pe **Suport 2** desi
+ultimul raspuns CargoTrack din fir era al Adrianei Brasovean (**Taxe de drum**); Robert Iova
+(Suport 2) semna doar intr-un reply mai vechi, din josul threadului.
+
+Doua cauze, ambele in `_match_employee_signature` (`app/services/department_classifier.py`):
+
+1. **Garda de „e reply?" era oarba pe atributii ne-latine.** Clientul scrie din Gmail rusesc, deci
+   citatul e introdus cu `пн, 24 авг. 2026 г. в 13:46, <office@cargotrack.ro>:` — fara `wrote:` /
+   `a scris:`. Nici quote-strip-ul, nici `_REPLY_PAT` nu il vedeau, deci potrivirea pe semnatura
+   iesea imediat cu `None` si decizia ramanea pe AI, care citea tot firul (inclusiv „panoul
+   electric", „echipamentul e pornit") si concluziona Suport 2.
+2. **Cautarea se facea pe tot corpul, ca un singur text** („prima aparitie castiga"), fara notiunea
+   de mesaj: un angajat dintr-un reply vechi putea decide departamentul.
+
+Acum threadul se sparge in blocuri (`_thread_blocks`), de la cel mai NOU la cel mai VECHI, si
+decide **primul bloc, de sus in jos, in care semneaza un angajat** — adica ultimul reply intern.
+Linia de atributie ramane la inceputul blocului pe care il introduce, fiindca ea contine autorul.
+
+Alte corectii din acelasi pachet:
+- potrivire **pe adresa `@cargotrack.ro` din semnatura** inainte de potrivirea pe nume (mult mai
+  discriminanta decat tokenii de nume);
+- potrivirea pe nume cere numele de familie + >=1 prenume **ca si cuvinte intregi**, in ACELASI
+  bloc (inainte, pozitiile se cautau independent, oriunde in corp, ca substring);
+- mailurile **doar HTML** intra si ele in analiza (`_body_as_text`) — inainte, cu `body_text` gol,
+  potrivirea pe semnatura nu rula deloc;
+- rezultatul salveaza `reply_block` / `reply_blocks` in `ai_department_result`, ca sa se vada din
+  ce reply a venit decizia.
+
+Garzile contra fals-pozitivelor raman: e nevoie de context `@cargotrack.ro` in corp SI de indiciu
+de reply (citat detectat, „a scris:" sau minim doua blocuri in fir).
+
 ## v3.8.0 - 2026-08-24
 
 ### MINOR — „Raport departamente" citește log-ul CTS: apar și departamentele intermediare

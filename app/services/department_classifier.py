@@ -17,6 +17,7 @@ import re
 import hashlib
 import logging
 import unicodedata
+from html import unescape
 from typing import Dict, Any, Optional
 
 from sqlalchemy import text
@@ -318,19 +319,122 @@ def _strip_diac(s: str) -> str:
     return out.lower()
 
 
+# ── segmentare thread + identificare ULTIMUL interlocutor intern ─────────────
+# Un thread e o stiva de mesaje: blocul 0 = mesajul NOU, apoi citatele, de la cel
+# mai RECENT la cel mai VECHI. Departamentul trebuie dat de ULTIMUL reply intern
+# (primul bloc, de sus in jos, in care semneaza un angajat), NU de orice angajat
+# aparut oriunde in istoric.
+#   #72780 / #72453: ultimul reply e al Adrianei Brasovean (Taxe de drum), dar mai
+#   jos in thread semna Robert Iova (Suport 2) -> mailurile ajungeau pe suport_2.
+# Cautarea „prima aparitie in body-ul intreg" nu rezolva cazul: liniile de atributie
+# in alte alfabete (ru: „пн, 24 авг. 2026 г. в 13:46, <office@cargotrack.ro>:") nu
+# erau recunoscute ca frontiere, deci tot threadul se citea ca un singur text.
+
+# Linie de atributie generica: data/ora + adresa, terminata cu ':' — prinde formatele
+# ne-latine pe care _pd._QUOTE_INTRO (ancorat pe „wrote:"/„a scris:") le rateaza.
+_ATTRIB_DATE_ADDR = re.compile(
+    r'^\s*>*\s*.{0,200}?\d{1,2}[:/.]\d{1,2}.{0,200}?<?[\w.+-]+@[\w.-]+\.\w{2,}>?\s*:\s*$')
+# Antetul pe care il randeaza aplicatia intre mesajele aceluiasi thread.
+_APP_THREAD_SEP = re.compile(r'(?i)^\s*(?:sent from|received on|mailed to)\s*:')
+_HTML_BR = re.compile(r'(?is)<\s*(?:br|/p|/div|/tr|/li|/h[1-6]|blockquote)[^>]*>')
+
+
+def _body_as_text(email: Dict[str, Any]) -> str:
+    """Corpul mailului ca text pe linii. Fara body_text (mail doar HTML) cade pe HTML,
+    convertit cu pastrarea liniilor — segmentarea pe blocuri e per linie."""
+    body_text = email.get("body_text") or ""
+    if body_text.strip():
+        return body_text
+    html = email.get("body_html") or ""
+    if not html.strip():
+        return ""
+    s = _HTML_BR.sub("\n", html)
+    s = _pd._HTML_TAG.sub(" ", s)
+    return unescape(s)
+
+
+def _thread_blocks(body: str):
+    """Imparte threadul in blocuri, de la cel mai NOU la cel mai VECHI.
+    Linia de atributie ramane la INCEPUTUL blocului pe care il introduce (ea contine
+    autorul mesajului citat, ex. 'Le 24 aout, Adriana Brasovean <...@cargotrack.ro> a ecrit:').
+    Fara nicio frontiera detectata => un singur bloc = tot corpul (comportamentul vechi)."""
+    lines = body.splitlines()
+    blocks, cur, prev_boundary = [], [], False
+    for i, ln in enumerate(lines):
+        is_boundary = bool(
+            _pd._QUOTE_INTRO.match(ln) or _pd._INLINE_QUOTE.match(ln)
+            or _ATTRIB_DATE_ADDR.match(ln) or _APP_THREAD_SEP.match(ln)
+            or (_pd._FWD_FROM.match(ln)
+                and any(_pd._FWD_FOLLOW.match(w) for w in lines[i + 1:i + 5]))
+        )
+        if is_boundary:
+            if not prev_boundary:           # antete consecutive => acelasi bloc nou
+                blocks.append("\n".join(cur))
+                cur = []
+            prev_boundary = True
+        else:
+            prev_boundary = False
+        cur.append(ln)
+    blocks.append("\n".join(cur))
+    return [b for b in blocks if b.strip()]
+
+
+def _employee_in_block(block: str, rows) -> Optional[tuple]:
+    """(name, department) al angajatului care semneaza in bloc, sau None.
+    Prioritate: adresa @cargotrack.ro din semnatura (discriminanta) > nume.
+    Numele cere numele de FAMILIE + >=1 prenume, pe granite de cuvant, in ACELASI bloc —
+    altfel un token scurt dintr-un cuvant obisnuit ar pica pe un angajat gresit."""
+    hay = _strip_diac(block)
+    best_pos, best = len(hay) + 1, None
+
+    for row in rows:
+        m = row._mapping
+        em = _strip_diac(m.get("email") or "")
+        if not em:
+            continue
+        p = hay.find(em)
+        if 0 <= p < best_pos:
+            best_pos, best = p, (m["name"], m["department"])
+    if best:
+        return best
+
+    for row in rows:
+        m = row._mapping
+        parts = _strip_diac(m["name"]).replace("-", " ").split()
+        if len(parts) < 2:
+            continue
+        surname, given = parts[0], parts[1:]
+        s_pos = _word_pos(hay, surname)
+        if s_pos < 0:
+            continue                      # numele de familie absent -> nu e semnatura lui
+        given_found = [p for p in (_word_pos(hay, g) for g in given) if p >= 0]
+        if not given_found:
+            continue                      # doar numele de familie -> insuficient
+        first_pos = min([s_pos] + given_found)
+        if first_pos < best_pos:
+            best_pos, best = first_pos, (m["name"], m["department"])
+    return best
+
+
+def _word_pos(hay: str, token: str) -> int:
+    """Pozitia primei aparitii a lui `token` ca CUVANT intreg (-1 daca lipseste).
+    Fara granite, un prenume scurt s-ar potrivi in interiorul unui cuvant oarecare."""
+    if len(token) < 2:
+        return -1
+    m = re.search(r'(?<![a-z0-9])' + re.escape(token) + r'(?![a-z0-9])', hay)
+    return m.start() if m else -1
+
+
 def _match_employee_signature(email: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Cauta un angajat CargoTrack in emailul curent (prioritar) sau in contextul citat.
-    Returneaza rezultat de clasificare doar daca:
-    - exista context @cargotrack.ro in body (email e legat de CargoTrack)
-    - exista text citat (e un reply, nu un email nou)
-    - un angajat din lista e gasit in mesajul nou SAU in body complet
-    Prioritate: angajat gasit in mesajul nou (fara citate) > angajat gasit in citate.
-    Previne false positives: un Kovacs Robert extern fara context CargoTrack nu va lovi.
-    Match ANCORAT PE NUME DE FAMILIE (token[0] din mapping, format 'Nume Prenume[e]'):
-    numele de familie e discriminant (rar), prenumele sunt frecvent duplicate intre
-    angajati (ionut x3, robert x3...). Cerem surname prezent + >=1 prenume prezent.
+    """Incadreaza dupa departamentul ULTIMULUI angajat CargoTrack care a scris in thread.
+    Conditii (pastrate, contra fals-pozitivelor):
+    - exista context @cargotrack.ro in corp (mailul e legat de CargoTrack);
+    - exista indiciu de reply (citat detectat sau atributie de tip 'a scris:').
+    Threadul se sparge pe blocuri (vezi _thread_blocks) si se ia PRIMUL bloc, de sus in
+    jos, in care semneaza un angajat: cel mai recent reply intern decide.
     """
-    body_text = _strip_diac(email.get("body_text") or "")
+    body = _body_as_text(email)
+    body_text = _strip_diac(body)
     body_html = (email.get("body_html") or "")
 
     # Verifica context CargoTrack: trebuie sa existe @cargotrack.ro in email
@@ -338,16 +442,14 @@ def _match_employee_signature(email: Dict[str, Any]) -> Optional[Dict[str, Any]]
         return None
 
     # Detecteaza daca e reply (are text citat) — reduce false positives
-    # was_stripped=False poate insemna si reply cu corp gol (clientul n-a scris nimic
-    # inainte de citat) — nu excludem in acel caz, doar prioritizam new_content.
     try:
-        new_content, _, was_stripped = _pd._new_content(email)
+        _, _, was_stripped = _pd._new_content(email)
     except Exception:
-        new_content, was_stripped = "", False
+        was_stripped = False
 
-    # Verifica ca exista indiciu de reply: text citat detectat SAU pattern "a scris:" in body
     _REPLY_PAT = re.compile(r'(?:wrote:|a scris:|on .{0,100}wrote:|(?:în|la)\b.{0,100}a scris:)', re.I)
-    has_reply_context = was_stripped or bool(_REPLY_PAT.search(body_text))
+    blocks = _thread_blocks(body)
+    has_reply_context = was_stripped or bool(_REPLY_PAT.search(body_text)) or len(blocks) > 1
     if not has_reply_context:
         return None
 
@@ -355,7 +457,8 @@ def _match_employee_signature(email: Dict[str, Any]) -> Optional[Dict[str, Any]]
     db = SessionLocal()
     try:
         rows = db.execute(text(
-            "SELECT name, department FROM employee_department_mapping WHERE enabled=TRUE ORDER BY name"
+            "SELECT name, department, email FROM employee_department_mapping "
+            "WHERE enabled=TRUE ORDER BY name"
         )).fetchall()
     except Exception as e:
         logger.warning("employee_department_mapping query failed: %s", e)
@@ -363,62 +466,21 @@ def _match_employee_signature(email: Dict[str, Any]) -> Optional[Dict[str, Any]]
     finally:
         db.close()
 
-    new_text = _strip_diac(new_content or "")
-
-    # Detecteaza surname-uri duplicate (dezambiguizare): daca 2 angajati au acelasi
-    # nume de familie normalizat, cerem SI un prenume comun ca sa nu ii confundam.
-    _surname_counts: Dict[str, int] = {}
-    for row in rows:
-        parts = _strip_diac(row._mapping["name"]).replace("-", " ").split()
-        if parts:
-            _surname_counts[parts[0]] = _surname_counts.get(parts[0], 0) + 1
-
-    def _find_earliest(haystack: str):
-        """Returneaza angajatul cu prima aparitie in text (cel mai devreme pozitionat).
-        Match ANCORAT PE NUME DE FAMILIE: numele de familie (token[0] din mapping, format
-        'Nume Prenume[e]') trebuie prezent, plus >=1 prenume. Numele de familie e
-        discriminant; prenumele singure (David, Andrei, Robert...) sunt duplicate intre
-        angajati => nu declanseaza singure. Tolereaza:
-        - diacritice (haystack deja normalizat prin _strip_diac; partile la fel),
-        - ordine libera (semnatura 'David Miclau' vs mapping 'Miclau ...'),
-        - prenume mijlociu absent din semnatura ('Miclau Adrian-David' prinde pe 'David Miclau')."""
-        best_pos, best_name, best_dept = len(haystack) + 1, None, None
-        for row in rows:
-            name_parts = _strip_diac(row._mapping["name"]).replace("-", " ").split()
-            if len(name_parts) < 2:
-                continue
-            surname = name_parts[0]
-            given = name_parts[1:]  # prenume (unul sau mai multe)
-            s_pos = haystack.find(surname)
-            if s_pos < 0:
-                continue  # numele de familie ABSENT -> nu e semnatura acestui angajat
-            given_pos = [haystack.find(g) for g in given]
-            given_found = [p for p in given_pos if p >= 0]
-            if not given_found:
-                continue  # doar numele de familie, fara niciun prenume -> insuficient
-            # Surname duplicat intre angajati -> cere macar 1 prenume (deja garantat mai sus);
-            # earliest-position decide intre omonimi (comportament pastrat).
-            first_pos = min([s_pos] + given_found)
-            if first_pos < best_pos:
-                best_pos = first_pos
-                best_name = row._mapping["name"]
-                best_dept = row._mapping["department"]
-        return best_name, best_dept
-
-    # Prioritate 1: angajat in mesajul nou (fara citate) — semnal puternic
-    name, dept = _find_earliest(new_text) if new_text else (None, None)
-    # Prioritate 2: fallback la body complet (angajat in citate) — prima aparitie
-    if not name:
-        name, dept = _find_earliest(body_text)
-
-    if name:
-        logger.info("Employee signature match: %s -> %s", name, dept)
+    for idx, block in enumerate(blocks):
+        hit = _employee_in_block(block, rows)
+        if not hit:
+            continue
+        name, dept = hit
+        logger.info("Employee signature match: %s -> %s (bloc %d/%d, de sus in jos)",
+                    name, dept, idx + 1, len(blocks))
         return {
             "department": dept,
             "confidence": 1.0,
-            "reason": "Semnatura angajat identificata: " + name,
+            "reason": ("Semnatura angajat identificata in ultimul reply intern: " + name),
             "model": "employee_signature",
             "employee": name,
+            "reply_block": idx,
+            "reply_blocks": len(blocks),
             "escalated": False,
         }
     return None
