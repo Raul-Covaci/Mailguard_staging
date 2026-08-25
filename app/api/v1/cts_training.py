@@ -21,6 +21,7 @@ from app.api.v1.auth import get_current_admin
 from app.api.v1.sorting import sort_dir
 from app.services import cts_groundtruth_sync as SYNC
 from app.services import cts_email_log
+from app.services import cts_dept_log
 from app.services.department_classifier import DEPT_LABELS
 
 logger = logging.getLogger("mailguard.cts_training")
@@ -805,24 +806,36 @@ ch AS (
 """
 
 
-# Sursa lantului de departamente:
-#   'moves' — `cts_department_moves` (trigger pe cts_ground_truth): vede doar tranzitiile prinse
-#             intre doua sincronizari (~5 min) => departamentele intermediare se pierd;
-#   'log'   — `cts_dv_client_contact_email_log` (view IRIS Data Views, pagina „Surse date"):
-#             un rand per alocare, deci lantul complet, cu tot cu intermediari;
-#   'auto'  — 'log' daca view-ul e sincronizat, altfel 'moves' (implicit).
-SOURCES = ("auto", "log", "moves")
+# Sursa lantului de departamente, de la cea mai buna la cea mai slaba:
+#   'deptlog' — `cts_dv_client_contact_email_department_log`: log-ul de MUTARI (cine a mutat, in
+#               ce departament, cand). Sursa preferata pentru INDICE 1 (cate mutari) si INDICE 3
+#               (departamente intermediare) — nu se deduce nimic din diferente;
+#   'log'     — `cts_dv_client_contact_email_log`: un rand per ALOCARE, lantul se reconstruieste
+#               din secventa de department_id;
+#   'moves'   — `cts_department_moves` (trigger pe cts_ground_truth): vede doar tranzitiile prinse
+#               intre doua sincronizari (~5 min) => departamentele intermediare se pierd;
+#   'auto'    — prima disponibila din ordinea de mai sus (implicit).
+SOURCES = ("auto", "deptlog", "log", "moves")
 
 
 def _chain_source(db, source: str) -> tuple:
-    """(CTE-ul de folosit, sursa efectiva, disponibilitatea log-ului). Nu arunca daca log-ul
-    lipseste — cade pe 'moves', ca raportul sa functioneze si inainte de primul sync."""
+    """(CTE-ul de folosit, sursa efectiva, disponibilitatea log-ului de alocari — folosita de
+    UI pentru butonul „Traseu"). Nu arunca daca o sursa lipseste — cade pe urmatoarea, ca
+    raportul sa functioneze si inainte de primul sync al view-urilor."""
     src = (source or "auto").strip().lower()
     if src not in SOURCES:
         src = "auto"
     log_ok = cts_email_log.available(db)
+    dept_ok = cts_dept_log.available(db)
+
+    if src == "deptlog" and not dept_ok:
+        src = "auto"
     if src == "log" and not log_ok:
-        return _DEPT_REPORT_CTE, "moves", False
+        src = "auto" if dept_ok else "moves"
+
+    if src == "deptlog" or (src == "auto" and dept_ok):
+        cts_dept_log.ensure_indexes(db)
+        return cts_dept_log.chain_cte(db), "deptlog", log_ok
     if src == "log" or (src == "auto" and log_ok):
         cts_email_log.ensure_indexes(db)
         return cts_email_log.chain_cte(), "log", True
@@ -923,8 +936,14 @@ def cts_training_dept_report(
               "n": int(r._mapping["n"]), "pct": _pct(int(r._mapping["n"]), total_moves)}
              for r in pair_rows]
 
-    # Acoperire: pe 'moves' = captura din trigger vs. backfill; pe 'log' = cat cuprinde log-ul CTS.
-    if src == "log":
+    # Acoperire: pe 'moves' = captura din trigger vs. backfill; pe 'log'/'deptlog' = cat
+    # cuprinde view-ul respectiv.
+    if src == "deptlog":
+        lc = cts_dept_log.coverage(db)
+        coverage = {"source": "deptlog", "rows": lc["rows"], "mails": lc["mails"],
+                    "first_at": lc["first_at"], "last_at": lc["last_at"],
+                    "unmapped_departments": lc["unmapped_departments"]}
+    elif src == "log":
         lc = cts_email_log.coverage(db)
         coverage = {"source": "log", "rows": lc["rows"], "mails": lc["mails"],
                     "first_at": lc["first_at"], "last_at": lc["last_at"],
@@ -989,10 +1008,11 @@ def cts_training_dept_report_cases(
       * `dept_from` + `dept_to` impreuna = TRANZITIA concreta (a plecat de pe X si a ajuns pe Y,
         una dupa alta), nu doua conditii independente — asta cere „de la -> spre" din modal;
       * `dept_to` singur = mailul a ajuns pe departamentul asta printr-o mutare (nu alocarea initiala);
-      * `responsible` — doar pe sursa 'log' (`moves` nu tine cine a preluat); ignorat altfel.
+      * `responsible` — necesita `client_contact_email_log` sincronizat (indiferent de `src`);
+        ignorat daca acel view lipseste.
     """
     params = _dept_report_params(date_from, date_to, department, only_solved)
-    CTE, src, _log_ok = _chain_source(db, source)
+    CTE, src, log_ok = _chain_source(db, source)
 
     def _dep(v):
         v = (v or "").strip() or None
@@ -1003,9 +1023,13 @@ def cts_training_dept_report_cases(
 
     d_from, d_to, d_mid = _dep(dept_from), _dep(dept_to), _dep(dept_mid)
     pair = (d_from is not None and d_to is not None)
+    # Responsabilul se citeste din `client_contact_email_log` (nu exista in alta parte), deci
+    # e disponibil doar cand acel view e sincronizat — indiferent daca lantul principal (`src`)
+    # vine din 'log' sau din 'deptlog'.
+    resp_ok = log_ok
     resp = (responsible or "").strip() or None
-    if src != "log":
-        resp = None                     # `cts_department_moves` nu tine responsabilul
+    if not resp_ok:
+        resp = None
     params.update({
         "min_moves": min_moves,
         "max_moves": (max_moves if max_moves and max_moves >= min_moves else None),
@@ -1065,8 +1089,10 @@ def cts_training_dept_report_cases(
            RESP_FILTER
     )
     """
-    # Responsabilul exista doar in log; pe sursa 'moves' coloana si filtrul dispar din SQL.
-    if src == "log":
+    # Responsabilul se citeste din `client_contact_email_log` (unde exista coloana), pe cheia
+    # comuna `message_id` — valabila si cand lantul principal vine din `deptlog`. Fara acel
+    # view sincronizat (indiferent de `src`), coloana si filtrul dispar din SQL.
+    if resp_ok:
         per_mail = per_mail.replace(
             "RESP_COL", ", " + cts_email_log.responsibles_select_sql("a.message_id") + " AS responsibles")
         per_mail = per_mail.replace(
@@ -1100,11 +1126,19 @@ def cts_training_dept_report_cases(
     } for m in (r._mapping for r in rows)]
     return {"total": int(total), "page": page, "page_size": page_size,
             "source": src, "items": items,
-            "responsible_filter_available": src == "log",
+            "responsible_filter_available": resp_ok,
             "filters": {"min_moves": min_moves, "max_moves": max_moves or None,
                         "dept_from": d_from, "dept_to": d_to, "dept_mid": d_mid,
                         "pair": pair, "q": params["q"], "email_id": params["email_id"],
                         "responsible": resp, "sort": sort}}
+
+
+@router.get("/cts-training/dept-report/log-schema")
+def cts_training_dept_log_schema(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Diagnostic: ce coloane s-au gasit in `client_contact_email_department_log` dupa sync si
+    cum s-au mapat pe campurile logice (`_CANDIDATES` din `cts_dept_log.py`). Util cand view-ul
+    isi schimba numele de coloane si sursa `deptlog` iese indisponibila fara motiv vizibil."""
+    return cts_dept_log.resolve(db)
 
 
 @router.get("/cts-training/dept-report/responsibles")
@@ -1121,46 +1155,76 @@ def cts_training_dept_report_responsibles(
 @router.get("/cts-training/dept-report/mail-steps")
 def cts_training_dept_report_mail_steps(
     message_id: str = Query(..., description="message_id al mailului (cheia de grupare din raport)"),
+    source: str = Query("auto", description="auto | deptlog | log"),
     db: Session = Depends(get_db),
     admin=Depends(get_current_admin),
 ):
-    """Pasii BRUTI ai unui mail din `client_contact_email_log` — un rand per alocare, fara
-    colapsare: departament, cine l-a preluat, status, cand. Asta e nivelul la care se vede
-    „de ce s-a mutat" (inclusiv departamentele intermediare pierdute de raportul pe `moves`).
+    """Pasii BRUTI ai unui mail — nivelul la care se vede „de ce s-a mutat" (inclusiv
+    departamentele intermediare pierdute de raportul pe `moves`). Doua surse posibile:
 
-    404 daca view-ul nu e sincronizat inca — raportul pe `moves` nu are datele astea."""
-    if not cts_email_log.available(db):
-        raise HTTPException(404, "View-ul client_contact_email_log nu e sincronizat "
-                                 "(Surse date → client_contact_email_log → Sincronizează).")
-    steps = cts_email_log.steps_for_mail(db, (message_id or "").strip())
-    out = []
-    prev = None
-    for st in steps:
-        dep = st.get("dep")
-        out.append({
+      * 'deptlog' (`client_contact_email_department_log`) — fiecare rand E o mutare (departament
+        sursa/destinatie, cine, cand): nu se deduce nimic, e nivelul cel mai direct.
+      * 'log' (`client_contact_email_log`) — un rand per ALOCARE; „mutare" se deduce din
+        schimbarea de departament fata de randul anterior.
+
+    'auto' foloseste deptlog daca e sincronizat, altfel log. 404 daca niciuna nu e disponibila."""
+    src = (source or "auto").strip().lower()
+    dept_ok = cts_dept_log.available(db)
+    log_ok = cts_email_log.available(db)
+    if src not in ("deptlog", "log") or (src == "deptlog" and not dept_ok) or (src == "log" and not log_ok):
+        src = "deptlog" if dept_ok else ("log" if log_ok else None)
+    if src is None:
+        raise HTTPException(404, "Niciun view cu istoricul mutarilor nu e sincronizat "
+                                 "(Surse date → client_contact_email_department_log sau "
+                                 "client_contact_email_log → Sincronizează).")
+
+    mid = (message_id or "").strip()
+    if src == "deptlog":
+        raw = cts_dept_log.steps_for_mail(db, mid)
+        out = [{
             "log_id": st.get("log_id"),
-            "department": dep,
-            "department_label": _lbl(dep),
-            "cts_department_id": st.get("dept_id"),
-            "folder_id": st.get("folder_id"),
-            "responsible_id": st.get("responsible_id"),
-            "responsible_name": st.get("responsible_name"),
-            "status": st.get("status"),
-            "title": st.get("title"),
-            "event_at": st.get("event_at"),
-            "assigned_at": st.get("assigned_at"),
-            "solved_at": st.get("solved_at"),
-            "updated_at": st.get("updated_at"),
-            # is_move=False pe replicile per destinatar (acelasi departament la rand)
-            "is_move": bool(prev is not None and dep != prev),
-        })
-        prev = dep
+            "department": st.get("to_dep"),
+            "department_label": _lbl(st.get("to_dep")),
+            "from_department": st.get("from_dep"),
+            "from_department_label": _lbl(st.get("from_dep")) if st.get("from_dep") else None,
+            "cts_department_id": st.get("to_dept_id"),
+            "responsible_id": st.get("actor_id"),
+            "responsible_name": st.get("actor_name"),
+            "event_at": st.get("moved_at"),
+            "is_move": True,     # fiecare rand din deptlog E o mutare, nu o alocare
+        } for st in raw]
+    else:
+        steps = cts_email_log.steps_for_mail(db, mid)
+        out = []
+        prev = None
+        for st in steps:
+            dep = st.get("dep")
+            out.append({
+                "log_id": st.get("log_id"),
+                "department": dep,
+                "department_label": _lbl(dep),
+                "cts_department_id": st.get("dept_id"),
+                "folder_id": st.get("folder_id"),
+                "responsible_id": st.get("responsible_id"),
+                "responsible_name": st.get("responsible_name"),
+                "status": st.get("status"),
+                "title": st.get("title"),
+                "event_at": st.get("event_at"),
+                "assigned_at": st.get("assigned_at"),
+                "solved_at": st.get("solved_at"),
+                "updated_at": st.get("updated_at"),
+                # is_move=False pe replicile per destinatar (acelasi departament la rand)
+                "is_move": bool(prev is not None and dep != prev),
+            })
+            prev = dep
+
     chain = []
     for st in out:
         if not chain or chain[-1] != st["department"]:
             chain.append(st["department"])
     return {
         "message_id": message_id,
+        "source": src,
         "steps": out,
         "chain": chain,
         "chain_labels": [_lbl(c) for c in chain],

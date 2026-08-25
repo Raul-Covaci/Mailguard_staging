@@ -8,6 +8,35 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.1 - 2026-08-25
+
+### PATCH — a treia sursă pentru „Raport departamente": log-ul de MUTĂRI
+
+Adaugă sursa cerută explicit pentru INDICE 1 (câte mutări) și INDICE 3 (departamente
+intermediare): `client_contact_email_department_log`, tabela Laravel unde CTS scrie exact o
+mutare per rând — `client_contact_email_log_id` (FK), `department_from_id`, `department_to_id`,
+`user_id` (cine a mutat), `updated_at` (când). Spre deosebire de celelalte două surse, aici nu se
+deduce nimic din diferențe: fiecare rând E o mutare.
+
+- `app/services/cts_dept_log.py` (nou) — CTE-ul lanțului (`chain_cte`) construit pe schema
+  reală: cheia mailului trece prin FK către `client_contact_email_log` (view-ul de mutări nu are
+  `message_id` propriu); departamentul INIȚIAL (cel pe care a intrat mailul, care nu apare ca
+  „mutare") se ia din `department_from_id` al primei mutări sau, dacă lipsește, din prima alocare
+  din `client_contact_email_log` — altfel INDICE 1 ar număra cu o mutare mai puțin și INDICE 3 ar
+  trata departamentul de intrare ca intermediar.
+- Numele coloanelor se rezolvă la runtime (`_CANDIDATES`, cu numele reale primele) —
+  `GET /cts-training/dept-report/log-schema` arată ce s-a găsit, pentru diagnostic dacă view-ul
+  își schimbă vreodată coloanele.
+- Sursă nouă `deptlog` în `SOURCES`, preferată de `auto` (deptlog → log → moves, prima
+  disponibilă). `/cts-training/dept-report/mail-steps` are acum ramură dedicată pentru ea:
+  fiecare pas arată direct „de pe X → pe Y, mutat de <nume>, când" — fără reconstrucție.
+- Migrația de auto-sync de la v3.9.0 pornea deja sincronizarea la 5 minute pentru acest view.
+
+UI: opțiune nouă „Log mutări (recomandat)" în selectorul de sursă din „Raport departamente",
+badge/etichete/text de ajutor actualizate; filtrul de responsabil din modalul „Cazuri concrete"
+funcționează acum indiferent dacă lanțul principal vine din `deptlog` sau `log` (rămâne legat de
+sincronizarea `client_contact_email_log`, singurul loc unde există coloana).
+
 ## v3.9.0 - 2026-08-25
 
 ### MINOR — Sincronizare automată IRIS Data Views + modal de cazuri în „Raport departamente"

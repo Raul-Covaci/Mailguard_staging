@@ -1027,35 +1027,39 @@ function CtsDeptReport() {
     setStepsBusy(true);
     api('/cts-training/dept-report/mail-steps?message_id=' + encodeURIComponent(messageId))
       .then(function(d){
+        var isMoveLog = d.source === 'deptlog';
         var rows = (d.steps || []).map(function(st){
+          var depCell = isMoveLog && st.from_department_label
+            ? (escHtml(st.from_department_label) + ' <span style="color:#888">→</span> ' + escHtml(st.department_label || '—'))
+            : escHtml(st.department_label || '—') + (st.is_move ? ' <span style="color:#f97316;font-size:11px">mutare</span>' : '');
           return '<tr' + (st.is_move ? ' style="background:rgba(249,115,22,.10)"' : '') + '>'
             + '<td style="padding:5px 8px;white-space:nowrap">' + escHtml(fmtTs(st.event_at)) + '</td>'
-            + '<td style="padding:5px 8px;font-weight:600">' + escHtml(st.department_label || '—')
-              + (st.is_move ? ' <span style="color:#f97316;font-size:11px">mutare</span>' : '') + '</td>'
+            + '<td style="padding:5px 8px;font-weight:600">' + depCell + '</td>'
             + '<td style="padding:5px 8px">' + escHtml(st.responsible_name || (st.responsible_id ? ('#' + st.responsible_id) : '—')) + '</td>'
-            + '<td style="padding:5px 8px">' + escHtml(st.status || '—') + '</td>'
+            + '<td style="padding:5px 8px">' + escHtml(isMoveLog ? '—' : (st.status || '—')) + '</td>'
             + '<td style="padding:5px 8px;white-space:nowrap">' + escHtml(st.solved_at ? fmtTs(st.solved_at) : '—') + '</td>'
             + '</tr>';
         }).join('');
         var head = '<div style="text-align:left;font-size:12.5px;line-height:1.5">'
           + (subject ? ('<div style="margin-bottom:6px"><b>' + escHtml(subject) + '</b></div>') : '')
           + '<div style="margin-bottom:8px;color:#888">Traseu: ' + escHtml((d.chain_labels || []).join(' → ') || '—')
-          + ' · <b>' + (d.moves || 0) + '</b> mutări · ' + ((d.steps || []).length) + ' alocări în log</div>';
+          + ' · <b>' + (d.moves || 0) + '</b> mutări · ' + ((d.steps || []).length)
+          + (isMoveLog ? ' mutări înregistrate</div>' : ' alocări în log</div>');
         window.Swal && window.Swal.fire({
           title: 'Traseul complet al mailului',
           html: head + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
             + '<thead><tr style="text-align:left;border-bottom:1px solid #8884">'
-            + '<th style="padding:5px 8px">Când</th><th style="padding:5px 8px">Departament</th>'
-            + '<th style="padding:5px 8px">Responsabil</th><th style="padding:5px 8px">Status</th>'
+            + '<th style="padding:5px 8px">Când</th><th style="padding:5px 8px">' + (isMoveLog ? 'Mutare' : 'Departament') + '</th>'
+            + '<th style="padding:5px 8px">' + (isMoveLog ? 'Mutat de' : 'Responsabil') + '</th><th style="padding:5px 8px">Status</th>'
             + '<th style="padding:5px 8px">Închis</th></tr></thead><tbody>'
-            + (rows || '<tr><td colspan="5" style="padding:14px;text-align:center;color:#888">Nicio alocare în log.</td></tr>')
+            + (rows || '<tr><td colspan="5" style="padding:14px;text-align:center;color:#888">Nicio mutare înregistrată.</td></tr>')
             + '</tbody></table></div>',
           width: 820, confirmButtonText: 'Închide'
         });
       })
       .catch(function(e){
         window.Swal && window.Swal.fire({ icon: 'info', title: 'Traseul detaliat nu e disponibil',
-          text: (e && e.message) || 'Sincronizează view-ul client_contact_email_log din pagina „Surse date".' });
+          text: (e && e.message) || 'Sincronizează view-ul client_contact_email_department_log sau client_contact_email_log din pagina „Surse date".' });
       })
       .finally(function(){ setStepsBusy(false); });
   }
@@ -1148,16 +1152,19 @@ function CtsDeptReport() {
     h('span', { key: 'sep2', style: { color: 'var(--bd)', fontSize: 18, lineHeight: 1, userSelect: 'none' } }, '|'),
     h('span', { key: 'srl', style: { fontSize: 12, color: 'var(--t3)' } }, 'Sursă:'),
     h('select', { key: 'src', className: 'btn secondary', style: { padding: '6px 10px' }, value: source,
-      title: 'Log CTS = un rând per alocare (arată și departamentele intermediare). Istoric sync = doar tranzițiile prinse între două sincronizări.',
+      title: 'Log mutări = un rând per MUTARE efectivă (cine a mutat, când) — cel mai direct. Log CTS = un rând per alocare, lanțul se reconstruiește. Istoric sync = doar tranzițiile prinse între două sincronizări.',
       onChange: function(e){ setSource(e.target.value); setDrill(null); } }, [
       h('option', { key: 'auto', value: 'auto' }, 'Automată'),
-      h('option', { key: 'log', value: 'log' }, 'Log CTS (complet)'),
+      h('option', { key: 'deptlog', value: 'deptlog' }, 'Log mutări (recomandat)'),
+      h('option', { key: 'log', value: 'log' }, 'Log CTS (alocări)'),
       h('option', { key: 'moves', value: 'moves' }, 'Istoric sync (vechi)')
     ]),
     (d.source ? h('span', { key: 'srb', className: 'badge', style: { textTransform: 'none', fontSize: 11,
-      background: d.source === 'log' ? 'rgba(16,185,129,.16)' : 'rgba(245,158,11,.16)' } },
-      d.source === 'log' ? 'client_contact_email_log' : 'cts_department_moves') : null),
-    (source === 'log' && d.log_available === false ? h('span', { key: 'srw', style: { fontSize: 11.5, color: 'var(--yw)' } },
+      background: d.source === 'deptlog' ? 'rgba(16,185,129,.16)' : (d.source === 'log' ? 'rgba(59,130,246,.16)' : 'rgba(245,158,11,.16)') } },
+      d.source === 'deptlog' ? 'client_contact_email_department_log' : (d.source === 'log' ? 'client_contact_email_log' : 'cts_department_moves')) : null),
+    (source === 'deptlog' && d.source !== 'deptlog' ? h('span', { key: 'srw', style: { fontSize: 11.5, color: 'var(--yw)' } },
+      'View-ul de mutări nu e sincronizat încă — se afișează sursa disponibilă.') : null),
+    (source === 'log' && d.log_available === false && d.source === 'moves' ? h('span', { key: 'srw2', style: { fontSize: 11.5, color: 'var(--yw)' } },
       'View-ul nu e sincronizat încă — se afișează istoricul vechi.') : null),
     h('div', { key: 'sp', style: { flex: 1 } }),
     h('button', { key: 'hlp', className: 'btn secondary', style: { fontSize: 12, padding: '5px 10px' }, onClick: function(){
@@ -1167,8 +1174,9 @@ function CtsDeptReport() {
           + '<b>Statistica 1 — mutări per mail.</b> De câte ori a schimbat mailul departamentul, de la intrare până la închidere. „0 mutări" = l-a rezolvat departamentul pe care a intrat.<br><br>'
           + '<b>Statistica 2 — cine mută.</b> La fiecare mutare se numără departamentul de pe care <i>pleacă</i> mailul (ex. Suport 1 a mutat 620 de mailuri către alt departament).<br><br>'
           + '<b>Statistica 3 — intermediari.</b> Departamentele prin care mailul doar a trecut: nu au fost primele alocate și nici nu l-au închis. Aici stau mailurile fără să se rezolve.<br><br>'
-          + '<b>De unde vin datele.</b> Două surse, comutabile din bara de filtre:<br>'
-          + '• <b>Log CTS</b> (<code>client_contact_email_log</code>, prin „Surse date") — un rând per alocare, deci lanțul complet, cu tot cu departamentele intermediare. Butonul „Traseu" de pe fiecare mail arată alocările brute: departament, cine a preluat, când.<br>'
+          + '<b>De unde vin datele.</b> Trei surse, comutabile din bara de filtre:<br>'
+          + '• <b>Log mutări</b> (<code>client_contact_email_department_log</code>, prin „Surse date") — fiecare rând E o mutare efectivă (departament sursă → destinație, cine, când). Nu se deduce nimic din diferențe — sursa preferată.<br>'
+          + '• <b>Log CTS</b> (<code>client_contact_email_log</code>, prin „Surse date") — un rând per alocare, lanțul se reconstruiește din secvența de departamente. Butonul „Traseu" de pe fiecare mail (ambele surse de mai sus) arată alocările/mutările brute: departament, cine, când.<br>'
           + '• <b>Istoric sync</b> (<code>cts_department_moves</code>) — varianta veche, scrisă la fiecare schimbare observată de sync.<br><br>'
           + '<b>Limitare (doar pe „Istoric sync").</b> Sync-ul CTS rulează la ~5 minute, deci două mutări făcute între două sincronizări apar ca una singură; pentru mailurile dinaintea activării raportului avem doar ultimul pas salvat. Pe sursa „Log CTS" limitarea nu există.<br><br>'
           + '<b>„Departament CTS #id".</b> Un <code>department_id</code> din CTS pentru care nu avem încă niciun angajat mapat local — pasul se arată ca atare, ca lanțul să nu piardă mutări reale.</div>',
@@ -1239,16 +1247,16 @@ function CtsDeptReport() {
     statPanel('s3', 3, 'Departamente intermediare', 'Au ținut mailul, dar nu au fost primele alocate și nici nu l-au închis. Top 10.', '#f97316',
       miniTable(['Departament', 'Apariții', '%'], midRows, 'Niciun intermediar pe intervalul filtrat.'),
       midRows.length ? barChartFor(midRows, '#f97316')
-        : chartPlaceholder(d.source === 'log'
+        : chartPlaceholder((d.source === 'log' || d.source === 'deptlog')
             ? 'Un intermediar apare doar la mailurile cu ≥2 mutări. Pe intervalul filtrat nu există niciunul în log.'
-            : 'Un intermediar apare doar la mailurile cu ≥2 mutări. Pe sursa „Istoric sync" vedem doar mutările prinse între două sincronizări (~5 min), deci lanțurile lungi ies sub-numărate — comută pe „Log CTS".'))
+            : 'Un intermediar apare doar la mailurile cu ≥2 mutări. Pe sursa „Istoric sync" vedem doar mutările prinse între două sincronizări (~5 min), deci lanțurile lungi ies sub-numărate — comută pe „Log mutări".'))
   ]);
 
   // ── Modalul „Cazuri concrete" ────────────────────────────────────────────
   // Lista din spatele unei cifre. Stă în modal (nu sub grafice) ca să încapă filtrele proprii:
   // de la → spre, câte mutări, subiect/expeditor, ID mail, responsabil.
   var casesTotalPages = Math.max(1, Math.ceil((cases.total || 0) / (cases.page_size || 50)));
-  var respAvailable = (cases.responsible_filter_available !== false) && d.source === 'log';
+  var respAvailable = (cases.responsible_filter_available !== false) && (d.source === 'log' || d.source === 'deptlog');
 
   function chainCell(it) {
     var slugs = (it.chain || '').split(' → ').filter(Boolean);
@@ -1319,7 +1327,7 @@ function CtsDeptReport() {
           h('div', { key: 'm', className: 'modal-meta' }, [
             h('span', { key: 'n' }, (cases.total || 0).toLocaleString('ro-RO') + ' mailuri'),
             h('span', { key: 's', style: { color: 'var(--t3)' } }, '·'),
-            h('span', { key: 'src' }, d.source === 'log' ? 'sursă: log CTS' : 'sursă: istoric sync'),
+            h('span', { key: 'src' }, d.source === 'deptlog' ? 'sursă: log mutări' : (d.source === 'log' ? 'sursă: log CTS' : 'sursă: istoric sync')),
             h('span', { key: 's2', style: { color: 'var(--t3)' } }, '·'),
             h('span', { key: 'hint', style: { color: 'var(--t3)' } }, 'Click pe rând → deschide emailul')
           ])
@@ -1336,7 +1344,7 @@ function CtsDeptReport() {
                 h('th', { key: 'fr' }, 'De la'), h('th', { key: 'ch' }, 'Traseu departamente'),
                 (respAvailable ? h('th', { key: 'rs' }, 'Responsabili') : null),
                 h('th', { key: 'mv', style: { textAlign: 'right' } }, 'Mutări'), h('th', { key: 'st' }, 'Închis'),
-                (d.source === 'log' ? h('th', { key: 'dt2' }, 'Detaliu') : null)
+                ((d.source === 'log' || d.source === 'deptlog') ? h('th', { key: 'dt2' }, 'Detaliu') : null)
               ])),
               h('tbody', { key: 'b' }, (cases.items || []).length ? cases.items.map(function(it){
                 return h('tr', { key: it.message_id, className: it.email_id ? 'clickable' : '', title: it.email_id ? 'Deschide emailul' : 'Doar în CTS — nu există în Cargo360',
@@ -1349,7 +1357,7 @@ function CtsDeptReport() {
                   (respAvailable ? h('td', { key: 'rs', title: it.responsibles || '', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.responsibles || '—') : null),
                   h('td', { key: 'mv', style: { textAlign: 'right', fontWeight: 700 } }, it.moves),
                   h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, it.solved_at ? dateCell(it.solved_at) : h('span', { style: { color: 'var(--yw)', fontSize: 11 } }, 'deschis')),
-                  (d.source === 'log' ? h('td', { key: 'dt2' }, h('button', {
+                  ((d.source === 'log' || d.source === 'deptlog') ? h('td', { key: 'dt2' }, h('button', {
                     className: 'btn secondary', style: { fontSize: 11, padding: '3px 8px', whiteSpace: 'nowrap' },
                     title: 'Toate alocările din log: departament, cine a preluat, când',
                     onClick: function(ev){ ev.stopPropagation(); openSteps(it.message_id, it.subject); }
@@ -1360,7 +1368,15 @@ function CtsDeptReport() {
       h('div', { key: 'ft', style: { padding: '0 20px 12px' } }, pager(casePage, casesTotalPages, setCasePage))
     ]));
 
-  var covNote = (cov.source === 'log')
+  var covNote = (cov.source === 'deptlog')
+    ? ('Sursă: log-ul de mutări `client_contact_email_department_log` — ' + ((cov.rows || 0).toLocaleString('ro-RO')) + ' mutări pe '
+       + ((cov.mails || 0).toLocaleString('ro-RO')) + ' mailuri'
+       + (cov.first_at ? (', ' + new Date(cov.first_at).toLocaleDateString('ro-RO') + ' → ' + new Date(cov.last_at).toLocaleDateString('ro-RO')) : '')
+       + '. Fiecare rând e o mutare efectivă (cine, când) — cel mai direct nivel de detaliu.'
+       + ((cov.unmapped_departments || 0) > 0
+          ? ' ⚠ ' + cov.unmapped_departments + ' department_id din CTS nu au niciun angajat mapat la noi — apar ca „Departament CTS #id".'
+          : ''))
+    : (cov.source === 'log')
     ? ('Sursă: log-ul CTS `client_contact_email_log` — ' + ((cov.rows || 0).toLocaleString('ro-RO')) + ' alocări pe '
        + ((cov.mails || 0).toLocaleString('ro-RO')) + ' mailuri'
        + (cov.first_at ? (', ' + new Date(cov.first_at).toLocaleDateString('ro-RO') + ' → ' + new Date(cov.last_at).toLocaleDateString('ro-RO')) : '')
