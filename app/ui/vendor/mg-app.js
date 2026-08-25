@@ -944,6 +944,11 @@ function CtsDeptReport() {
   const [casesLoading, setCasesLoading] = useState(false);
   const [casePage, setCasePage] = useState(1);
   const [selectedId, setSelectedId] = useState(null);
+  // Filtrele din modalul „Cazuri concrete". Se inițializează din drill (ce s-a apăsat pe KPI)
+  // și rămân editabile acolo — modalul e locul unde se caută mailul concret.
+  const [cf, setCf] = useState({ from: '', to: '', min: 1, max: 0, q: '', emailId: '', resp: '', sort: 'moves', size: 50 });
+  const [cq, setCq] = useState('');          // textul din caseta de căutare, înainte de debounce
+  const [respOpts, setRespOpts] = useState([]);
 
   function baseQs() {
     var qs = [];
@@ -966,18 +971,51 @@ function CtsDeptReport() {
   function loadCases() {
     if (!drill) { setCases({ items: [], total: 0, page: 1, page_size: 50 }); return; }
     setCasesLoading(true);
-    var qs = baseQs().concat(['page=' + casePage, 'page_size=50']);
-    if (drill.kind === 'moves') qs.push('min_moves=' + drill.value);
-    else if (drill.kind === 'from') { qs.push('min_moves=1'); qs.push('dept_from=' + encodeURIComponent(drill.value)); }
-    else if (drill.kind === 'mid') { qs.push('min_moves=1'); qs.push('dept_mid=' + encodeURIComponent(drill.value)); }
+    var qs = baseQs().concat(['page=' + casePage, 'page_size=' + (cf.size || 50), 'sort=' + (cf.sort || 'moves')]);
+    qs.push('min_moves=' + (cf.min != null ? cf.min : 1));
+    if (cf.max) qs.push('max_moves=' + cf.max);
+    // `dept_mid` vine DOAR din drill (INDICE 3): e o poziție pe lanț, nu o pereche din → spre.
+    if (drill.kind === 'mid') qs.push('dept_mid=' + encodeURIComponent(drill.value));
+    if (cf.from) qs.push('dept_from=' + encodeURIComponent(cf.from));
+    if (cf.to) qs.push('dept_to=' + encodeURIComponent(cf.to));
+    if (cf.q) qs.push('q=' + encodeURIComponent(cf.q));
+    if (cf.emailId) qs.push('email_id=' + encodeURIComponent(cf.emailId));
+    if (cf.resp) qs.push('responsible=' + encodeURIComponent(cf.resp));
     api('/cts-training/dept-report/cases?' + qs.join('&'))
       .then(function(d){ setCases(d); setCasesLoading(false); })
       .catch(function(){ setCasesLoading(false); });
   }
 
+  function setCfv(k, v) { setCf(function(p){ var n = Object.assign({}, p); n[k] = v; return n; }); setCasePage(1); }
+
+  // Deschiderea unui KPI = drill + filtre pornite din el; de aici încolo se rafinează în modal.
+  function openDrill(dr) {
+    setDrill(dr);
+    setCasePage(1);
+    setCq('');
+    setCf({
+      from: dr.kind === 'from' ? dr.value : '',
+      to: '', min: dr.kind === 'moves' ? dr.value : 1, max: 0,
+      q: '', emailId: '', resp: '', sort: 'moves', size: 50
+    });
+  }
+
   useEffect(function(){ load(); setCasePage(1); }, [dateFrom, dateTo, dept, onlySolved, source]);
-  useEffect(function(){ setCasePage(1); }, [drill]);
-  useEffect(function(){ loadCases(); }, [drill, casePage, dateFrom, dateTo, dept, onlySolved, source]);
+  useEffect(function(){ loadCases(); },
+    [drill, casePage, dateFrom, dateTo, dept, onlySolved, source,
+     cf.from, cf.to, cf.min, cf.max, cf.q, cf.emailId, cf.resp, cf.sort, cf.size]);
+  // Căutarea liberă se aplică după 350 ms de liniște — altfel s-ar cere o pagină per tastă.
+  useEffect(function(){
+    var t = setTimeout(function(){ if (cq !== cf.q) setCfv('q', cq); }, 350);
+    return function(){ clearTimeout(t); };
+  }, [cq]);
+  // Opțiunile de responsabil există doar pe sursa 'log' (istoricul din sync nu ține cine a preluat).
+  useEffect(function(){
+    if (!drill) return;
+    api('/cts-training/dept-report/responsibles')
+      .then(function(d){ setRespOpts((d && d.items) || []); })
+      .catch(function(){ setRespOpts([]); });
+  }, [drill]);
 
   // Traseul BRUT al unui mail: un rând per alocare din client_contact_email_log — acolo se văd
   // departamentele intermediare, cine a preluat și când. Doar pentru sursa 'log'.
@@ -1156,7 +1194,7 @@ function CtsDeptReport() {
       label: DIST_SHORT[r.bucket], value: r.emails, pct: r.pct, color: DIST_COLORS[r.bucket],
       active: !!(drill && drill.kind === 'moves' && drill.value === r.bucket),
       title: pick ? 'Vezi mailurile cu cel puțin ' + r.bucket + ' mutări' : 'Rezolvate de departamentul inițial',
-      onPick: pick ? function(){ setDrill({ kind: 'moves', value: r.bucket, label: (r.bucket >= 3 ? 'mailuri cu 3+ mutări' : 'mailuri cu cel puțin ' + r.bucket + ' mutări') }); } : null
+      onPick: pick ? function(){ openDrill({ kind: 'moves', value: r.bucket, label: (r.bucket >= 3 ? 'mailuri cu 3+ mutări' : 'mailuri cu cel puțin ' + r.bucket + ' mutări') }); } : null
     };
   });
 
@@ -1166,7 +1204,7 @@ function CtsDeptReport() {
     return { label: r.label, value: r.moves, pct: r.pct, color: DEPT_COLORS[r.department] || '#a855f7',
       active: !!(drill && drill.kind === 'from' && drill.value === r.department),
       title: 'Vezi mailurile mutate de ' + r.label,
-      onPick: function(){ setDrill({ kind: 'from', value: r.department, label: 'mutări inițiate de ' + r.label }); } };
+      onPick: function(){ openDrill({ kind: 'from', value: r.department, label: 'mutări inițiate de ' + r.label }); } };
   });
 
   var midTop = mids.filter(function(r){ return (r.n || 0) > 0; }).slice(0, 10);
@@ -1174,7 +1212,7 @@ function CtsDeptReport() {
     return { label: r.label, value: r.n, pct: r.pct, color: DEPT_COLORS[r.department] || '#f97316',
       active: !!(drill && drill.kind === 'mid' && drill.value === r.department),
       title: 'Vezi mailurile în care ' + r.label + ' a fost doar intermediar',
-      onPick: function(){ setDrill({ kind: 'mid', value: r.department, label: r.label + ' ca departament intermediar' }); } };
+      onPick: function(){ openDrill({ kind: 'mid', value: r.department, label: r.label + ' ca departament intermediar' }); } };
   });
 
   function barChartFor(rows, fallbackColor) {
@@ -1206,8 +1244,12 @@ function CtsDeptReport() {
             : 'Un intermediar apare doar la mailurile cu ≥2 mutări. Pe sursa „Istoric sync" vedem doar mutările prinse între două sincronizări (~5 min), deci lanțurile lungi ies sub-numărate — comută pe „Log CTS".'))
   ]);
 
-  // tabelul de cazuri concrete (drill-down)
+  // ── Modalul „Cazuri concrete" ────────────────────────────────────────────
+  // Lista din spatele unei cifre. Stă în modal (nu sub grafice) ca să încapă filtrele proprii:
+  // de la → spre, câte mutări, subiect/expeditor, ID mail, responsabil.
   var casesTotalPages = Math.max(1, Math.ceil((cases.total || 0) / (cases.page_size || 50)));
+  var respAvailable = (cases.responsible_filter_available !== false) && d.source === 'log';
+
   function chainCell(it) {
     var slugs = (it.chain || '').split(' → ').filter(Boolean);
     return h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' } },
@@ -1218,42 +1260,105 @@ function CtsDeptReport() {
         ]);
       }));
   }
-  var casesBlock = !drill ? null : h('div', { key: 'cases' }, [
-    secHdr('cs-h', 'Cazuri concrete — ' + drill.label, '#ef4444',
-      'Mailurile din spatele cifrei de mai sus. Click pe rând → deschide emailul (pentru „de ce s-a mutat").'),
-    h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 10, margin: '6px 0 8px' } }, [
-      h('span', { key: 'n', style: { fontSize: 12, color: 'var(--t2)' } }, (cases.total || 0).toLocaleString('ro-RO') + ' mailuri'),
-      h('button', { key: 'x', className: 'btn secondary', style: { fontSize: 12, padding: '4px 10px' }, onClick: function(){ setDrill(null); } }, '✕ Închide lista')
+
+  var fLbl = { fontSize: 11, color: 'var(--t3)', whiteSpace: 'nowrap' };
+  var fCtl = { padding: '5px 8px', fontSize: 12.5, fontFamily: 'inherit' };
+  function deptSelect(key, value, onCh, placeholder) {
+    return h('select', { key: key, className: 'btn secondary', style: Object.assign({ minWidth: 150 }, fCtl),
+      value: value, onChange: function(e){ onCh(e.target.value); } },
+      [h('option', { key: '', value: '' }, placeholder)].concat(
+        DEPT_SLUGS.map(function(sl){ return h('option', { key: sl, value: sl }, DEPT_LABELS[sl]); })));
+  }
+
+  var casesFilters = h('div', { key: 'cflt', style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', padding: '10px 20px', borderBottom: '1px solid var(--bd)' } }, [
+    h('span', { key: 'l1', style: fLbl }, 'De la:'),
+    deptSelect('ff', cf.from, function(v){ setCfv('from', v); }, '— oricare —'),
+    h('span', { key: 'ar', style: { color: 'var(--t3)' } }, '→'),
+    h('span', { key: 'l2', style: fLbl }, 'Spre:'),
+    deptSelect('ft', cf.to, function(v){ setCfv('to', v); }, '— oricare —'),
+    (cf.from && cf.to) ? h('span', { key: 'pw', style: { fontSize: 10.5, color: 'var(--am)' }, title: 'Se caută tranziția directă, nu cele două departamente separat' }, 'tranziție directă') : null,
+    h('span', { key: 'sp1', style: { color: 'var(--bd)' } }, '|'),
+    h('span', { key: 'l3', style: fLbl }, 'Mutări:'),
+    h('input', { key: 'mn', type: 'number', min: 0, max: 10, className: 'btn secondary', style: Object.assign({ width: 62 }, fCtl),
+      title: 'Minim mutări', value: cf.min, onChange: function(e){ setCfv('min', e.target.value === '' ? 0 : Math.max(0, parseInt(e.target.value, 10) || 0)); } }),
+    h('span', { key: 'dh', style: fLbl }, '—'),
+    h('input', { key: 'mx', type: 'number', min: 0, max: 10, className: 'btn secondary', style: Object.assign({ width: 62 }, fCtl),
+      title: 'Maxim mutări (0 = fără plafon)', value: cf.max, onChange: function(e){ setCfv('max', e.target.value === '' ? 0 : Math.max(0, parseInt(e.target.value, 10) || 0)); } }),
+    h('span', { key: 'sp2', style: { color: 'var(--bd)' } }, '|'),
+    h('input', { key: 'q', type: 'search', className: 'btn secondary', style: Object.assign({ minWidth: 210 }, fCtl),
+      placeholder: 'Subiect / expeditor / message-id', value: cq, onChange: function(e){ setCq(e.target.value); } }),
+    h('input', { key: 'eid', type: 'number', className: 'btn secondary', style: Object.assign({ width: 108 }, fCtl),
+      placeholder: 'ID mail', title: 'ID-ul mailului din Cargo360', value: cf.emailId, onChange: function(e){ setCfv('emailId', e.target.value); } }),
+    respAvailable ? h('input', { key: 'rsp', className: 'btn secondary', list: 'ctsRespOpts', style: Object.assign({ minWidth: 160 }, fCtl),
+      placeholder: 'Responsabil', title: 'Cine a preluat mailul (din log-ul CTS)', value: cf.resp,
+      onChange: function(e){ setCfv('resp', e.target.value); } }) : null,
+    respAvailable ? h('datalist', { key: 'dl', id: 'ctsRespOpts' }, respOpts.map(function(o, i){
+      return h('option', { key: i, value: o.name }, o.n + ' alocări'); })) : null,
+    h('div', { key: 'sp3', style: { flex: 1 } }),
+    h('select', { key: 'srt', className: 'btn secondary', style: fCtl, value: cf.sort, title: 'Ordonare',
+      onChange: function(e){ setCfv('sort', e.target.value); } }, [
+      h('option', { key: 'm', value: 'moves' }, 'Cele mai mutate'),
+      h('option', { key: 'r', value: 'recent' }, 'Cea mai recentă mutare'),
+      h('option', { key: 'o', value: 'oldest' }, 'Cele mai vechi')
     ]),
-    casesLoading
-      ? h('div', { key: 'ld', style: { padding: 26, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…')
-      : h('div', { key: 'tbl', className: 'card', style: { padding: 0, overflow: 'auto' } }, h('table', { className: 'list-table-full' }, [
-          h('thead', { key: 'h' }, h('tr', null, [
-            h('th', { key: 'id' }, 'ID'), h('th', { key: 'dt' }, 'Recepționat'), h('th', { key: 'su' }, 'Subiect'),
-            h('th', { key: 'fr' }, 'De la'), h('th', { key: 'ch' }, 'Traseu departamente'),
-            h('th', { key: 'mv', style: { textAlign: 'right' } }, 'Mutări'), h('th', { key: 'st' }, 'Închis'),
-            (d.source === 'log' ? h('th', { key: 'dt2' }, 'Detaliu') : null)
-          ])),
-          h('tbody', { key: 'b' }, (cases.items || []).length ? cases.items.map(function(it){
-            return h('tr', { key: it.message_id, className: it.email_id ? 'clickable' : '', title: it.email_id ? 'Deschide emailul' : 'Doar în CTS — nu există în Cargo360',
-              onClick: it.email_id ? function(){ setSelectedId(it.email_id); } : null }, [
-              h('td', { key: 'id' }, it.email_id ? h(IdCell, { id: it.email_id }) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
-              h('td', { key: 'dt', style: { whiteSpace: 'nowrap' } }, (it.received_at || it.first_at) ? dateCell(it.received_at || it.first_at) : '—'),
-              h('td', { key: 'su', title: it.subject || '', style: { maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.subject || h('span', { style: { color: 'var(--t3)' } }, '(doar în CTS)')),
-              h('td', { key: 'fr', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.from_address || '—'),
-              h('td', { key: 'ch' }, chainCell(it)),
-              h('td', { key: 'mv', style: { textAlign: 'right', fontWeight: 700 } }, it.moves),
-              h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, it.solved_at ? dateCell(it.solved_at) : h('span', { style: { color: 'var(--yw)', fontSize: 11 } }, 'deschis')),
-              (d.source === 'log' ? h('td', { key: 'dt2' }, h('button', {
-                className: 'btn secondary', style: { fontSize: 11, padding: '3px 8px', whiteSpace: 'nowrap' },
-                title: 'Toate alocările din log: departament, cine a preluat, când',
-                onClick: function(ev){ ev.stopPropagation(); openSteps(it.message_id, it.subject); }
-              }, 'Traseu')) : null)
-            ]);
-          }) : h('tr', { key: 'e' }, h('td', { colSpan: d.source === 'log' ? 8 : 7, style: { textAlign: 'center', padding: 26, color: 'var(--t3)' } }, 'Niciun mail pentru selecția curentă.')))
-        ])),
-    h('div', { key: 'pg' }, pager(casePage, casesTotalPages, setCasePage))
+    h('select', { key: 'ps', className: 'btn secondary', style: fCtl, value: cf.size, title: 'Mailuri pe pagină',
+      onChange: function(e){ setCfv('size', parseInt(e.target.value, 10) || 50); } },
+      [25, 50, 100, 200].map(function(n){ return h('option', { key: n, value: n }, n + ' / pagină'); })),
+    (cf.from || cf.to || cf.q || cf.emailId || cf.resp || cf.max || cf.min > 1)
+      ? h('button', { key: 'rs', className: 'btn secondary', style: Object.assign({ color: 'var(--rd)' }, fCtl),
+          onClick: function(){ setCq(''); setCf(function(pv){ return Object.assign({}, pv, { from: '', to: '', min: drill && drill.kind === 'moves' ? drill.value : 1, max: 0, q: '', emailId: '', resp: '' }); }); setCasePage(1); } }, 'Reset')
+      : null
   ]);
+
+  var casesModal = !drill ? null : h('div', { key: 'cmod', className: 'modal-bg',
+    onMouseDown: function(e){ if (e.target === e.currentTarget) setDrill(null); } },
+    h('div', { className: 'modal', style: { width: 1480 }, onClick: function(e){ e.stopPropagation(); } }, [
+      h('div', { key: 'hd', className: 'modal-head' }, [
+        h('div', { key: 't', style: { minWidth: 0 } }, [
+          h('h3', { key: 'h' }, 'Cazuri concrete — ' + drill.label),
+          h('div', { key: 'm', className: 'modal-meta' }, [
+            h('span', { key: 'n' }, (cases.total || 0).toLocaleString('ro-RO') + ' mailuri'),
+            h('span', { key: 's', style: { color: 'var(--t3)' } }, '·'),
+            h('span', { key: 'src' }, d.source === 'log' ? 'sursă: log CTS' : 'sursă: istoric sync'),
+            h('span', { key: 's2', style: { color: 'var(--t3)' } }, '·'),
+            h('span', { key: 'hint', style: { color: 'var(--t3)' } }, 'Click pe rând → deschide emailul')
+          ])
+        ]),
+        h('button', { key: 'x', className: 'modal-close', title: 'Închide', onClick: function(){ setDrill(null); } }, '✕')
+      ]),
+      casesFilters,
+      h('div', { key: 'bd', style: { flex: 1, overflow: 'auto', padding: '0 20px' } },
+        casesLoading
+          ? h('div', { style: { padding: 40, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…')
+          : h('table', { className: 'list-table-full' }, [
+              h('thead', { key: 'h' }, h('tr', null, [
+                h('th', { key: 'id' }, 'ID'), h('th', { key: 'dt' }, 'Recepționat'), h('th', { key: 'su' }, 'Subiect'),
+                h('th', { key: 'fr' }, 'De la'), h('th', { key: 'ch' }, 'Traseu departamente'),
+                (respAvailable ? h('th', { key: 'rs' }, 'Responsabili') : null),
+                h('th', { key: 'mv', style: { textAlign: 'right' } }, 'Mutări'), h('th', { key: 'st' }, 'Închis'),
+                (d.source === 'log' ? h('th', { key: 'dt2' }, 'Detaliu') : null)
+              ])),
+              h('tbody', { key: 'b' }, (cases.items || []).length ? cases.items.map(function(it){
+                return h('tr', { key: it.message_id, className: it.email_id ? 'clickable' : '', title: it.email_id ? 'Deschide emailul' : 'Doar în CTS — nu există în Cargo360',
+                  onClick: it.email_id ? function(){ setSelectedId(it.email_id); } : null }, [
+                  h('td', { key: 'id' }, it.email_id ? h(IdCell, { id: it.email_id }) : h('span', { style: { color: 'var(--t3)', fontSize: 11 } }, '—')),
+                  h('td', { key: 'dt', style: { whiteSpace: 'nowrap' } }, (it.received_at || it.first_at) ? dateCell(it.received_at || it.first_at) : '—'),
+                  h('td', { key: 'su', title: it.subject || '', style: { maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.subject || h('span', { style: { color: 'var(--t3)' } }, '(doar în CTS)')),
+                  h('td', { key: 'fr', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.from_address || '—'),
+                  h('td', { key: 'ch' }, chainCell(it)),
+                  (respAvailable ? h('td', { key: 'rs', title: it.responsibles || '', style: { fontSize: 12, color: 'var(--t2)', maxWidth: 190, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, it.responsibles || '—') : null),
+                  h('td', { key: 'mv', style: { textAlign: 'right', fontWeight: 700 } }, it.moves),
+                  h('td', { key: 'st', style: { whiteSpace: 'nowrap' } }, it.solved_at ? dateCell(it.solved_at) : h('span', { style: { color: 'var(--yw)', fontSize: 11 } }, 'deschis')),
+                  (d.source === 'log' ? h('td', { key: 'dt2' }, h('button', {
+                    className: 'btn secondary', style: { fontSize: 11, padding: '3px 8px', whiteSpace: 'nowrap' },
+                    title: 'Toate alocările din log: departament, cine a preluat, când',
+                    onClick: function(ev){ ev.stopPropagation(); openSteps(it.message_id, it.subject); }
+                  }, 'Traseu')) : null)
+                ]);
+              }) : h('tr', { key: 'e' }, h('td', { colSpan: 9, style: { textAlign: 'center', padding: 40, color: 'var(--t3)' } }, 'Niciun mail pentru filtrele curente.')))
+            ])),
+      h('div', { key: 'ft', style: { padding: '0 20px 12px' } }, pager(casePage, casesTotalPages, setCasePage))
+    ]));
 
   var covNote = (cov.source === 'log')
     ? ('Sursă: log-ul CTS `client_contact_email_log` — ' + ((cov.rows || 0).toLocaleString('ro-RO')) + ' alocări pe '
@@ -1271,7 +1376,7 @@ function CtsDeptReport() {
   return h('div', { className: 'page' }, [
     h('div', { key: 'intro', style: { fontSize: 13, color: 'var(--t2)', marginBottom: 12 } },
       'Ce procent din mailuri ajunge pe mai multe departamente, privit din 3 unghiuri: câte mutări are un mail, cine le inițiază și cine e doar intermediar. ' +
-      'Fiecare linie e clicabilă și deschide mailurile concrete din spatele cifrei.'),
+      'Fiecare linie (și fiecare traseu din → în) deschide un tabel cu mailurile concrete din spatele cifrei, cu filtre proprii: de la → spre, număr de mutări, subiect, ID mail, responsabil.'),
     kpis,
     filters,
     loading ? h('div', { key: 'ld', style: { padding: 40, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…') : h('div', { key: 'body' }, [
@@ -1286,7 +1391,11 @@ function CtsDeptReport() {
             h('th', { key: 'p', style: { textAlign: 'right' } }, 'Pondere din mutări')
           ])),
           h('tbody', { key: 'b' }, pairs.map(function(p, i){
-            return h('tr', { key: i }, [
+            return h('tr', { key: i, className: 'clickable', title: 'Vezi mailurile mutate ' + p.from_label + ' → ' + p.to_label,
+              onClick: function(){
+                openDrill({ kind: 'pair', value: p.from + '>' + p.to, label: p.from_label + ' → ' + p.to_label });
+                setCf(function(pv){ return Object.assign({}, pv, { from: p.from, to: p.to, min: 1 }); });
+              } }, [
               h('td', { key: 'f' }, deptBadge(p.from) || h('span', { className: 'badge', style: { textTransform: 'none' } }, p.from_label)),
               h('td', { key: 't' }, deptBadge(p.to) || h('span', { className: 'badge', style: { textTransform: 'none' } }, p.to_label)),
               h('td', { key: 'n', style: { textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' } }, (p.n || 0).toLocaleString('ro-RO')),
@@ -1295,19 +1404,19 @@ function CtsDeptReport() {
           }))
         ])) : null,
 
-      casesBlock,
       h('div', { key: 'cov', style: { marginTop: 16, fontSize: 11.5, color: 'var(--t3)', lineHeight: 1.6 } }, covNote)
     ]),
     (function(){
       var navIds = (cases.items || []).filter(function(it){ return it.email_id; }).map(function(it){ return it.email_id; });
       var ci = navIds.indexOf(selectedId);
       return selectedId != null ? h(EmailDetail, {
-        key: 'mod', emailId: selectedId, allIds: navIds, currentIndex: ci,
+        key: 'mod', emailId: selectedId, allIds: navIds, currentIndex: ci, zIndex: 1200,
         onNext: function(){ if (ci > -1 && ci < navIds.length - 1) setSelectedId(navIds[ci + 1]); },
         onPrev: function(){ if (ci > 0) setSelectedId(navIds[ci - 1]); },
         onClose: function(){ setSelectedId(null); }
       }) : null;
-    })()
+    })(),
+    casesModal
   ]);
 }
 

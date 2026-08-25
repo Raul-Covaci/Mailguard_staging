@@ -8,6 +8,48 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.0 - 2026-08-25
+
+### MINOR — Sincronizare automată IRIS Data Views + modal de cazuri în „Raport departamente"
+
+**Auto-sync (partea care lipsea ca raportul să meargă pe producție).** Comutatorul „sincronizare
+automată" exista în UI și în schemă (`iris_dv_state.auto_sync`, din 20260723), dar nu avea nici
+endpoint (butonul dădea 404), nici rulare: un view rămânea la ultima apăsare manuală de buton.
+Pe producție, unde nimeni nu intră în „Surse date" să apese, raportul ar fi arătat date înghețate.
+
+- `PUT /iris-dv/views/{view}/auto-sync` `{enabled, interval_minutes}` (interval minim 5 = cadența
+  cronului); `auto_sync` apare acum în `/sync-status` și în listarea de view-uri.
+- `app/services/iris_dv_autosync.py` → `run_due_syncs()`, apelat din cronul de 5 minute
+  (`POST /process/run-now`). Fiecare view are intervalul lui; `pg_advisory_lock` global, ca un
+  sync lung să nu fie pornit a doua oară de tick-ul următor; maxim 6 view-uri per tick.
+- Migrația `20260825_dv_autosync_email_log.sql` pornește auto-sync la 5 minute pentru
+  `client_contact_email_log` și `client_contact_email_department_log`.
+
+**Mod incremental.** Sincronizarea știa DOAR `snapshot` (DELETE + INSERT integral). Un view
+declarat `incremental` întoarce doar rândurile schimbate de la `since`, deci snapshot-ul ar fi
+golit tabela la prima rulare care aduce trei rânduri. Acum modul se ia din ce declară view-ul în
+`/onboarding` (memorat apoi în `iris_dv_state.mode`): `incremental` face UPSERT pe `id`, fără
+DELETE, cu fereastră de suprapunere de 30 min peste ultimul sync.
+
+Tot aici, în sincronizare: fiecare pagină se cerea de DOUĂ ori (răspunsul primului GET se arunca,
+apoi se refăcea cererea) — trafic și timp dublu pe view-urile mari; și inserarea se făcea rând cu
+rând, acum în loturi de 500.
+
+**Modal „Cazuri concrete".** Lista din spatele unei cifre era un tabel sub grafice. Acum e modal,
+cu filtre proprii peste cele ale paginii:
+
+- **de la → spre**: cu ambele completate se caută **tranziția directă** (a plecat de pe X și a
+  ajuns pe Y, una după alta), nu cele două departamente separat;
+- număr de mutări (interval min–max), căutare în subiect / expeditor / message-id, ID mail,
+  **responsabil** (cine a preluat — doar pe sursa „Log CTS", `moves` nu ține informația);
+- ordonare (cele mai mutate / cea mai recentă mutare / cele mai vechi), 25–200 rânduri pe pagină,
+  paginare completă.
+- Tabelul „Trasee frecvente (din → în)" e clicabil: deschide modalul filtrat pe acea tranziție.
+- `GET /cts-training/dept-report/responsibles` alimentează dropdown-ul de responsabili.
+
+Potrivirea responsabilului trece prin `cts_dv_employee.admin_id` → email → `employee_department_mapping`,
+NICIODATĂ pe egalitate de nume.
+
 ## v3.8.2 - 2026-08-25
 
 ### PATCH — „Email Scout Report" (office@cargotrack.ro): fortat pe Suport 1 + P4

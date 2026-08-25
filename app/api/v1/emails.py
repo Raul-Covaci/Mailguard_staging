@@ -1060,6 +1060,14 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
         res["device_ops_dv_sync"] = device_ops_suport2_sync.run_recent_if_due()
     except Exception:
         logger.exception("device_ops_dv rolling sync failed")
+    # IRIS DATA VIEWS: sincronizare automata per view (iris_dv_state.auto_sync + interval).
+    # Aici intra si `client_contact_email_log` / `client_contact_email_department_log`, sursele
+    # raportului de departamente — fara asta ramaneau la ultima apasare manuala de buton.
+    try:
+        from app.services import iris_dv_autosync
+        res["iris_dv_autosync"] = iris_dv_autosync.run_due_syncs()
+    except Exception:
+        logger.exception("iris_dv auto-sync failed")
     # RECLAMATII (Quality Evaluation, IRIS Data Views). Throttle intern 50s, deci prospetimea e
     # data de cadenta cronului, nu de sync -- cerinta e "la 1 minut" (v2.10.0).
     try:

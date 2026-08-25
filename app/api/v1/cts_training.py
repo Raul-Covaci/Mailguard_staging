@@ -968,9 +968,15 @@ def cts_training_dept_report_cases(
     department: str = Query("", description="doar mailurile care au trecut prin acest departament"),
     only_solved: int = Query(0),
     min_moves: int = Query(1, ge=0, le=10),
+    max_moves: int = Query(0, ge=0, le=10, description="0 = fara plafon"),
     dept_from: str = Query("", description="departamentul care a initiat o mutare"),
+    dept_to: str = Query("", description="departamentul care a PRIMIT mailul printr-o mutare"),
     dept_mid: str = Query("", description="departament aparut ca INTERMEDIAR pe lant"),
+    q: str = Query("", description="cautare in subiect / expeditor / message_id"),
+    email_id: int = Query(0, description="un singur mail, dupa ID-ul din Cargo360"),
+    responsible: str = Query("", description="nume (partial) sau ID CTS al celui care a preluat"),
     source: str = Query("auto", description="auto | log | moves"),
+    sort: str = Query("moves", description="moves | recent | oldest"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -978,16 +984,47 @@ def cts_training_dept_report_cases(
 ):
     """Cazurile concrete din spatele statisticilor: un rand per mail, cu lantul de departamente.
 
-    Filtrele `dept_from` / `dept_mid` corespund click-ului pe o linie din statistica 2 / 3."""
+    Filtre:
+      * `dept_from` / `dept_mid` — click pe o linie din statistica 2 / 3;
+      * `dept_from` + `dept_to` impreuna = TRANZITIA concreta (a plecat de pe X si a ajuns pe Y,
+        una dupa alta), nu doua conditii independente — asta cere „de la -> spre" din modal;
+      * `dept_to` singur = mailul a ajuns pe departamentul asta printr-o mutare (nu alocarea initiala);
+      * `responsible` — doar pe sursa 'log' (`moves` nu tine cine a preluat); ignorat altfel.
+    """
     params = _dept_report_params(date_from, date_to, department, only_solved)
     CTE, src, _log_ok = _chain_source(db, source)
-    d_from = (dept_from or "").strip() or None
-    d_mid = (dept_mid or "").strip() or None
-    params.update({"min_moves": min_moves,
-                   "d_from": d_from if d_from in DEPT_LABELS else None,
-                   "d_mid": d_mid if d_mid in DEPT_LABELS else None})
+
+    def _dep(v):
+        v = (v or "").strip() or None
+        # `cts_<id>` = department_id CTS fara angajat mapat local; e un slug valid in lant.
+        if v and (v in DEPT_LABELS or (v.startswith("cts_") and v[4:].isdigit())):
+            return v
+        return None
+
+    d_from, d_to, d_mid = _dep(dept_from), _dep(dept_to), _dep(dept_mid)
+    pair = (d_from is not None and d_to is not None)
+    resp = (responsible or "").strip() or None
+    if src != "log":
+        resp = None                     # `cts_department_moves` nu tine responsabilul
+    params.update({
+        "min_moves": min_moves,
+        "max_moves": (max_moves if max_moves and max_moves >= min_moves else None),
+        "d_from": None if pair else d_from,
+        "d_to": None if pair else d_to,
+        "d_mid": d_mid,
+        "p_from": d_from if pair else None,
+        "p_to": d_to if pair else None,
+        "q": (q or "").strip() or None,
+        "email_id": email_id or None,
+        "resp": resp,
+    })
 
     per_mail = CTE + """
+    , trans AS (
+        SELECT message_id, dep AS t,
+               lag(dep) OVER (PARTITION BY message_id ORDER BY step) AS f
+          FROM ch
+    )
     , agg AS (
         SELECT c.message_id,
                max(c.steps) - 1 AS moves,
@@ -999,22 +1036,54 @@ def cts_training_dept_report_cases(
           FROM ch c
          GROUP BY c.message_id
         HAVING max(c.steps) - 1 >= :min_moves
+           AND (CAST(:max_moves AS int) IS NULL OR max(c.steps) - 1 <= CAST(:max_moves AS int))
            AND (CAST(:d_from AS text) IS NULL
                 OR bool_or(c.dep = CAST(:d_from AS text) AND c.step < c.steps))
+           AND (CAST(:d_to AS text) IS NULL
+                OR bool_or(c.dep = CAST(:d_to AS text) AND c.step > 1))
            AND (CAST(:d_mid AS text) IS NULL
                 OR bool_or(c.dep = CAST(:d_mid AS text) AND c.step > 1 AND c.step < c.steps))
+           AND (CAST(:p_from AS text) IS NULL
+                OR EXISTS (SELECT 1 FROM trans x
+                            WHERE x.message_id = c.message_id
+                              AND x.f = CAST(:p_from AS text)
+                              AND x.t = CAST(:p_to AS text)))
     )
-    """
-
-    total = db.execute(text(per_mail + " SELECT count(*) FROM agg"), params).scalar() or 0
-    rows = db.execute(text(per_mail + """
+    , rowsq AS (
         SELECT a.message_id, a.moves, a.chain, a.first_dep, a.last_dep,
                a.first_at, a.last_move_at, m.email_id, m.solved_at, m.is_solved,
                e.subject, e.from_address, e.received_at
+               RESP_COL
           FROM agg a
           JOIN mail m ON m.message_id = a.message_id
           LEFT JOIN emails e ON e.id = m.email_id
-         ORDER BY a.moves DESC, a.last_move_at DESC
+         WHERE (CAST(:email_id AS bigint) IS NULL OR m.email_id = CAST(:email_id AS bigint))
+           AND (CAST(:q AS text) IS NULL
+                OR position(lower(CAST(:q AS text)) in lower(COALESCE(e.subject, ''))) > 0
+                OR position(lower(CAST(:q AS text)) in lower(COALESCE(e.from_address, ''))) > 0
+                OR position(lower(CAST(:q AS text)) in lower(a.message_id)) > 0)
+           RESP_FILTER
+    )
+    """
+    # Responsabilul exista doar in log; pe sursa 'moves' coloana si filtrul dispar din SQL.
+    if src == "log":
+        per_mail = per_mail.replace(
+            "RESP_COL", ", " + cts_email_log.responsibles_select_sql("a.message_id") + " AS responsibles")
+        per_mail = per_mail.replace(
+            "RESP_FILTER",
+            ("AND (CAST(:resp AS text) IS NULL OR "
+             + cts_email_log.responsible_exists_sql("a.message_id") + ")"))
+    else:
+        per_mail = per_mail.replace("RESP_COL", "").replace("RESP_FILTER", "")
+
+    order = {"recent": "a.last_move_at DESC NULLS LAST",
+             "oldest": "a.first_at ASC NULLS LAST"}.get(
+                 (sort or "").strip().lower(), "a.moves DESC, a.last_move_at DESC")
+
+    total = db.execute(text(per_mail + " SELECT count(*) FROM rowsq"), params).scalar() or 0
+    rows = db.execute(text(per_mail + f"""
+        SELECT * FROM rowsq
+         ORDER BY {order}
          LIMIT :page_size OFFSET :offset
     """), dict(params, page_size=page_size, offset=(page - 1) * page_size)).fetchall()
 
@@ -1027,9 +1096,26 @@ def cts_training_dept_report_cases(
         "first_at": m["first_at"], "last_move_at": m["last_move_at"],
         "solved_at": m["solved_at"], "is_solved": bool(m["is_solved"]),
         "subject": m["subject"], "from_address": m["from_address"], "received_at": m["received_at"],
+        "responsibles": m.get("responsibles"),
     } for m in (r._mapping for r in rows)]
     return {"total": int(total), "page": page, "page_size": page_size,
-            "source": src, "items": items}
+            "source": src, "items": items,
+            "responsible_filter_available": src == "log",
+            "filters": {"min_moves": min_moves, "max_moves": max_moves or None,
+                        "dept_from": d_from, "dept_to": d_to, "dept_mid": d_mid,
+                        "pair": pair, "q": params["q"], "email_id": params["email_id"],
+                        "responsible": resp, "sort": sort}}
+
+
+@router.get("/cts-training/dept-report/responsibles")
+def cts_training_dept_report_responsibles(
+    db: Session = Depends(get_db), admin=Depends(get_current_admin),
+):
+    """Optiunile pentru filtrul „responsabil" din modalul de cazuri. Gol daca log-ul nu e
+    sincronizat — filtrul se ascunde atunci in UI."""
+    if not cts_email_log.available(db):
+        return {"available": False, "items": []}
+    return {"available": True, "items": cts_email_log.responsible_options(db)}
 
 
 @router.get("/cts-training/dept-report/mail-steps")

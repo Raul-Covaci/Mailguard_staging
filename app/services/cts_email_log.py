@@ -243,3 +243,65 @@ def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
          LIMIT :lim
     """), {"mid": message_id, "lim": limit}).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# ── Responsabili (pentru filtrul si coloana din „Cazuri concrete") ────────────
+# Log-ul tine `responsible_id` = admin CTS. Traducerea in angajat trece prin
+# `cts_dv_employee.admin_id` -> email -> `employee_department_mapping`, NICIODATA pe egalitate
+# de nume (numele din CTS e scris altfel decat in mapping — vezi CLAUDE.md).
+_RESP_LATERAL = """
+    LEFT JOIN LATERAL (
+        SELECT e.name
+          FROM cts_dv_employee dv
+          JOIN employee_department_mapping e ON lower(e.email) = lower(dv.email)
+         WHERE dv.admin_id = NULLIF(l2."responsible_id", '')
+         ORDER BY e.enabled DESC, e.id
+         LIMIT 1
+    ) emp ON true
+"""
+
+_MID_MATCH = """(l2."message_id" = {mid} OR ('mid:' || NULLIF(l2."mid", '')) = {mid})"""
+
+
+def responsible_exists_sql(mid_expr: str) -> str:
+    """EXISTS pentru filtrul pe responsabil: dupa nume (potrivire partiala, case-insensitive)
+    sau dupa id-ul CTS, ca sa mearga si cand angajatul nu e inca mapat local.
+    `position(... in ...)` in loc de ILIKE: `%` e placeholder de parametru la psycopg2, deci
+    orice `%` literal in SQL-ul asta ar trebui dublat — vezi nota de la `_ts`."""
+    return f"""EXISTS (
+        SELECT 1 FROM {TABLE} l2 {_RESP_LATERAL}
+         WHERE {_MID_MATCH.format(mid=mid_expr)}
+           AND (position(lower(CAST(:resp AS text)) in lower(emp.name)) > 0
+                OR NULLIF(l2."responsible_id", '') = CAST(:resp AS text))
+    )"""
+
+
+def responsibles_select_sql(mid_expr: str, limit: int = 4) -> str:
+    """Numele responsabililor unui mail, pentru coloana din lista de cazuri (max `limit`)."""
+    return f"""(
+        SELECT string_agg(DISTINCT n, ', ')
+          FROM (
+            SELECT emp.name AS n
+              FROM {TABLE} l2 {_RESP_LATERAL}
+             WHERE {_MID_MATCH.format(mid=mid_expr)}
+               AND emp.name IS NOT NULL
+             LIMIT {int(limit)}
+          ) r
+    )"""
+
+
+def responsible_options(db, limit: int = 200) -> list:
+    """Lista responsabililor care apar in log — pentru dropdown-ul de filtru."""
+    try:
+        rows = db.execute(text(f"""
+            SELECT emp.name AS name, count(*) AS n
+              FROM {TABLE} l2 {_RESP_LATERAL}
+             WHERE emp.name IS NOT NULL
+             GROUP BY emp.name
+             ORDER BY n DESC, emp.name
+             LIMIT :lim
+        """), {"lim": limit}).fetchall()
+        return [{"name": r._mapping["name"], "n": int(r._mapping["n"])} for r in rows]
+    except Exception as e:
+        logger.warning("cts_email_log.responsible_options: %s", e)
+        return []

@@ -2,8 +2,16 @@
 
 Toate view-urile CTS vin prin https://iris.cargotrack.ro/api/dv/*.
 Cheia API se stochează în settings(key='iris_dv.api_key').
-Sincronizarea e mode=snapshot: freshness ETag → înlocuire integrală tabelă locală.
-Fereastra de date: 2026-01-01 → azi, cu refresh pe ultimele 10 zile (overlap).
+Două moduri de sincronizare, alese după `mode` declarat de view în /onboarding:
+  * `snapshot`    — freshness ETag → înlocuire integrală a tabelei locale (DELETE + INSERT).
+  * `incremental` — se cer DOAR rândurile schimbate de la ultima rulare (`since` = ultimul sync
+                    minus o fereastră de suprapunere) și se face UPSERT pe `id`. NU se șterge
+                    nimic: un view incremental nu retrimite istoricul, deci un DELETE ar goli
+                    tabela la prima rulare care aduce 3 rânduri.
+
+Fereastra de date: 2026-01-01 → azi, cu refresh pe ultimele 10 zile (overlap) la snapshot.
+Sincronizarea automată: `iris_dv_state.auto_sync` + `auto_sync_interval_minutes`, rulate de cron
+(POST /process/run-now, la 5 min) prin `app/services/iris_dv_autosync.py`.
 """
 import json
 import logging
@@ -27,6 +35,11 @@ router = APIRouter()
 DV_BASE = "https://iris.cargotrack.ro/api/dv"
 APP_NAME = "mailguard-staging"
 SYNC_FROM = "2026-01-01"  # data de start import date CTS
+# Cat de mult se suprapune fereastra ceruta la un sync incremental peste ce am luat deja.
+# Acopera decalajul de ceas dintre noi si CTS si randurile scrise fix in timpul rularii
+# precedente; duplicatele nu strica nimic, UPSERT-ul e idempotent pe `id`.
+INCREMENTAL_OVERLAP_MINUTES = 30
+DEFAULT_AUTO_SYNC_MINUTES = 60
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -167,6 +180,9 @@ def list_views(db: Session = Depends(get_db), _admin=Depends(get_current_admin))
             "total_rows": state.get("total_rows"),
             "freshness_at": state.get("freshness_at").isoformat() if state.get("freshness_at") else None,
             "etag": bool(state.get("etag")),
+            "mode": state.get("mode"),
+            "auto_sync": bool(state.get("auto_sync")),
+            "auto_sync_interval_minutes": state.get("auto_sync_interval_minutes"),
         }
 
     return {"views": views, "links": data.get("links", {})}
@@ -253,14 +269,13 @@ def _create_local_table_if_needed(db: Session, view_name: str, columns: list):
     db.commit()
 
 
-def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
-    """Algoritmul §A.5 mode=snapshot — înlocuire integrală atomică."""
-    state = _get_state(db, view_name)
-    etag = state.get("etag") or ""
+BATCH_ROWS = 500          # cate randuri intr-un executemany (INSERT rand-cu-rand era ~10x mai lent)
 
-    # 1. freshness check
+
+def _freshness(view_name: str, api_key: str, db: Session, etag: str):
+    """(response, freshness_json|None). Actualizeaza starea la eroare si arunca."""
     try:
-        fresh_resp = _http_get_with_retry(
+        resp = _http_get_with_retry(
             f"{DV_BASE}/{view_name}/freshness",
             _dv_headers(api_key),
             {"If-None-Match": etag} if etag else {}
@@ -268,66 +283,44 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
     except RuntimeError as e:
         _update_state(db, view_name, last_error=str(e), last_error_at=datetime.now(timezone.utc))
         raise
-
-    # versiune schemă
-    remote_schema_ver = int(fresh_resp.headers.get("X-DV-Schema-Version", 0) or 0)
-    remote_prompt_ver = int(fresh_resp.headers.get("X-DV-Prompt-Version", 0) or 0)
-
-    if fresh_resp.status_code == 304:
-        logger.info("iris_dv sync %s: 304 not modified, skip", view_name)
-        return {"skipped": True, "reason": "not_modified"}
-
-    if fresh_resp.status_code != 200:
-        msg = f"freshness răspuns {fresh_resp.status_code}"
+    if resp.status_code == 304:
+        return resp, None
+    if resp.status_code != 200:
+        msg = f"freshness raspuns {resp.status_code}"
         _update_state(db, view_name, last_error=msg, last_error_at=datetime.now(timezone.utc))
         raise RuntimeError(msg)
+    return resp, resp.json()
 
-    fresh_data = fresh_resp.json()
-    new_freshness_at = fresh_data.get("view_updated_at")
-    total_rows_hint = fresh_data.get("total_rows")
 
-    # 2. paginare completă /data cu since=SYNC_FROM și overlap 10 zile
-    overlap_date = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
-    all_rows = []
-    cursor = None
-    new_etag = fresh_resp.headers.get("ETag") or fresh_resp.headers.get("etag") or ""
-    columns_seen = None
+def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_ver: int = 0):
+    """Toate randurile din /data de la `since`, urmarind cursorul. -> (rows, columns, pages).
 
-    page_num = 0
+    Un singur GET per pagina: varianta veche cerea pagina de doua ori (o data prin
+    _http_get_with_retry, al carui raspuns se arunca, apoi inca o data cu httpx.get) — dublu
+    trafic si dublu timp pe view-urile mari."""
+    headers = _dv_headers(api_key)
+    if schema_ver:
+        headers = {**headers, "X-DV-Schema-Version": str(schema_ver)}
+
+    all_rows, columns_seen, cursor, page_num = [], None, None, 0
     while True:
-        url = f"{DV_BASE}/{view_name}/data?since={SYNC_FROM}&limit=10000"
-        if cursor:
-            url += f"&cursor={cursor}"
-        try:
-            resp = _http_get_with_retry(f"{DV_BASE}/{view_name}/data", _dv_headers(api_key),
-                                         {"X-DV-Schema-Version": str(remote_schema_ver)} if remote_schema_ver else {})
-        except RuntimeError as e:
-            _update_state(db, view_name, last_error=str(e), last_error_at=datetime.now(timezone.utc))
-            raise
-
-        # reconstruiesc URL cu parametri (httpx nu acceptă URL cu parametri și extra headers)
-        params = {"since": SYNC_FROM, "limit": "10000"}
+        params = {"since": since, "limit": "10000"}
         if cursor:
             params["cursor"] = cursor
         try:
-            resp = httpx.get(
-                f"{DV_BASE}/{view_name}/data",
-                params=params,
-                headers={**_dv_headers(api_key)},
-                timeout=60,
-                follow_redirects=True
-            )
+            resp = httpx.get(f"{DV_BASE}/{view_name}/data", params=params, headers=headers,
+                             timeout=60, follow_redirects=True)
         except Exception as e:
             _update_state(db, view_name, last_error=str(e), last_error_at=datetime.now(timezone.utc))
             raise
 
         if resp.status_code == 410:
             # cursor expirat sau view apus
-            _update_state(db, view_name, etag=None, last_error="410 cursor expirat — re-sync complet la următoarea rulare")
+            _update_state(db, view_name, etag=None, cursor_val=None,
+                          last_error="410 cursor expirat — re-sync complet la urmatoarea rulare")
             raise RuntimeError("410 Gone — re-sync necesar")
-
         if resp.status_code != 200:
-            msg = f"data răspuns {resp.status_code}: {resp.text[:200]}"
+            msg = f"data raspuns {resp.status_code}: {resp.text[:200]}"
             _update_state(db, view_name, last_error=msg, last_error_at=datetime.now(timezone.utc))
             raise RuntimeError(msg)
 
@@ -337,8 +330,8 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
         cursor = payload.get("next_cursor") if isinstance(payload, dict) else None
 
         if rows and columns_seen is None:
-            # numele de coloane ajung în DDL/DML ca identificatori — se filtrează
-            # o singură dată aici, ca CREATE și INSERT să rămână consistente.
+            # numele de coloane ajung in DDL/DML ca identificatori — se filtreaza
+            # o singura data aici, ca CREATE si INSERT sa ramana consistente.
             raw_cols = list(rows[0].keys())
             columns_seen = [c for c in raw_cols if _IDENT_RE.match(c or "")]
             if len(columns_seen) != len(raw_cols):
@@ -347,31 +340,62 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
 
         all_rows.extend(rows)
         page_num += 1
-        logger.info("iris_dv sync %s: pagina %d, %d rânduri acum", view_name, page_num, len(all_rows))
+        logger.info("iris_dv sync %s: pagina %d, %d randuri acum", view_name, page_num, len(all_rows))
 
         if not has_more or not cursor:
             break
 
-    if not columns_seen:
-        columns_seen = ["id"]
+    return all_rows, (columns_seen or ["id"]), page_num
 
-    # 3. înlocuire integrală atomică
+
+def _row_values(row: dict, columns: list) -> dict:
+    return {c: (str(row[c]) if row.get(c) is not None else None) for c in columns}
+
+
+def _insert_rows(db: Session, tbl: str, columns: list, rows: list, upsert: bool):
+    """Scrie randurile in loturi. `upsert=False` (snapshot, dupa DELETE) ignora coliziunile;
+    `upsert=True` (incremental) SUPRASCRIE randul existent — altfel o actualizare venita din
+    CTS (ex. mutarea pe alt departament) nu s-ar vedea niciodata local."""
+    if not rows:
+        return
+    cols_quoted = ", ".join(f'"{c}"' for c in columns)
+    placeholders = ", ".join(f":{c}" for c in columns)
+    if upsert:
+        setters = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in columns if c != "id")
+        conflict = f'DO UPDATE SET {setters}' if setters else "DO NOTHING"
+    else:
+        conflict = "DO NOTHING"
+    stmt = text(f'INSERT INTO {tbl} ({cols_quoted}) VALUES ({placeholders}) '
+                f'ON CONFLICT ("id") {conflict}')
+    for i in range(0, len(rows), BATCH_ROWS):
+        chunk = [_row_values(r, columns) for r in rows[i:i + BATCH_ROWS]]
+        db.execute(stmt, chunk)
+
+
+def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
+    """mode=snapshot — inlocuire integrala atomica a tabelei locale."""
+    state = _get_state(db, view_name)
+    etag = state.get("etag") or ""
+
+    fresh_resp, fresh_data = _freshness(view_name, api_key, db, etag)
+    remote_schema_ver = int(fresh_resp.headers.get("X-DV-Schema-Version", 0) or 0)
+    remote_prompt_ver = int(fresh_resp.headers.get("X-DV-Prompt-Version", 0) or 0)
+    if fresh_data is None:
+        logger.info("iris_dv sync %s: 304 not modified, skip", view_name)
+        return {"skipped": True, "reason": "not_modified"}
+
+    new_freshness_at = fresh_data.get("view_updated_at")
+    new_etag = fresh_resp.headers.get("ETag") or fresh_resp.headers.get("etag") or ""
+
+    all_rows, columns_seen, page_num = _fetch_pages(view_name, api_key, db, SYNC_FROM,
+                                                    remote_schema_ver)
+
     tbl = _local_table_name(view_name)
     _create_local_table_if_needed(db, view_name, columns_seen)
-
     with db.begin_nested():
         db.execute(text(f'DELETE FROM {tbl}'))
-        if all_rows:
-            cols_quoted = ", ".join(f'"{c}"' for c in columns_seen)
-            placeholders = ", ".join(f":{c}" for c in columns_seen)
-            for row in all_rows:
-                row_data = {c: (str(row[c]) if row.get(c) is not None else None) for c in columns_seen}
-                db.execute(
-                    text(f'INSERT INTO {tbl} ({cols_quoted}) VALUES ({placeholders}) ON CONFLICT ("id") DO NOTHING'),
-                    row_data
-                )
+        _insert_rows(db, tbl, columns_seen, all_rows, upsert=False)
 
-    # 4. salvează starea (în aceeași tranzacție cu datele — commit separat)
     _update_state(db, view_name,
         etag=new_etag,
         last_sync_at=datetime.now(timezone.utc),
@@ -384,26 +408,122 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
         mode="snapshot"
     )
     db.commit()
+    return {"synced": True, "mode": "snapshot", "rows_loaded": len(all_rows),
+            "pages": page_num, "schema_version": remote_schema_ver}
 
-    return {
-        "synced": True,
-        "rows_loaded": len(all_rows),
-        "pages": page_num,
-        "schema_version": remote_schema_ver,
-    }
+
+def _since_for_incremental(state: dict) -> str:
+    """De unde se cer randurile la un sync incremental: ultimul sync reusit minus overlap.
+    Fara sync anterior -> SYNC_FROM (prima rulare aduce tot istoricul disponibil)."""
+    last = state.get("last_sync_at")
+    if not last:
+        return SYNC_FROM
+    try:
+        lt = last if hasattr(last, "tzinfo") else datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if lt.tzinfo is None:
+            lt = lt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return SYNC_FROM
+    lt -= timedelta(minutes=INCREMENTAL_OVERLAP_MINUTES)
+    return lt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _sync_view_incremental(view_name: str, api_key: str, db: Session):
+    """mode=incremental — UPSERT pe `id`, fara DELETE.
+
+    Diferenta esentiala fata de snapshot: view-ul intoarce DOAR ce s-a schimbat de la `since`,
+    deci tabela locala e acumulatorul. Un DELETE + INSERT ar pastra numai ultimul delta."""
+    state = _get_state(db, view_name)
+    etag = state.get("etag") or ""
+
+    fresh_resp, fresh_data = _freshness(view_name, api_key, db, etag)
+    remote_schema_ver = int(fresh_resp.headers.get("X-DV-Schema-Version", 0) or 0)
+    remote_prompt_ver = int(fresh_resp.headers.get("X-DV-Prompt-Version", 0) or 0)
+    if fresh_data is None:
+        # Nimic nou de la ultimul ETag. Marcam rularea ca reusita ca sa nu para „blocat" in UI.
+        _update_state(db, view_name, last_sync_at=datetime.now(timezone.utc),
+                      last_error=None, last_error_at=None, mode="incremental")
+        logger.info("iris_dv sync %s: 304 not modified, skip", view_name)
+        return {"skipped": True, "reason": "not_modified", "mode": "incremental"}
+
+    new_freshness_at = fresh_data.get("view_updated_at")
+    new_etag = fresh_resp.headers.get("ETag") or fresh_resp.headers.get("etag") or ""
+    since = _since_for_incremental(state)
+
+    all_rows, columns_seen, page_num = _fetch_pages(view_name, api_key, db, since,
+                                                    remote_schema_ver)
+
+    tbl = _local_table_name(view_name)
+    _create_local_table_if_needed(db, view_name, columns_seen)
+    with db.begin_nested():
+        _insert_rows(db, tbl, columns_seen, all_rows, upsert=True)
+
+    try:
+        total_local = int(db.execute(text(f'SELECT count(*) FROM {tbl}')).scalar() or 0)
+    except Exception:
+        total_local = None
+
+    _update_state(db, view_name,
+        etag=new_etag,
+        last_sync_at=datetime.now(timezone.utc),
+        last_error=None,
+        last_error_at=None,
+        schema_version=remote_schema_ver,
+        prompt_version=remote_prompt_ver,
+        total_rows=total_local if total_local is not None else len(all_rows),
+        freshness_at=new_freshness_at,
+        mode="incremental"
+    )
+    db.commit()
+    return {"synced": True, "mode": "incremental", "rows_received": len(all_rows),
+            "rows_total_local": total_local, "since": since, "pages": page_num,
+            "schema_version": remote_schema_ver}
+
+
+def _remote_mode(view_name: str, api_key: str) -> Optional[str]:
+    """`mode` declarat de view in /onboarding (snapshot | incremental | query). None la esec."""
+    try:
+        resp = _http_get_with_retry(f"{DV_BASE}/onboarding", _dv_headers(api_key))
+        if resp.status_code != 200:
+            return None
+        for v in (resp.json().get("views") or []):
+            if (v.get("name") or v.get("view_name")) == view_name:
+                m = (v.get("mode") or "").strip().lower()
+                return m or None
+    except Exception as e:
+        logger.info("iris_dv _remote_mode(%s): %s", view_name, e)
+    return None
+
+
+def sync_view(view_name: str, api_key: str, db: Session, mode: Optional[str] = None):
+    """Sincronizeaza un view in modul potrivit. Ordinea de rezolvare a modului:
+    argument explicit -> ce a scris ultima rulare in `iris_dv_state.mode` -> /onboarding ->
+    'snapshot' (implicit istoric). Modul rezolvat se salveaza, deci /onboarding se interogheaza
+    o singura data per view."""
+    _validate_view_name(view_name)
+    m = (mode or "").strip().lower() or None
+    if not m:
+        m = (_get_state(db, view_name).get("mode") or "").strip().lower() or None
+    if not m:
+        m = _remote_mode(view_name, api_key)
+    if m == "incremental":
+        return _sync_view_incremental(view_name, api_key, db)
+    return _sync_view_snapshot(view_name, api_key, db)
 
 
 @router.post("/iris-dv/views/{view_name}/sync")
 def trigger_sync(view_name: str, background_tasks: BackgroundTasks,
+                 mode: str = "",
                  db: Session = Depends(get_db), _admin=Depends(get_current_admin)):
-    """Declanșează sincronizare snapshot (mode=snapshot) pentru un view."""
+    """Declanșează sincronizarea unui view, în modul declarat de el (snapshot | incremental).
+    `mode` forțează modul (depanare); implicit se rezolvă automat — vezi `sync_view`."""
     _validate_view_name(view_name)
     api_key = _require_key(db)
 
     def _run():
         db2 = next(get_db())
         try:
-            _sync_view_snapshot(view_name, api_key, db2)
+            sync_view(view_name, api_key, db2, mode=mode or None)
             # După sync vacation_request, populează employee_schedule (vacation_approved)
             if view_name == "employee_vacation_request":
                 try:
@@ -433,7 +553,38 @@ def get_sync_status(view_name: str, db: Session = Depends(get_db), _admin=Depend
         "freshness_at": state.get("freshness_at").isoformat() if state.get("freshness_at") else None,
         "schema_version": state.get("schema_version"),
         "etag_present": bool(state.get("etag")),
+        "mode": state.get("mode"),
+        "auto_sync": bool(state.get("auto_sync")),
+        "auto_sync_interval_minutes": state.get("auto_sync_interval_minutes") or DEFAULT_AUTO_SYNC_MINUTES,
     }
+
+
+@router.put("/iris-dv/views/{view_name}/auto-sync")
+def set_auto_sync(view_name: str, body: dict,
+                  db: Session = Depends(get_db), _admin=Depends(get_current_admin)):
+    """Pornește/oprește sincronizarea automată a unui view. Body: {enabled, interval_minutes}.
+
+    Rularea efectivă o face cronul (POST /process/run-now, la 5 min) prin
+    `app/services/iris_dv_autosync.py` — aici doar se scrie intenția în `iris_dv_state`.
+    Intervalul se rotunjeste in sus la cadenta cronului: sub 5 minute nu are ce sa insemne."""
+    _validate_view_name(view_name)
+    enabled = bool(body.get("enabled"))
+    try:
+        interval = int(body.get("interval_minutes") or DEFAULT_AUTO_SYNC_MINUTES)
+    except (TypeError, ValueError):
+        interval = DEFAULT_AUTO_SYNC_MINUTES
+    interval = max(5, min(interval, 1440))
+    db.execute(text("""
+        INSERT INTO iris_dv_state (view_name, auto_sync, auto_sync_interval_minutes, updated_at)
+        VALUES (:v, :e, :i, NOW())
+        ON CONFLICT (view_name) DO UPDATE
+           SET auto_sync = EXCLUDED.auto_sync,
+               auto_sync_interval_minutes = EXCLUDED.auto_sync_interval_minutes,
+               updated_at = NOW()
+    """), {"v": view_name, "e": enabled, "i": interval})
+    db.commit()
+    return {"ok": True, "view_name": view_name, "auto_sync": enabled,
+            "auto_sync_interval_minutes": interval}
 
 
 @router.get("/iris-dv/states")
