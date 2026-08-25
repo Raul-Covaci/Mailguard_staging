@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.3 - 2026-08-25
+
+### PATCH — raportul de departamente era GOL: corelare greșită + paginare care se oprea la prima pagină
+
+Două bug-uri distincte, ambele descoperite pe producție.
+
+**1. Corelarea trecea prin oglinda DV a log-ului de alocări, nu prin datele noastre.**
+`cts_dept_log.chain_cte()` lega mutările la mail prin JOIN pe `cts_dv_client_contact_email_log`
+(copia locală a view-ului DV). Pe producție acea copie avea 10.000 rânduri, TOATE din 2020, în
+timp ce mutările din `client_contact_email_department_log` erau din 2026 — deci JOIN-ul nu găsea
+nimic și raportul ieșea gol.
+
+Corelarea trece acum prin `cts_ground_truth`, tabela NOASTRĂ:
+`department_log.client_contact_email_log_id` = `cts_ground_truth.cts_ticket_id` (populat din
+`extra.cts_email_log_id`, migrația `20260805_cts_ticket_replicas.sql`), iar
+`cts_ground_truth.email_id` e ID-ul din `emails` — adică exact legătura cu pagina „Emailuri" pe
+care o cerea raportul. Starea de închidere vine din `cts_solved_at` / `cts_status`, tot de acolo.
+Sursa `deptlog` NU mai depinde deloc de `cts_dv_client_contact_email_log`.
+
+Cheia de grupare: `message_id` când există în ground truth (așa se colapsează replicile pe care
+CTS le face per destinatar), altfel `ticket:<id>` — un mail fără ground truth nu mai dispare din
+statistică, doar nu are subiect/ID local de afișat.
+
+**2. Paginarea sincronizării DV se oprea după prima pagină.** `_fetch_pages` citea
+`rows`/`has_more`/`next_cursor` DOAR de la top-level. Pe un răspuns care le ține altundeva (sub
+`meta`, sau numite `data`/`nextCursor`), `has_more` ieșea falsy și sync-ul se oprea la 10.000 de
+rânduri — de aici copia locală blocată în 2020, cu restul istoricului niciodată cerut.
+
+Acum: rândurile se caută în `rows`/`data`/`items`/`results`/`records` sau ca listă simplă;
+`has_more`/cursorul se caută și în `meta`/`pagination`/`links`/`page_info`, în variantele
+snake_case și camelCase. Regula de oprire: un `has_more: false` explicit e autoritar, altfel se
+continuă cât timp pagina vine PLINĂ (semnalul clasic că mai există date), avansând pe `offset`
+când serverul nu dă cursor. Plafon de siguranță 500 pagini și oprire la cursor repetat, ca să nu
+se bucleze.
+
 ## v3.9.2 - 2026-08-25
 
 ### PATCH — donut-ul de la INDICE 1 ("Mutări per mail") era mereu gol

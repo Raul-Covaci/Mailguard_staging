@@ -292,6 +292,46 @@ def _freshness(view_name: str, api_key: str, db: Session, etag: str):
     return resp, resp.json()
 
 
+PAGE_LIMIT = 10000        # cate randuri se cer per pagina
+MAX_PAGES = 500           # plafon de siguranta: 500 x 10.000 = 5M randuri
+
+
+def _dig(payload, *names):
+    """Prima valoare nenula gasita pentru oricare din `names`, la top-level sau in
+    containerele uzuale (`meta`, `pagination`, `links`, `page_info`).
+
+    De ce: forma raspunsului nu e garantata. Varianta initiala citea DOAR top-level
+    `has_more`/`next_cursor`, deci pe un raspuns care le tine sub `meta` paginarea se oprea
+    silentios dupa prima pagina — exact simptomul de pe productie (10.000 randuri aduse, toate
+    din 2020, restul istoricului niciodata cerut)."""
+    if not isinstance(payload, dict):
+        return None
+    for n in names:
+        if payload.get(n) is not None:
+            return payload[n]
+    for box in ("meta", "pagination", "links", "page_info"):
+        sub = payload.get(box)
+        if isinstance(sub, dict):
+            for n in names:
+                if sub.get(n) is not None:
+                    return sub[n]
+    return None
+
+
+def _extract_rows(payload):
+    """Randurile din raspuns, oricare din formele uzuale (lista simpla sau obiect cu
+    `rows`/`data`/`items`/`results`)."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("rows", "data", "items", "results", "records"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return val
+    return []
+
+
 def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_ver: int = 0):
     """Toate randurile din /data de la `since`, urmarind cursorul. -> (rows, columns, pages).
 
@@ -303,10 +343,16 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
         headers = {**headers, "X-DV-Schema-Version": str(schema_ver)}
 
     all_rows, columns_seen, cursor, page_num = [], None, None, 0
+    seen_cursors = set()
     while True:
-        params = {"since": since, "limit": "10000"}
+        params = {"since": since, "limit": str(PAGE_LIMIT)}
         if cursor:
             params["cursor"] = cursor
+        else:
+            # Fara cursor oferit de server, avansam pe offset — altfel un view care pagineaza
+            # clasic ne-ar da mereu prima pagina.
+            if page_num:
+                params["offset"] = str(len(all_rows))
         try:
             resp = httpx.get(f"{DV_BASE}/{view_name}/data", params=params, headers=headers,
                              timeout=60, follow_redirects=True)
@@ -325,9 +371,9 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
             raise RuntimeError(msg)
 
         payload = resp.json()
-        rows = payload if isinstance(payload, list) else payload.get("rows", [])
-        has_more = payload.get("has_more", False) if isinstance(payload, dict) else False
-        cursor = payload.get("next_cursor") if isinstance(payload, dict) else None
+        rows = _extract_rows(payload)
+        has_more = _dig(payload, "has_more", "hasMore", "more", "has_next")
+        cursor = _dig(payload, "next_cursor", "nextCursor", "cursor", "next", "next_page_cursor")
 
         if rows and columns_seen is None:
             # numele de coloane ajung in DDL/DML ca identificatori — se filtreaza
@@ -340,10 +386,27 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
 
         all_rows.extend(rows)
         page_num += 1
-        logger.info("iris_dv sync %s: pagina %d, %d randuri acum", view_name, page_num, len(all_rows))
+        logger.info("iris_dv sync %s: pagina %d, %d randuri acum (has_more=%s, cursor=%s)",
+                    view_name, page_num, len(all_rows), has_more, bool(cursor))
 
-        if not has_more or not cursor:
+        # Oprire. Ordinea conteaza: un `has_more` explicit False e autoritar; altfel continuam
+        # cat timp pagina a venit PLINA (semnul clasic ca mai exista date) — asa nu ne mai
+        # oprim la prima pagina pe un view care nu trimite metadate de paginare.
+        if has_more is False:
             break
+        if not rows or len(rows) < PAGE_LIMIT:
+            break
+        if page_num >= MAX_PAGES:
+            logger.warning("iris_dv sync %s: oprit la plafonul de %d pagini (%d randuri) — "
+                           "view-ul pare sa aiba mai multe date decat putem aduce intr-o rulare",
+                           view_name, MAX_PAGES, len(all_rows))
+            break
+        if cursor:
+            if cursor in seen_cursors:
+                logger.warning("iris_dv sync %s: cursor repetat (%s) — oprit ca sa nu buclam",
+                               view_name, cursor)
+                break
+            seen_cursors.add(cursor)
 
     return all_rows, (columns_seen or ["id"]), page_num
 

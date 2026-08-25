@@ -124,89 +124,81 @@ def _num(col: str) -> str:
 
 def chain_cte(db) -> str:
     """CTE-ul lantului, construit pe coloanele rezolvate. Expune `mail` si `ch` exact ca
-    `cts_email_log.chain_cte()`, deci endpoint-urile raportului raman comune.
+    celelalte doua surse, deci endpoint-urile raportului raman comune.
 
-    Trei lucruri de stiut despre datele astea:
-      * log-ul tine MUTARI, nu alocari — primul departament (cel pe care a INTRAT mailul) nu e un
-        rand aici. Se ia din `department_from_id` al primei mutari; daca lipseste, din prima
-        alocare din `client_contact_email_log`. Fara pasul asta INDICE 1 ar numara cu o mutare mai
-        putin, iar INDICE 3 ar trata departamentul initial ca intermediar.
-      * cheia de grupare e tot `message_id`, ca in celelalte surse: view-ul tine FK-ul catre
-        `client_contact_email_log`, deci se face join ca sa ajungem la el.
-      * `user_id` (cine a mutat) se pastreaza pe eveniment — de acolo vine „cine a mutat" din
-        drill-down.
+    LEGATURA CU MAILURILE NOASTRE trece prin `cts_ground_truth`, NU prin oglinda DV a log-ului
+    de alocari:
+      `department_log.client_contact_email_log_id` = `cts_ground_truth.cts_ticket_id`
+      (populat din `extra.cts_email_log_id`, vezi 20260805_cts_ticket_replicas.sql), iar
+      `cts_ground_truth.email_id` e ID-ul din tabela noastra `emails`.
+    De ce asa: `cts_dv_client_contact_email_log` e un snapshot DV care poate fi trunchiat sau in
+    urma (pe productie avea 10.000 randuri, toate din 2020, in timp ce mutarile erau din 2026),
+    iar un JOIN pe el facea raportul GOL. `cts_ground_truth` e tabela NOASTRA, sincronizata de
+    cronul propriu, deci e sursa de adevar pentru corelarea cu pagina „Emailuri".
+
+    Cheia de grupare: `message_id` cand il stim din ground truth (asa se colapseaza replicile pe
+    care CTS le face per destinatar), altfel `ticket:<id>` — un mail fara ground truth nu se
+    pierde din statistica, doar nu are subiect/ID local de afisat.
+
+    Departamentul INITIAL (cel pe care a INTRAT mailul) nu e un rand aici — log-ul tine doar
+    mutari. Se ia din `department_from_id` al primei mutari. Fara pasul asta INDICE 1 ar numara
+    cu o mutare mai putin, iar INDICE 3 ar trata departamentul de intrare ca intermediar.
+
+    `user_id` (cine a mutat) se pastreaza pe eveniment — de acolo vine „mutat de" din drill-down.
     """
     m = _resolve(db)
-    L = cts_email_log.TABLE
     at = _ts(f'l."{m["at"]}"')
     to_dept = f'NULLIF(l."{m["to_dept"]}", \'\')'
     actor = _num(f'l."{m["actor"]}"') if m.get("actor") else "NULL::bigint"
     from_dept = f'NULLIF(l."{m["from_dept"]}", \'\')' if m.get("from_dept") else "NULL::text"
     del_guard = (f'(l."{m["deleted_at"]}" IS NULL OR l."{m["deleted_at"]}" = \'\' '
                  f'OR left(l."{m["deleted_at"]}", 4) = \'0000\')') if m.get("deleted_at") else "TRUE"
-
-    if m.get("message_id"):
-        mail_key = f'NULLIF(l."{m["message_id"]}", \'\')'
-        join_src = f"FROM {TABLE} l"
-    else:
-        # FK -> client_contact_email_log.id, de unde luam message_id (cheia comuna a raportului).
-        mail_key = ('COALESCE(NULLIF(src."message_id", \'\'), '
-                    '\'mid:\' || NULLIF(src."mid", \'\'))')
-        join_src = (f'FROM {TABLE} l '
-                    f'JOIN {L} src ON src."id" = NULLIF(l."{m["email_fk"]}", \'\')')
+    ticket = _num(f'l."{m["email_fk"]}"') if m.get("email_fk") else "NULL::bigint"
 
     return f"""
 WITH {cts_email_log._DEPT_MAP_CTE},
 mv0 AS (
-    SELECT {mail_key}      AS message_id,
+    SELECT {ticket}        AS ticket_id,
            {to_dept}       AS to_dept_id,
            {from_dept}     AS from_dept_id,
            {actor}         AS actor_id,
            {at}            AS moved_at,
            {_num('l."id"')} AS mv_id
-      {join_src}
+      FROM {TABLE} l
      WHERE {del_guard}
 ),
-mv AS (
+mv1 AS (
     SELECT * FROM mv0
-     WHERE message_id IS NOT NULL AND to_dept_id IS NOT NULL AND moved_at IS NOT NULL
+     WHERE ticket_id IS NOT NULL AND to_dept_id IS NOT NULL AND moved_at IS NOT NULL
+),
+-- Ground truth per tichet CTS: de aici vin message_id, ID-ul local de mail si starea de inchidere.
+gt AS (
+    SELECT cts_ticket_id,
+           min(message_id)                            AS message_id,
+           min(email_id)                              AS email_id,
+           max(cts_solved_at)                         AS solved_at,
+           bool_or(cts_solved_at IS NOT NULL
+                   OR lower(COALESCE(cts_status, '')) IN ('solved', 'rezolvat', 'closed')) AS is_solved
+      FROM cts_ground_truth
+     WHERE cts_ticket_id IS NOT NULL
+     GROUP BY cts_ticket_id
+),
+mv AS (
+    SELECT v.*,
+           COALESCE(g.message_id, 'ticket:' || v.ticket_id::text) AS message_id,
+           g.email_id, g.solved_at, g.is_solved
+      FROM mv1 v
+      LEFT JOIN gt g ON g.cts_ticket_id = v.ticket_id
 ),
 -- Alocarea INITIALA a fiecarui mail (vezi docstring).
 first_mv AS (
     SELECT DISTINCT ON (message_id) message_id, from_dept_id, moved_at
       FROM mv ORDER BY message_id, moved_at, mv_id
 ),
--- Metadatele mailului (inchis / cand / ID local) din log-ul de alocari, o data per message_id.
-keys AS (SELECT DISTINCT message_id FROM mv),
-meta AS (
-    SELECT k.message_id,
-           min(NULLIF(x."department_id", '')) FILTER (WHERE x.first_rn = 1) AS first_dept_id,
-           min(x.first_at)                    FILTER (WHERE x.first_rn = 1) AS first_at,
-           max(x.solved_at)                                                 AS solved_at,
-           bool_or(x.solved_at IS NOT NULL
-                   OR lower(COALESCE(x."status", '')) IN ('solved', 'rezolvat', 'closed')) AS is_solved,
-           (SELECT min(t.email_id) FROM cts_ground_truth t WHERE t.message_id = k.message_id) AS email_id
-      FROM keys k
-      LEFT JOIN LATERAL (
-          SELECT g."department_id", g."status",
-                 {_ts('g."solved_at"')} AS solved_at,
-                 COALESCE({_ts('g."assigned_at"')}, {_ts('g."created_at"')}, {_ts('g."date"')}) AS first_at,
-                 row_number() OVER (ORDER BY COALESCE({_ts('g."assigned_at"')}, {_ts('g."created_at"')},
-                                                      {_ts('g."date"')}) NULLS LAST,
-                                             {_num('g."id"')}) AS first_rn
-            FROM {L} g
-           WHERE NULLIF(g."message_id", '') = k.message_id
-              OR ('mid:' || NULLIF(g."mid", '')) = k.message_id
-      ) x ON true
-     GROUP BY k.message_id
-),
 seed AS (
-    SELECT f.message_id,
-           COALESCE(f.from_dept_id, mt.first_dept_id) AS dept_id,
-           COALESCE(mt.first_at, f.moved_at - interval '1 second') AS moved_at
-      FROM first_mv f
-      LEFT JOIN meta mt ON mt.message_id = f.message_id
-     WHERE COALESCE(f.from_dept_id, mt.first_dept_id) IS NOT NULL
+    SELECT message_id, from_dept_id AS dept_id, moved_at - interval '1 second' AS moved_at
+      FROM first_mv
+     WHERE from_dept_id IS NOT NULL
 ),
 ev0 AS (
     SELECT message_id, to_dept_id AS dept_id, moved_at, mv_id AS ord, actor_id FROM mv
@@ -221,18 +213,18 @@ ev1 AS (
 ),
 mail AS (
     SELECT v.message_id,
-           min(v.moved_at)              AS started_at,
-           max(mt.solved_at)            AS solved_at,
-           COALESCE(bool_or(mt.is_solved), false) AS is_solved,
-           min(mt.email_id)             AS email_id
+           min(v.moved_at)                        AS started_at,
+           max(x.solved_at)                       AS solved_at,
+           COALESCE(bool_or(x.is_solved), false)  AS is_solved,
+           min(x.email_id)                        AS email_id
       FROM ev1 v
-      LEFT JOIN meta mt ON mt.message_id = v.message_id
+      LEFT JOIN mv x ON x.message_id = v.message_id
      GROUP BY v.message_id
     HAVING (CAST(:date_from AS date) IS NULL
             OR min(v.moved_at) >= CAST(:date_from AS date))
        AND (CAST(:date_to AS date) IS NULL
             OR min(v.moved_at) < CAST(:date_to AS date) + interval '1 day')
-       AND (NOT CAST(:only_solved AS boolean) OR COALESCE(bool_or(mt.is_solved), false))
+       AND (NOT CAST(:only_solved AS boolean) OR COALESCE(bool_or(x.is_solved), false))
 ),
 ev AS (
     SELECT v.message_id, v.dep, v.moved_at, v.ord AS id,
@@ -295,30 +287,33 @@ def coverage(db) -> dict:
 
 def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
     """Mutarile BRUTE ale unui mail (departament sursa/destinatie, cine, cand), pentru
-    drill-down-ul „de ce s-a mutat". Spre deosebire de `cts_email_log.steps_for_mail` (alocari),
-    aici fiecare rand E o mutare — nu trebuie dedusa nicio tranzitie."""
+    drill-down-ul „de ce s-a mutat". Fiecare rand E o mutare — nu se deduce nicio tranzitie.
+
+    Cheia primita e aceeasi ca in raport: `message_id` real (rezolvat prin
+    `cts_ground_truth.cts_ticket_id`) sau `ticket:<id>` pentru mailurile fara ground truth."""
     m = _resolve(db)
-    if not m.get("to_dept") or not m.get("at"):
+    if not m.get("to_dept") or not m.get("at") or not m.get("email_fk"):
         return []
-    L = cts_email_log.TABLE
     at = _ts(f'l."{m["at"]}"')
     to_dept = f'NULLIF(l."{m["to_dept"]}", \'\')'
     from_dept = f'NULLIF(l."{m["from_dept"]}", \'\')' if m.get("from_dept") else "NULL::text"
     actor = _num(f'l."{m["actor"]}"') if m.get("actor") else "NULL::bigint"
     del_guard = (f'(l."{m["deleted_at"]}" IS NULL OR l."{m["deleted_at"]}" = \'\' '
                  f'OR left(l."{m["deleted_at"]}", 4) = \'0000\')') if m.get("deleted_at") else "TRUE"
-
-    if m.get("message_id"):
-        mid_match = f'(NULLIF(l."{m["message_id"]}", \'\') = :mid)'
-        join_src = f"FROM {TABLE} l"
-    else:
-        mid_match = ('(NULLIF(src."message_id", \'\') = :mid '
-                     'OR (\'mid:\' || NULLIF(src."mid", \'\')) = :mid)')
-        join_src = (f'FROM {TABLE} l '
-                    f'JOIN {L} src ON src."id" = NULLIF(l."{m["email_fk"]}", \'\')')
+    ticket = _num(f'l."{m["email_fk"]}"')
 
     rows = db.execute(text(f"""
-        WITH {cts_email_log._DEPT_MAP_CTE}
+        WITH {cts_email_log._DEPT_MAP_CTE},
+        tickets AS (
+            -- Tichetele CTS ale acestui mail: fie prin message_id din ground truth, fie direct
+            -- din cheia `ticket:<id>` cand mailul nu are ground truth.
+            SELECT DISTINCT cts_ticket_id AS ticket_id
+              FROM cts_ground_truth
+             WHERE cts_ticket_id IS NOT NULL AND message_id = :mid
+            UNION
+            SELECT CASE WHEN :mid ~ '^ticket:[0-9]+$'
+                        THEN substring(:mid from 8)::bigint END
+        )
         SELECT {_num('l."id"')} AS log_id,
                {from_dept} AS from_dept_id,
                {to_dept}   AS to_dept_id,
@@ -327,7 +322,8 @@ def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
                {actor}     AS actor_id,
                {at}        AS moved_at,
                emp.name    AS actor_name
-          {join_src}
+          FROM {TABLE} l
+          JOIN tickets tk ON tk.ticket_id = {ticket}
           LEFT JOIN dept_map dmf ON dmf.cts_dept_id = {from_dept}
           LEFT JOIN dept_map dmt ON dmt.cts_dept_id = {to_dept}
           LEFT JOIN LATERAL (
@@ -338,7 +334,7 @@ def steps_for_mail(db, message_id: str, limit: int = 200) -> list:
                ORDER BY e.enabled DESC, e.id
                LIMIT 1
           ) emp ON true
-         WHERE {del_guard} AND {mid_match}
+         WHERE {del_guard}
          ORDER BY moved_at NULLS LAST, log_id
          LIMIT :lim
     """), {"mid": message_id, "lim": limit}).fetchall()
