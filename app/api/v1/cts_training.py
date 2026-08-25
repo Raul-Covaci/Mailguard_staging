@@ -1094,11 +1094,11 @@ def cts_training_dept_report_cases(
     # view sincronizat (indiferent de `src`), coloana si filtrul dispar din SQL.
     if resp_ok:
         per_mail = per_mail.replace(
-            "RESP_COL", ", " + cts_email_log.responsibles_select_sql("a.message_id") + " AS responsibles")
+            "RESP_COL", ", " + cts_email_log.responsibles_select_sql("m.message_id") + " AS responsibles")
         per_mail = per_mail.replace(
             "RESP_FILTER",
             ("AND (CAST(:resp AS text) IS NULL OR "
-             + cts_email_log.responsible_exists_sql("a.message_id") + ")"))
+             + cts_email_log.responsible_exists_sql("m.message_id") + ")"))
     else:
         per_mail = per_mail.replace("RESP_COL", "").replace("RESP_FILTER", "")
 
