@@ -8,6 +8,29 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.9.4 - 2026-08-25
+
+### PATCH — /cases dădea 500: `missing FROM-clause entry for table "a"`
+
+Modalul „Cazuri concrete" cădea cu 500 la ORICE click pe un departament, pe ambele surse
+(`log` și `deptlog`) — bug introdus în v3.9.0, odată cu coloana „Responsabili".
+
+`responsibles_select_sql()` ambala selectul într-un **derived table** (`FROM (SELECT ...) r`)
+ca să poată pune un `LIMIT` pe numărul de nume. În Postgres un subquery din `FROM` **fără
+`LATERAL`** nu vede coloanele query-ului exterior, deci `a.message_id` (aliasul CTE-ului `agg`)
+ieșea nerezolvabil și tot endpoint-ul cădea. `responsible_exists_sql()`, fiind un `EXISTS`
+corelat, era corect — de aceea doar coloana rupea query-ul, nu filtrul.
+
+Acum e un subquery scalar corelat, fără subquery în `FROM`; plafonarea se face pe TEXTUL
+rezultat (`left(string_agg(...), 200)`), nu pe numărul de rânduri, ca să nu fie nevoie de un
+derived table. Alocările per mail sunt oricum puține (una per destinatar).
+
+De ce a scăpat până acum: verificarea era pe parsare (sqlglot), iar forma greșită e sintactic
+VALIDĂ — eroarea e semantică, de rezolvare a numelor, deci apărea doar la execuție pe Postgres.
+Adăugat un audit care umblă pe AST-ul tuturor interogărilor generate și semnalează orice derived
+table non-LATERAL care referențiază un alias din exterior; confirmat că detectează forma veche
+în toate cele 4 interogări afectate și că e curat pe cele 35 generate acum.
+
 ## v3.9.3 - 2026-08-25
 
 ### PATCH — raportul de departamente era GOL: corelare greșită + paginare care se oprea la prima pagină

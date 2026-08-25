@@ -276,17 +276,22 @@ def responsible_exists_sql(mid_expr: str) -> str:
     )"""
 
 
-def responsibles_select_sql(mid_expr: str, limit: int = 4) -> str:
-    """Numele responsabililor unui mail, pentru coloana din lista de cazuri (max `limit`)."""
+def responsibles_select_sql(mid_expr: str, max_chars: int = 200) -> str:
+    """Numele responsabililor unui mail, pentru coloana din lista de cazuri.
+
+    ⚠️ Trebuie sa ramana un subquery scalar CORELAT, fara subquery in FROM. Prima varianta
+    ambala selectul intr-un derived table (`FROM (SELECT ...) r`) ca sa poata pune un LIMIT pe
+    numarul de nume; in Postgres un subquery din FROM fara LATERAL NU vede coloanele query-ului
+    exterior, deci `mid_expr` (ex. `a.message_id`) ieșea nerezolvabil si tot endpointul /cases
+    cadea cu `missing FROM-clause entry for table "a"`. Un EXISTS/scalar corelat (ca aici si ca
+    in `responsible_exists_sql`) poate referenția exteriorul — un derived table nu.
+    Plafonarea se face pe TEXTUL rezultat (`left(...)`), nu pe numarul de rânduri, ca sa nu fie
+    nevoie de subquery in FROM. Alocarile per mail sunt oricum putine (una per destinatar)."""
     return f"""(
-        SELECT string_agg(DISTINCT n, ', ')
-          FROM (
-            SELECT emp.name AS n
-              FROM {TABLE} l2 {_RESP_LATERAL}
-             WHERE {_MID_MATCH.format(mid=mid_expr)}
-               AND emp.name IS NOT NULL
-             LIMIT {int(limit)}
-          ) r
+        SELECT left(string_agg(DISTINCT emp.name, ', '), {int(max_chars)})
+          FROM {TABLE} l2 {_RESP_LATERAL}
+         WHERE {_MID_MATCH.format(mid=mid_expr)}
+           AND emp.name IS NOT NULL
     )"""
 
 
