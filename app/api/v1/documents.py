@@ -3356,14 +3356,15 @@ def _reclassify_part(db, att, part_row, catalog):
 
 
 def _drain_doc_extractions(scope="recent", limit=500, force=False):
-    """scope: 'today' (azi), 'recent'/'all' (fereastra de procesare), 'auto' (in plus: doar
-    emailuri primite DUPA activarea automatizarii — `enabled_at`), 'ids' (fara limita de data,
-    folosit DOAR de reprocess-by-ids, care lucreaza pe maximum 50 de emailuri alese explicit).
+    """scope: 'today' (azi), 'recent'/'all'/'ids' (fereastra de procesare), 'auto' (in plus: doar
+    emailuri primite DUPA activarea automatizarii — `enabled_at`).
 
-    ⚠️ TOATE scope-urile in afara de 'ids' au o PODEA de data: `doc_window.window_days()`. Fara ea,
-    curatenia nocturna (care sterge randurile din document_extractions) transforma orice atasament
-    vechi inapoi in candidat — predicatul de mai jos citeste „procesat" exclusiv din prezenta
-    randurilor — deci arhiva se reprocesa in fiecare noapte, pe bani. Podeaua NU se scoate fara sa
+    ⛔ TOATE scope-urile, FARA EXCEPTIE, au podeaua `doc_window.window_days()` (plafon dur: 1 zi).
+    Nu exista cale prin care un mail mai vechi sa fie procesat — nici cron, nici „Proceseaza tot",
+    nici „Reproceseaza ID-uri", nici reset-reimport. Motivul: predicatul de mai jos citeste
+    „procesat" exclusiv din prezenta randurilor in document_extractions, iar curatenia nocturna
+    sterge exact acele randuri — fara podea, arhiva se reprocesa in fiecare noapte, pe bani
+    (28.07 -> 26.08.2026: ~1969 extrageri replatite intr-o singura zi). Podeaua NU se scoate fara sa
     existe alt semn persistent de „deja procesat".
 
     Toate cer d.id IS NULL. `force=True` (actiune manuala) ignora comutatorul si NU se opreste
@@ -3403,30 +3404,24 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
             if skip:
                 base += " AND lower(e.from_address) NOT IN :skip"
             since = None
-            wdays = None
-            if scope == "ids":
-                # Reprocesare deliberata pe emailuri alese unul cate unul (max 50) — singura cale
-                # prin care un mail mai vechi decat fereastra mai poate fi procesat.
-                pass
-            elif scope == "today":
+            if scope == "today":
                 base += " AND e.received_at::date = CURRENT_DATE"
             elif scope == "auto":
                 # DOAR ce a intrat DUPA activarea automatizarii (START). Backlog-ul anterior NU
                 # se proceseaza automat. Fara `enabled_at` salvat -> doar de-acum incolo (now()).
                 since = _auto_since()
                 base += " AND e.received_at >= :since" if since else " AND e.received_at >= now()"
-            # Podeaua comuna de data ('auto', 'all', 'recent'). 'today' e mai ingust oricum, dar o
-            # primeste si el: nu strica nimic si tine o singura regula in cod.
-            if scope != "ids":
-                wdays = doc_window.window_days(db)
-                base += " AND e.received_at >= CURRENT_DATE - make_interval(days => :wdays)"
+            # Podeaua de data — pe TOATE scope-urile, inclusiv 'ids' (reprocesare manuala) si 'all'.
+            # Nu adauga aici vreo scutire: exact scutirile au fost gaura prin care se reprocesa
+            # arhiva. 'today' e mai ingust oricum, dar trece si el prin aceeasi regula.
+            wdays = doc_window.window_days(db)
+            base += " AND e.received_at >= CURRENT_DATE - make_interval(days => :wdays)"
             q = base + " ORDER BY a.id DESC LIMIT :lim"
             stmt = text(q)
             params = {"lim": limit}
             if since:
                 params["since"] = since
-            if wdays is not None:
-                params["wdays"] = wdays
+            params["wdays"] = wdays
             if skip:
                 stmt = stmt.bindparams(bindparam("skip", expanding=True))
                 params["skip"] = skip
@@ -3490,7 +3485,7 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
             except Exception:
                 logger.exception("auto-dismiss neidentificat failed")
             # ── Retry reclassify ──────────────────────────────────────────────────
-            _retry_wdays = wdays if wdays is not None else doc_window.window_days(db)
+            _retry_wdays = wdays
             # Single-doc (part_no=0): reprocess complet (extrage prev_retry intern)
             try:
                 # Aceeasi podea de data ca la selectia candidatilor: un rand ramas de la o
@@ -4228,8 +4223,12 @@ def documents_reprocess_by_ids(body: dict, db: Session = Depends(get_db),
                                 admin=Depends(get_current_admin)):
     """Reseteaza starea de procesare pentru o lista de email ID-uri, fara a sterge emailurile.
     Sterge extractiile existente (non-reviewed) + reseteaza doc_discarded pe atasamente,
-    apoi kickeaza drain-ul cu scope='all' (force=True) ca sa le preia imediat.
-    Emailurile raman cu acelasi ID — nu se pierd date."""
+    apoi kickeaza drain-ul cu scope='ids' (force=True) ca sa le preia imediat.
+    Emailurile raman cu acelasi ID — nu se pierd date.
+
+    ⛔ Podeaua de data se aplica si aici (doc_window, plafon dur 1 zi): un mail mai vechi NU se
+    reproceseaza, oricat de explicit ar fi cerut. Raspunsul le listeaza in `outside_window`, ca
+    operatorul sa nu astepte degeaba un rezultat care nu mai vine."""
     raw_ids = body.get("email_ids") or []
     if not raw_ids:
         raise HTTPException(400, "email_ids lista goala")
@@ -4242,9 +4241,12 @@ def documents_reprocess_by_ids(body: dict, db: Session = Depends(get_db),
     if not email_ids:
         raise HTTPException(400, "email_ids lista goala")
 
-    existing = [r[0] for r in db.execute(
-        text("SELECT id FROM emails WHERE id = ANY(:ids)"), {"ids": email_ids}
-    ).fetchall()]
+    _wd = doc_window.window_days(db)
+    rows = db.execute(text(
+        "SELECT id, (received_at >= CURRENT_DATE - make_interval(days => :w)) AS in_window "
+        "FROM emails WHERE id = ANY(:ids)"), {"ids": email_ids, "w": _wd}).fetchall()
+    existing = [r[0] for r in rows]
+    outside_window = sorted(r[0] for r in rows if not r[1])
     missing = sorted(set(email_ids) - set(existing))
     if not existing:
         raise HTTPException(404, "Niciun email gasit pentru ID-urile furnizate")
@@ -4277,17 +4279,25 @@ def documents_reprocess_by_ids(body: dict, db: Session = Depends(get_db),
                 len(existing), n_atts, n_deleted, by)
 
     # Kickeaza drain-ul cu scope='ids' + force=True — preia imediat atasamentele resetate.
-    # 'ids' e singurul scope FARA podea de data: aici emailurile sunt alese explicit (max 50), deci
-    # un mail vechi poate fi reprocesat intentionat, fara sa redeschidem arhiva pentru cron.
+    # ⛔ 'ids' respecta si el podeaua de data: un mail mai vechi de fereastra NU se reproceseaza,
+    # oricat de explicit ar fi cerut. Endpoint-ul raporteaza asta in `outside_window`.
     _kick_drain("ids", force=True)
 
+    msg = "Resetat %d email(uri), %d atasamente. Procesarea a pornit." % (len(existing), n_atts)
+    if outside_window:
+        msg += (" %d email(uri) sunt mai vechi de %d zi(le) si NU se proceseaza: %s."
+                % (len(outside_window), _wd,
+                   ", ".join(str(i) for i in outside_window[:10])
+                   + ("…" if len(outside_window) > 10 else "")))
     return {
         "ok": True,
         "email_ids": existing,
         "missing_ids": missing,
+        "outside_window": outside_window,
+        "window_days": _wd,
         "attachments_found": n_atts,
         "extractions_deleted": n_deleted,
-        "message": "Resetat %d email(uri), %d atasamente. Procesarea a pornit." % (len(existing), n_atts),
+        "message": msg,
     }
 
 
@@ -4295,8 +4305,7 @@ def documents_reprocess_by_ids(body: dict, db: Session = Depends(get_db),
 def documents_process_now(scope: str = "today", db: Session = Depends(get_db),
                           admin=Depends(get_current_admin)):
     # 'today'/'all' sunt actiuni manuale. 'all' NU mai matura arhiva: si el e limitat la fereastra
-    # de procesare (doc_window) — altfel un click reprocesa tot istoricul, pe bani. Reprocesarea
-    # unui mail vechi se face tinta, din „Reproceseaza ID-uri" (scope 'ids').
+    # de procesare (doc_window, plafon dur 1 zi) — altfel un click reprocesa tot istoricul, pe bani.
     sc = scope if scope in ("today", "recent", "all") else "today"
     busy = _drain_in_progress(db)
     # Actiune manuala explicita a operatorului: ruleaza chiar daca automatizarea e OPRITA.

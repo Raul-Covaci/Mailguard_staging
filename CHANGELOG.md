@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.14.0 - 2026-08-26
+
+### MINOR — plafon DUR: nu se procesează documente din mailuri mai vechi de 1 zi
+
+Regulă de business (Raul Covaci, 2026-08-26): dacă azi e 30.08, niciun document dintr-un mail
+primit înainte de 29.08 nu se mai procesează — **indiferent de acțiune**.
+
+- `doc_window.HARD_MAX_DAYS = 1`: `window_days()` întoarce `min(setare, 1)`. Setarea din DB poate
+  doar strânge fereastra, niciodată lărgi — o valoare mai mare pusă din UI sau printr-un UPDATE
+  grăbit e ignorată.
+- **Scutirea `ids` a fost eliminată.** „Reprocesează ID-uri" respectă și el podeaua; endpoint-ul
+  întoarce `outside_window` + `window_days` și scrie în mesaj ce ID-uri nu se procesează, ca
+  operatorul să nu aștepte un rezultat care nu mai vine. Nu mai există nicio cale de bypass.
+- `migrations/20260826c_doc_process_window_1day.sql` forțează `days=1` și pe bazele unde migrația
+  precedentă seedase 2 (UPDATE, nu DO NOTHING).
+- Retenția din `storage_cleanup.sh` urmează automat aceeași valoare — rămâne egală cu fereastra.
+
+⚠️ Consecință asumată: dacă procesarea stă mai mult de ~24h (pană de API, gateway AI căzut,
+automatizare lăsată pe STOP), documentele din intervalul respectiv nu se mai procesează deloc,
+nici manual. E prețul explicit al garanției că arhiva nu se mai poate reprocesa.
+
 ## v3.13.0 - 2026-08-26
 
 ### MINOR — documentele vechi nu se mai reprocesează după curățenia nocturnă (cost AI repetat)
