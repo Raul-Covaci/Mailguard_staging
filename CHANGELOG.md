@@ -23,6 +23,17 @@ mailului. Orice mail vechi reprocesat (reset/reimport, „Procesează acum", re-
   atașamente, iar rândul de tracking rămâne intenționat; un INNER JOIN ar fi șters tăcut
   documentele vechi din numitor.
 
+### PATCH — trasabilitatea CTS urmează selectorul de perioadă al paginii
+
+Panoul de sus filtra pe `scope` (implicit `today`), cel de jos arăta tot din 24.08 — două perioade
+una sub alta, citite de utilizatori ca o contradicție („61 documente" vs „282 extrase").
+
+- `/cts/document-stats` acceptă `scope=all|today`, cu aceeași semantică (data mailului).
+- UI: `loadCtsStats()` trimite scope-ul curent și se reîncarcă la schimbarea lui.
+- Cifrele rămân diferite prin construcție și după aliniere: sus e `document_extractions` (golită
+  nocturn de `storage_cleanup.sh`, fără rândurile `grouped`/`discarded`), jos e
+  `cts_document_tracking` (păstrată intenționat, un rând per parte extrasă, inclusiv junk).
+
 ## v3.11.0 - 2026-08-26
 
 ### MINOR — statisticile din „Procesare documente" se numără doar din 24.08.2026

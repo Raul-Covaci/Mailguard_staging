@@ -1322,6 +1322,7 @@ def cts_update_documents(request: Request, payload: dict,
 
 @router.get("/cts/document-stats")
 def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar documente trimise la/dupa aceasta data (YYYY-MM-DD sau ISO 8601)"),
+            scope: str = Query("all", description="all|today — aceeasi semantica cu /documents/extractions/stats"),
             db: Session = Depends(get_db),
             admin=Depends(get_current_admin)):
     """Palnia completa a unui document, pe categorie (sofer / vehicul / contract):
@@ -1339,6 +1340,12 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
 
     Fereastra: `from_date` e plafonat la `doc_stats.STATS_SINCE` (24.08.2026) — documentele mai
     vechi nu intra in statistica nici daca apelantul cere o data mai veche.
+
+    `scope=today` restrange la mailurile de azi, ca in /documents/extractions/stats: cele doua
+    panouri stau unul sub altul in pagina, iar perioade diferite se citesc ca o contradictie.
+    Cifrele tot NU vor fi egale — sus e `document_extractions` (golita nocturn de storage_cleanup,
+    fara randurile 'grouped'/'discarded'), jos e `cts_document_tracking` (pastrata intentionat, un
+    rand per parte extrasa) — dar devin comparabile.
     """
     if from_date:
         _fd = (from_date or "").strip()
@@ -1356,8 +1363,10 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
     # statistica. `email_id` n-are FK (randurile din emails/attachments pot fi curatate de
     # storage_cleanup, tracking-ul ramane), deci JOIN-ul e LEFT si cade inapoi pe `extracted_at`
     # cand mailul nu mai exista — altfel documentele vechi ar disparea din numitor pe tacute.
-    where, qp = ("COALESCE(e.received_at, t.extracted_at) >= :from_date",
-                 {"from_date": from_date})
+    _when = "COALESCE(e.received_at, t.extracted_at)"
+    where, qp = (_when + " >= :from_date", {"from_date": from_date})
+    if scope == "today":
+        where += " AND " + _when + "::date = CURRENT_DATE"
 
     rows = db.execute(text(f"""
         SELECT COALESCE(t.category, 'necunoscut')                   AS category,
@@ -1392,7 +1401,7 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
     tot["sent_pct"] = _pct(tot["total_sent"], tot["extracted"])
     tot["saved_pct"] = _pct(tot["ever_saved"], tot["total_sent"])
     tot["deleted_pct"] = _pct(tot["deleted_after"], tot["ever_saved"])
-    return {"ok": True, "from_date": from_date, "since": STATS_SINCE,
+    return {"ok": True, "from_date": from_date, "since": STATS_SINCE, "scope": scope,
             "by_category": items, "total": tot}
 
 

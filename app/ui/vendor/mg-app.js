@@ -18037,10 +18037,13 @@ function DocProcessing(props) {
 
   // Trasabilitate CTS: sursa e cts_document_tracking, care NU e afectata de curatenia zilnica
   // a extractiilor — de aceea are propriul apel, nu vine odata cu statisticile de procesare.
+  // Perioada o urmeaza insa pe cea de sus (acelasi `scope`): panourile stau unul sub altul, iar
+  // doua perioade diferite se citesc ca o contradictie ("61 documente" vs "282 extrase").
   function loadCtsStats() {
-    api('/cts/document-stats').then(function (r) { if (r && r.ok) setCtsStats(r); }).catch(function () {});
+    var eff = q.trim() ? 'all' : scope;
+    api('/cts/document-stats?scope=' + eff).then(function (r) { if (r && r.ok) setCtsStats(r); }).catch(function () {});
   }
-  useEffect(function () { loadCtsStats(); }, []);
+  useEffect(function () { loadCtsStats(); }, [scope, q.trim() ? 1 : 0]);
 
   function loadAuto() { api('/documents/automation').then(setAuto).catch(function () {}); }
   useEffect(function () { loadAuto(); var iv = setInterval(loadAuto, 6000); return function () { clearInterval(iv); }; }, []);
