@@ -8,6 +8,25 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.12.0 - 2026-08-26
+
+### MINOR — „Procesare documente": rămâne un singur panou de statistici, pe selectorul Azi/Toate
+
+Pagina avea două panouri suprapuse, cu perioade și numitori diferiți („220 documente" sus vs „288
+extrase" jos) — imposibil de citit fără explicație. Rămâne trasabilitatea CTS, singura care
+supraviețuiește curățeniei nocturne.
+
+- **Eliminat** panoul „📊 Statistici procesare" (auto-validate + defalcarea pe categorii + selectorul
+  de motor). Sursa lui, `document_extractions`, e golită în fiecare noapte de `storage_cleanup.sh`,
+  deci „Toate" nu putea arăta niciodată istoricul, doar coada curentă. Endpoint-ul
+  `/documents/extractions/stats` rămâne funcțional, doar nu mai e apelat din UI.
+- **Trasabilitatea CTS urmează selectorul Azi/Toate** (`?scope=`), implicit „Azi"; pe „Toate" arată
+  tot din 24.08 până azi. Badge-ul din antet scrie „azi" / „din 24.08.2026", după caz.
+- **Necategorizatele ies din numitor** — nu mai apar nici ca rând în defalcare, nici în totaluri:
+  n-aveau cum să plece spre CTS, stăteau garantat pe 0% și trăgeau „Trimise spre CTS" în jos fără
+  să spună nimic despre asociere (123/288 = 42,7% → ~123/226 = ~54%). Numărul lor se întoarce
+  separat în răspuns, câmpul `uncategorized`, ca să nu dispară din raport.
+
 ## v3.11.1 - 2026-08-26
 
 ### PATCH — „Trasabilitate în CTS" nu respecta fereastra din 24.08 (filtra pe data procesării)

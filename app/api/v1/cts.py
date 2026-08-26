@@ -1331,7 +1331,8 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
 
     Bazele procentelor sunt DIFERITE si de aceea sunt numite explicit — un procent fara numitor
     stiut se citeste gresit:
-      sent_pct    = trimise / extrase          (cate documente extrase apuca sa plece spre CTS)
+      sent_pct    = trimise / extrase          (cate documente extrase apuca sa plece spre CTS;
+                                                numai documentele CATEGORISITE — vezi mai jos)
       saved_pct   = ever_saved / total_sent    (din cele plecate, cate s-au atasat pe entitate)
       deleted_pct = deleted_after / ever_saved (din cele ajunse pe entitate, cate au fost sterse)
 
@@ -1386,9 +1387,19 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
         return round(100.0 * part / whole, 1) if whole else None
 
     _KEYS = ["extracted", "total_sent", "saved", "failed", "pending_ack", "deleted_after"]
+    # Documentele fara categorie (extragere esuata / tip neidentificat) NU intra nici in randuri,
+    # nici in totaluri: n-aveau cum sa plece vreodata spre CTS, deci stateau garantat pe 0% si
+    # trageau in jos „Trimise spre CTS" fara sa spuna nimic despre asociere. Numarul lor se
+    # intoarce separat (`uncategorized`), ca sa nu dispara complet din raport.
+    _CATS = ("sofer", "vehicul", "contract")
     items, tot = [], {k: 0 for k in _KEYS}
+    uncategorized = {k: 0 for k in _KEYS}
     for r in rows:
         m = dict(r._mapping)
+        if m["category"] not in _CATS:
+            for k in _KEYS:
+                uncategorized[k] += m[k]
+            continue
         for k in _KEYS:
             tot[k] += m[k]
         m["ever_saved"] = m["saved"] + m["deleted_after"]
@@ -1402,7 +1413,7 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
     tot["saved_pct"] = _pct(tot["ever_saved"], tot["total_sent"])
     tot["deleted_pct"] = _pct(tot["deleted_after"], tot["ever_saved"])
     return {"ok": True, "from_date": from_date, "since": STATS_SINCE, "scope": scope,
-            "by_category": items, "total": tot}
+            "by_category": items, "total": tot, "uncategorized": uncategorized}
 
 
 # ---------------------------------------------------------------- monitorizare (admin)

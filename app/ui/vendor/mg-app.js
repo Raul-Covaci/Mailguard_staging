@@ -18015,8 +18015,6 @@ function DocProcessing(props) {
   const [resetTo, setResetTo] = useState(function () { return new Date().toISOString().slice(0, 10); });
   const [resetState, setResetState] = useState(null);
   const [resetBusy, setResetBusy] = useState(false);
-  const [stats, setStats] = useState(null);
-  const [statsEngine, setStatsEngine] = useState('all');   // 'all' | 'iris' (migration readiness)
   const [ctsStats, setCtsStats] = useState(null);          // trasabilitate documente in CTS
   var err = function (t) { Swal.fire({ icon: 'error', title: 'Eroare', text: t, background: 'var(--bg2,#0e131c)', color: 'var(--tx,#e6edf3)' }); };
   var toast = function (t) { Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: t, showConfirmButton: false, timer: 1600, background: 'var(--bg2,#0e131c)', color: 'var(--tx,#e6edf3)' }); };
@@ -18028,17 +18026,10 @@ function DocProcessing(props) {
   }
   useEffect(function () { load(); }, [scope, q.trim() ? 1 : 0]);
 
-  function loadStats() {
-    var eff = q.trim() ? 'all' : scope;
-    api('/documents/extractions/stats?scope=' + eff + '&engine=' + statsEngine)
-      .then(function (r) { if (r && r.ok) setStats(r); }).catch(function () {});
-  }
-  useEffect(function () { loadStats(); }, [scope, statsEngine, q.trim() ? 1 : 0]);
-
-  // Trasabilitate CTS: sursa e cts_document_tracking, care NU e afectata de curatenia zilnica
-  // a extractiilor — de aceea are propriul apel, nu vine odata cu statisticile de procesare.
-  // Perioada o urmeaza insa pe cea de sus (acelasi `scope`): panourile stau unul sub altul, iar
-  // doua perioade diferite se citesc ca o contradictie ("61 documente" vs "282 extrase").
+  // Trasabilitate CTS: singurul panou de statistici al paginii. Sursa e cts_document_tracking,
+  // pastrata intentionat — `document_extractions` e golita in fiecare noapte de storage_cleanup.sh,
+  // deci un panou construit pe ea nu putea arata istoricul, doar coada curenta (de-aia a fost scos).
+  // Perioada urmeaza selectorul Azi/Toate al paginii; cautarea e globala, deci forteaza `all`.
   function loadCtsStats() {
     var eff = q.trim() ? 'all' : scope;
     api('/cts/document-stats?scope=' + eff).then(function (r) { if (r && r.ok) setCtsStats(r); }).catch(function () {});
@@ -18118,7 +18109,7 @@ function DocProcessing(props) {
     setBusy(true);
     api('/documents/process/run-now?scope=' + scope, { method: 'POST' }).then(function () {
       toast('Procesare pornită…');
-      var n = 0; var iv = setInterval(function () { n++; load(); loadStats(); loadCtsStats(); if (n >= 10) { clearInterval(iv); setBusy(false); } }, 2500);
+      var n = 0; var iv = setInterval(function () { n++; load(); loadCtsStats(); if (n >= 10) { clearInterval(iv); setBusy(false); } }, 2500);
     }).catch(function (e) { setBusy(false); err(String((e && e.message) || e)); });
   }
 
@@ -18148,7 +18139,7 @@ function DocProcessing(props) {
           var msg = (r && r.message) || 'Resetat și repus în coadă.';
           if (r && r.missing_ids && r.missing_ids.length) msg += ' ID-uri negăsite: ' + r.missing_ids.join(', ') + '.';
           toast(msg);
-          var n = 0; var iv = setInterval(function () { n++; load(); loadStats(); loadCtsStats(); if (n >= 12) { clearInterval(iv); setBusy(false); } }, 2500);
+          var n = 0; var iv = setInterval(function () { n++; load(); loadCtsStats(); if (n >= 12) { clearInterval(iv); setBusy(false); } }, 2500);
         })
         .catch(function (e) { setBusy(false); err(String((e && e.message) || e)); });
     });
@@ -18196,7 +18187,7 @@ function DocProcessing(props) {
       h('option', { key: 't', value: 'today' }, 'Azi'),
       h('option', { key: 'a', value: 'all' }, 'Toate')
     ]),
-    h('button', { key: 'r', className: 'btn secondary', style: { padding: '5px 10px', fontSize: 12 }, onClick: function () { load(); loadStats(); loadCtsStats(); } }, '↻'),
+    h('button', { key: 'r', className: 'btn secondary', style: { padding: '5px 10px', fontSize: 12 }, onClick: function () { load(); loadCtsStats(); } }, '↻'),
     h('button', { key: 'rids', className: 'btn secondary', disabled: busy, onClick: reprocessByIds, title: 'Reprocesează email-uri specifice după ID — util la testare', style: { padding: '5px 12px', fontSize: 12 } }, '⟳ Reprocesează ID-uri'),
     h('span', { key: 'rsep', style: { width: 1, height: 22, background: 'var(--bd)' } }),
     h('span', { key: 'rdlbl', style: { fontSize: 11, color: 'var(--t2)', whiteSpace: 'nowrap' } }, 'De la:'),
@@ -18261,7 +18252,6 @@ function DocProcessing(props) {
     if (navEmailIds.indexOf(openEmail) < 0) navEmailIds = navEmailIds.concat([openEmail]);
     return h(EmailDocView, { key: 'edv' + openEmail, emailId: openEmail, emailIds: navEmailIds, onNavEmail: function (id) { setOpenEmail(id); }, types: allTypes, onBack: function () { navOrderRef.current = null; setOpenEmail(null); load(); }, onChanged: load });
   }
-  var S = stats || {};
   // Fereastra de raportare vine din backend (doc_stats.STATS_SINCE) — nu o rescrie aici, altfel
   // eticheta ar putea minti fata de ce s-a numarat efectiv.
   function sinceLbl(iso) {
@@ -18290,23 +18280,18 @@ function DocProcessing(props) {
       { key: 'contract', label: 'Contract', color: '#d29922' }
     ];
     var byCat = {};
+    // Necategorizatele nu mai apar nici ca rând, nici în totaluri — backend-ul le ține deoparte
+    // (`uncategorized`), fiindcă n-aveau cum să plece spre CTS și stăteau garantat pe 0%, deci
+    // trăgeau „Trimise spre CTS" în jos fără să spună nimic despre asociere.
     (C.by_category || []).forEach(function (r) { byCat[r.category] = r; });
-    // Documentele fără categorie (extragere eșuată, tip neidentificat) intră în TOTALUL din titlu.
-    // Fără rândul ăsta, suma categoriilor afișate ar fi mai mică decât totalul, iar cifrele s-ar
-    // contrazice pe ecran fără nicio explicație pentru cine se uită.
-    (C.by_category || []).forEach(function (r) {
-      if (['sofer', 'vehicul', 'contract'].indexOf(r.category) < 0) {
-        catMeta.push({ key: r.category, label: 'Necategorizate', color: 'var(--t3)' });
-      }
-    });
 
-    return h('div', { key: 'ctstrace', style: { marginTop: 14 } }, [
+    return h('div', { key: 'ctstrace', style: { marginBottom: 12 } }, [
       h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 } }, [
         h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 700, color: 'var(--t2)' } },
           'Trasabilitate în CTS' + (hasData ? ' · ' + T.extracted + ' documente extrase' : '')),
         h('span', { key: 'h', style: { fontSize: 11, color: 'var(--t3)' } },
           'extras → trimis → salvat pe entitate → șters de operator'),
-        C.since ? h('span', { key: 'sn', title: 'Documentele mai vechi nu sunt contorizate', style: { fontSize: 11, color: 'var(--t3)', border: '1px solid var(--bd)', borderRadius: 8, padding: '1px 7px' } }, sinceLbl(C.since)) : null
+        C.since ? h('span', { key: 'sn', title: (C.scope === 'today' ? 'Doar mailurile de azi — schimbă selectorul Azi/Toate' : 'Documentele mai vechi de ' + sinceLbl(C.since).replace('din ', '') + ' nu sunt contorizate'), style: { fontSize: 11, color: 'var(--t3)', border: '1px solid var(--bd)', borderRadius: 8, padding: '1px 7px' } }, C.scope === 'today' ? 'azi' : sinceLbl(C.since)) : null
       ]),
       !hasData
         ? h('div', { key: 'empty', className: 'card', style: { padding: '14px 16px', fontSize: 12, color: 'var(--t3)' } },
@@ -18351,38 +18336,7 @@ function DocProcessing(props) {
     ]);
   })();
 
-  var statsCards = h('div', { key: 'stats', style: { marginBottom: 12 } }, [
-    h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 } }, [
-      h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 700, color: 'var(--t2)' } }, '📊 Statistici procesare' + (S.total != null ? ' · ' + S.total + ' documente' : '')),
-      S.since ? h('span', { key: 'sn', title: 'Documentele mai vechi nu sunt contorizate în nicio statistică de pe această pagină', style: { fontSize: 11, color: 'var(--t3)', border: '1px solid var(--bd)', borderRadius: 8, padding: '1px 7px' } }, sinceLbl(S.since)) : null,
-      h('div', { key: 'sp', style: { flex: 1 } }),
-      h('select', { key: 'eng', value: statsEngine, onChange: function (e) { setStatsEngine(e.target.value); }, title: 'Filtrează după motorul de extragere — „Doar IRIS" arată cât de pregătit e pentru migrare', style: { padding: '4px 8px', background: 'var(--bg2)', color: 'var(--tx)', border: '1px solid var(--bd)', borderRadius: 6, fontSize: 11.5 } }, [
-        h('option', { key: 'a', value: 'all' }, 'Toate motoarele'),
-        h('option', { key: 'i', value: 'iris' }, 'Doar IRIS')
-      ])
-    ]),
-    h('div', { key: 'cards', style: { display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
-      statCard('av', (S.auto_validated_pct != null ? S.auto_validated_pct + '%' : '—'), 'Auto-validate', '#a855f7', (S.auto_validated || 0) + ' documente'),
-      (function() {
-        var BC = (S.by_category && typeof S.by_category === 'object') ? S.by_category : {};
-        var cats = [
-          { key: 'sofer',    label: 'Doc. șofer',   color: '#2ea043' },
-          { key: 'vehicul',  label: 'Doc. vehicul',  color: '#58a6ff' },
-          { key: 'contract', label: 'Contracte',     color: '#d29922' }
-        ];
-        return cats.map(function(c) {
-          var cd = BC[c.key] || {};
-          var grandTotal = S.total || 0;
-          var pct = (cd.auto_validated != null && grandTotal) ? (Math.round(1000 * cd.auto_validated / grandTotal) / 10) + '%' : '—';
-          var sub = (cd.auto_validated != null ? cd.auto_validated : '—') + ' din ' + (grandTotal || '—') + ' total (' + (cd.total != null ? cd.total : '—') + ' ' + c.label.toLowerCase() + ')';
-          return statCard(c.key, pct, c.label, c.color, sub);
-        });
-      })()
-    ]),
-    ctsTraceability
-  ]);
-
-  return h('div', null, [statsCards, toolbar, table]);
+  return h('div', null, [ctsTraceability, toolbar, table]);
 }
 
 // Modal detaliu: date editabile + selector tip manual + reidentifică
