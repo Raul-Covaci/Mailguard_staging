@@ -8,6 +8,21 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.11.1 - 2026-08-26
+
+### PATCH — „Trasabilitate în CTS" nu respecta fereastra din 24.08 (filtra pe data procesării)
+
+Cardurile de trasabilitate arătau în continuare 2333 documente extrase, deși fereastra pornea de
+la 24.08: filtrul rula pe `cts_document_tracking.extracted_at` — momentul PROCESĂRII, nu data
+mailului. Orice mail vechi reprocesat (reset/reimport, „Procesează acum", re-extragere după
+`storage_cleanup`) primește un `extracted_at` recent și rămânea în statistică.
+
+- `/cts/document-stats` filtrează acum pe **data mailului**: `LEFT JOIN emails e ON e.id =
+  t.email_id`, condiție `COALESCE(e.received_at, t.extracted_at) >= from_date`.
+- LEFT JOIN + fallback pentru că `email_id` n-are FK — `storage_cleanup.sh` șterge emailuri și
+  atașamente, iar rândul de tracking rămâne intenționat; un INNER JOIN ar fi șters tăcut
+  documentele vechi din numitor.
+
 ## v3.11.0 - 2026-08-26
 
 ### MINOR — statisticile din „Procesare documente" se numără doar din 24.08.2026

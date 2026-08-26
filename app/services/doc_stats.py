@@ -5,9 +5,10 @@ reincadrat, trasabilitate CTS) se numara DOAR de la 24.08.2026 incolo. Documente
 fost procesate cu alt set de tipuri/prompturi si trag procentele in jos, fara sa spuna nimic despre
 cum se comporta fluxul curent.
 
-Se filtreaza pe data MAILULUI (`emails.received_at`), la fel ca `scope=today` din aceleasi
-endpoint-uri — altfel „azi" nu ar mai fi un subset al totalului. Trasabilitatea CTS are propriul
-camp de timp (`cts_document_tracking.extracted_at`), filtrat cu aceeasi data.
+Se filtreaza pe data MAILULUI (`emails.received_at`) in TOATE statisticile paginii, inclusiv in
+trasabilitatea CTS — acolo prin LEFT JOIN pe `emails`, cu cadere inapoi pe
+`cts_document_tracking.extracted_at` cand mailul a fost curatat de storage_cleanup. Nu pe momentul
+procesarii: un mail vechi reprocesat azi nu trebuie sa intre in fereastra.
 
 Constanta e SINGURA sursa de adevar: o folosesc si `/documents/extractions/stats`
 (app/api/v1/documents.py) si `/cts/document-stats` (app/api/v1/cts.py), iar UI-ul o afiseaza din

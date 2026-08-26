@@ -1351,17 +1351,24 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
     # Plafon dur la fereastra de raportare a paginii „Procesare documente" (STATS_SINCE): un
     # from_date lipsa sau mai vechi e ridicat la ea, deci nimic dinainte nu se contorizeaza.
     from_date = clamp_from_date(from_date)
-    where, qp = "extracted_at >= :from_date", {"from_date": from_date}
+    # Fereastra se masoara pe DATA MAILULUI, ca in /documents/extractions/stats — nu pe
+    # `extracted_at` (momentul procesarii): un mail vechi reprocesat azi ar fi intrat altfel in
+    # statistica. `email_id` n-are FK (randurile din emails/attachments pot fi curatate de
+    # storage_cleanup, tracking-ul ramane), deci JOIN-ul e LEFT si cade inapoi pe `extracted_at`
+    # cand mailul nu mai exista — altfel documentele vechi ar disparea din numitor pe tacute.
+    where, qp = ("COALESCE(e.received_at, t.extracted_at) >= :from_date",
+                 {"from_date": from_date})
 
     rows = db.execute(text(f"""
-        SELECT COALESCE(category, 'necunoscut')                   AS category,
-               count(*)                                           AS extracted,
-               count(*) FILTER (WHERE cts_status <> 'extracted')  AS total_sent,
-               count(*) FILTER (WHERE cts_status = 'saved')       AS saved,
-               count(*) FILTER (WHERE cts_status = 'failed')      AS failed,
-               count(*) FILTER (WHERE cts_status = 'sent')        AS pending_ack,
-               count(*) FILTER (WHERE cts_status = 'deleted')     AS deleted_after
-        FROM cts_document_tracking
+        SELECT COALESCE(t.category, 'necunoscut')                   AS category,
+               count(*)                                             AS extracted,
+               count(*) FILTER (WHERE t.cts_status <> 'extracted')  AS total_sent,
+               count(*) FILTER (WHERE t.cts_status = 'saved')       AS saved,
+               count(*) FILTER (WHERE t.cts_status = 'failed')      AS failed,
+               count(*) FILTER (WHERE t.cts_status = 'sent')        AS pending_ack,
+               count(*) FILTER (WHERE t.cts_status = 'deleted')     AS deleted_after
+        FROM cts_document_tracking t
+        LEFT JOIN emails e ON e.id = t.email_id
         WHERE {where}
         GROUP BY 1 ORDER BY 1
     """), qp).fetchall()
