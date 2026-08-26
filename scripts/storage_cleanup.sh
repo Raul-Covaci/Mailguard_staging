@@ -2,7 +2,7 @@
 # Cleanup storage zilnic la 00:00:
 #   1. Fișiere native atașamente >10 zile — șterge conținut, păstrează numele în DB (storage_path intact)
 #   2. Audio apeluri >3 zile cu transcript success — șterge MP3/WAV, nullează audio_path în DB
-#   3. document_extractions procesate (status != pending) create ieri sau mai devreme — DELETE din DB
+#   3. document_extractions procesate (status != pending) mai vechi decat FEREASTRA de procesare — DELETE din DB
 #
 # Loguri: /opt/iris-mailguard/storage/logs/storage_cleanup.log (rotit la 10MB)
 set -euo pipefail
@@ -107,11 +107,24 @@ done < <($DB_CMD -c \
 
 log "  Audio: $AUDIO_DELETED fișiere șterse, $(( AUDIO_BYTES / 1048576 )) MB eliberate, $AUDIO_ERRORS erori"
 
-# ── 3. DOCUMENT_EXTRACTIONS procesate până ieri ────────────────────────────
-# Șterge rândurile cu status != pending create înainte de azi (00:00).
+# ── 3. DOCUMENT_EXTRACTIONS procesate, mai vechi decât fereastra ───────────
+# Șterge rândurile cu status != pending create înainte de (azi - RETENTION_DAYS).
 # raw_text și data (jsonb) sunt câmpurile mari — asta e memoria principală.
 # grouped_into FK: ștergem mai întâi non-root (grouped_into IS NOT NULL), apoi root.
-log "3/3 Cleanup document_extractions procesate pana ieri..."
+#
+# ⚠️ RETENTION_DAYS = fereastra de procesare (settings['documents.process_window'], vezi
+# app/services/doc_window.py). Drain-ul citește „am procesat asta" EXCLUSIV din prezența rândurilor
+# de aici. Dacă retenția e mai scurtă decât fereastra, un mail încă aflat în fereastră își pierde
+# rândurile la miezul nopții și e reprocesat (și replătit) a doua zi — bucla care a generat costuri
+# mari până în 26.08.2026. Nu scurta retenția fără să scurtezi fereastra în același timp.
+# `|| true`: sub `set -o pipefail` un psql picat (sau SIGPIPE de la `head`) ar face atribuirea sa
+# iasa cu cod != 0, iar `set -e` ar OMORI scriptul exact ca bug-ul reparat mai sus.
+RETENTION_DAYS=$($DB_CMD -c "SELECT (value->>'days')::int FROM settings WHERE key='documents.process_window'" 2>/dev/null | head -1 | tr -cd '0-9' || true)
+if [ -z "$RETENTION_DAYS" ] || [ "$RETENTION_DAYS" -lt 1 ] 2>/dev/null; then
+    RETENTION_DAYS=2
+    log "  ATENTIE: nu am putut citi documents.process_window — folosesc $RETENTION_DAYS zile"
+fi
+log "3/3 Cleanup document_extractions procesate, mai vechi de $RETENTION_DAYS zile..."
 CLEANUP_FAILED=0
 
 # Întoarce nr. de rânduri șterse, sau "ERR" dacă interogarea însăși a eșuat.
@@ -139,14 +152,14 @@ _count_deleted() {
 # Pass 1: copii grupate (grouped_into != NULL) — FK constraint
 DEL1=$(_count_deleted "DELETE FROM document_extractions
      WHERE status NOT IN ('pending')
-       AND created_at < CURRENT_DATE
+       AND created_at < CURRENT_DATE - make_interval(days => $RETENTION_DAYS)
        AND grouped_into IS NOT NULL
      RETURNING id")
 
 # Pass 2: root-uri (grouped_into NULL)
 DEL2=$(_count_deleted "DELETE FROM document_extractions
      WHERE status NOT IN ('pending')
-       AND created_at < CURRENT_DATE
+       AND created_at < CURRENT_DATE - make_interval(days => $RETENTION_DAYS)
        AND grouped_into IS NULL
      RETURNING id")
 

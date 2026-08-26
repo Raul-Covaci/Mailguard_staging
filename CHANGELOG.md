@@ -8,6 +8,40 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.13.0 - 2026-08-26
+
+### MINOR — documentele vechi nu se mai reprocesează după curățenia nocturnă (cost AI repetat)
+
+Drain-ul citea „am procesat asta" **exclusiv** din prezența rândurilor în `document_extractions`
+(`documents.py`, predicatul candidaților), iar curățenia nocturnă ștergea exact acele rânduri.
+Singura limită de dată pe traseul automat era `enabled_at` din `settings['documents.automation']`,
+deci **tot ce intrase după ultimul START al automatizării se re-extrăgea în fiecare noapte**, la
+nesfârșit — mailuri din 16.08 reapăreau procesate pe 26.08. Amplificator: nativele șterse după 10
+zile produceau rânduri `failed` („fisier indisponibil pe disc") care reintrau în coadă la fiecare
+10 minute.
+
+- **Fereastră de procesare, sursă unică**: `settings['documents.process_window'] = {"days": 2}`
+  (migrația `20260826b_doc_process_window.sql`), citită din Python prin
+  `app/services/doc_window.py::window_days()` și din shell de `storage_cleanup.sh`.
+- **Podea de dată pe toate scope-urile drain-ului** (`auto`, `all`, `recent`, `today`) și pe cele
+  două măturări de `retry_reclassify`. `all` (butonul „Procesează tot") **nu mai mătură arhiva**.
+- **Scope nou `ids`, singurul fără podea** — folosit doar de „Reprocesează ID-uri" (max 50 mailuri
+  alese explicit), ca reprocesarea deliberată a unui mail vechi să rămână posibilă. Nu e acceptat
+  de `/documents/process/run-now`, deci nu poate fi declanșat din UI.
+- **Fișier lipsă → `discard`, nu `failed`**: `_discard_attachment` în loc de rând `failed`, deci
+  atașamentul iese definitiv din coadă (recuperabil din restore-discarded) și se oprește retry-ul
+  la 10 minute.
+- **Retenția curățeniei = fereastra**: `storage_cleanup.sh` șterge extragerile mai vechi de
+  `RETENTION_DAYS` (citit din aceeași setare, fallback 2), nu „create înainte de azi". Altfel un
+  mail aflat încă în fereastră își pierdea rândurile la miezul nopții și se re-plătea a doua zi.
+- **`scripts/purge_documents_before.py`** (nou): golire unică a extragerilor + fișierelor native
+  pentru mailuri de dinainte de o dată (implicit 2026-08-24). Dry-run implicit, `--apply` pentru
+  execuție; nu atinge `cts_document_tracking` și nu șterge mailuri.
+
+⚠️ Consecințe asumate: un mail mai vechi decât fereastra nu se mai procesează automat niciodată
+(recuperare doar prin „Reprocesează ID-uri"), iar `reset-reimport` pe un interval vechi reimportă
+mailurile fără să le mai proceseze documentele.
+
 ## v3.12.0 - 2026-08-26
 
 ### MINOR — „Procesare documente": rămâne un singur panou de statistici, pe selectorul Azi/Toate
