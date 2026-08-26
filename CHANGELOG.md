@@ -8,6 +8,37 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.11.0 - 2026-08-26
+
+### MINOR — statisticile din „Procesare documente" se numără doar din 24.08.2026
+
+Documentele mai vechi au fost procesate cu alt set de tipuri/prompturi și trăgeau procentele în
+jos fără să spună nimic despre fluxul curent. Fereastra e o singură constantă,
+`app/services/doc_stats.py::STATS_SINCE`.
+
+- `/documents/extractions/stats` — filtru `e.received_at >= STATS_SINCE` (aceeași bază de timp ca
+  `scope=today`, ca „azi" să rămână un subset al totalului); se aplică și pe `scope=all`. Filtrul
+  merge și în `by_category`. Răspunsul întoarce `since`.
+- `/cts/document-stats` (trasabilitate CTS) — `from_date` e **plafonat** la `STATS_SINCE`
+  (`clamp_from_date`): un apel fără dată sau cu o dată mai veche nu mai poate număra înainte de
+  fereastră. Filtrul e pe `extracted_at`, câmpul propriu al `cts_document_tracking`.
+- UI (`mg-app.js`): badge „din 24.08.2026" pe ambele antete de statistici, citit din răspuns.
+
+Fără migrație — doar cod.
+
+## v3.10.1 - 2026-08-26
+
+### PATCH — mailurile de la `onrc_notificari@onrc.ro` intră obligatoriu pe Contabilitate
+
+Regulă deterministă nouă pe expeditor (fără condiție de subiect), deci se aplică înaintea
+AI-ului și înaintea potrivirii pe semnătura de angajat.
+
+- `department_rules.DEFAULT_RULES`: regula `onrc-notificari-01` (`onrc_notificari@onrc.ro` →
+  `contabilitate`).
+- `migrations/20260826_dept_rule_onrc.sql` — store-ul `settings['department_rules']` e seedat o
+  singură dată, deci pe bazele deja inițializate regula se adaugă prin migrație, idempotent după
+  `id`.
+
 ## v3.10.0 - 2026-08-25
 
 ### PATCH — /cases dura ~21 s: numele responsabililor se citeau cu un scan complet PER RÂND

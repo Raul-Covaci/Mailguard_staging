@@ -1,3 +1,4 @@
+
 """Sursa dedicata pentru mutarile intre departamente: `client_contact_email_department_log`.
 
 DE CE INCA O SURSA. `client_contact_email_log` (vezi `cts_email_log.py`) tine un rand per

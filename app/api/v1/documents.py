@@ -29,6 +29,7 @@ from app.database import get_db, SessionLocal
 from app.api.v1.auth import get_current_admin
 from app.services import iris_ai
 from app.services import iris_docsvc
+from app.services.doc_stats import STATS_SINCE
 # Reutilizam helperele PURE din Rapoarte (sursa unica, fara drift).
 from app.api.v1.reports import _fmt_fields, _fields_keys, _RETRY_CODES, AI_WORKERS
 # Traducerea caii atasamentului (container -> host) e single-source in emails.py.
@@ -4335,7 +4336,7 @@ def list_extractions(scope: str = "today", include_skipped: bool = False,
 
 
 
-def _stats_by_category(db, where_clauses):
+def _stats_by_category(db, where_clauses, params=None):
     """Statistici auto_validated per categorie (sofer/vehicul/contract)."""
     r2 = db.execute(text(
         "SELECT dt.category, "
@@ -4347,7 +4348,7 @@ def _stats_by_category(db, where_clauses):
         "WHERE " + " AND ".join(where_clauses) +
         " AND dt.category IN ('sofer','vehicul','contract') "
         "GROUP BY dt.category"
-    )).fetchall()
+    ), params or {}).fetchall()
     result = {}
     for row in r2:
         cat = row[0]
@@ -4366,8 +4367,13 @@ def extractions_stats(scope: str = "all", engine: str = "all",
                       db: Session = Depends(get_db), admin=Depends(get_current_admin)):
     """Statistici pt pagina Procesare documente (migration readiness): % auto-validat, extras corect
     (fara interventie operator), corectat de operator, reincadrat (tip schimbat manual).
-    scope: today|all. engine: all|iris (doar documentele extrase prin IRIS, extract_confidence not null)."""
-    where = ["d.status NOT IN ('grouped','discarded')"]
+    scope: today|all. engine: all|iris (doar documentele extrase prin IRIS, extract_confidence not null).
+
+    Fereastra de raportare e plafonata la `doc_stats.STATS_SINCE` (24.08.2026): documentele mai
+    vechi NU se contorizeaza deloc, nici macar pe scope=all — vezi app/services/doc_stats.py."""
+    where = ["d.status NOT IN ('grouped','discarded')",
+             "e.received_at >= CAST(:stats_since AS date)"]
+    params = {"stats_since": STATS_SINCE}
     if scope == "today":
         where.append("e.received_at::date = CURRENT_DATE")
     if engine == "iris":
@@ -4381,7 +4387,7 @@ def extractions_stats(scope: str = "all", engine: str = "all",
         "  count(*) FILTER (WHERE d.extract_confidence IS NOT NULL) AS iris_extracted, "
         "  round(avg(d.extract_confidence) FILTER (WHERE d.extract_confidence IS NOT NULL), 2) AS avg_iris_conf "
         "FROM document_extractions d JOIN emails e ON e.id=d.email_id "
-        "WHERE " + " AND ".join(where))).fetchone()
+        "WHERE " + " AND ".join(where)), params).fetchone()
     m = dict(r._mapping) if r else {}
     total = int(m.get("total") or 0)
     corrected = int(m.get("corrected") or 0)
@@ -4390,7 +4396,7 @@ def extractions_stats(scope: str = "all", engine: str = "all",
     def _pct(n):
         return round(100.0 * int(n or 0) / total, 1) if total else 0.0
     return {
-        "ok": True, "scope": scope, "engine": engine, "total": total,
+        "ok": True, "scope": scope, "engine": engine, "since": STATS_SINCE, "total": total,
         "auto_validated": int(m.get("auto_validated") or 0), "auto_validated_pct": _pct(m.get("auto_validated")),
         "needs_review": int(m.get("needs_review") or 0), "needs_review_pct": _pct(m.get("needs_review")),
         "corrected": corrected, "corrected_pct": _pct(corrected),
@@ -4399,7 +4405,7 @@ def extractions_stats(scope: str = "all", engine: str = "all",
         "correct_pct": (round(100.0 * (total - corrected - reincadrat) / total, 1) if total else 0.0),
         "iris_extracted": int(m.get("iris_extracted") or 0),
         "avg_iris_conf": (float(m["avg_iris_conf"]) if m.get("avg_iris_conf") is not None else None),
-        "by_category": _stats_by_category(db, where),
+        "by_category": _stats_by_category(db, where, params),
     }
 
 

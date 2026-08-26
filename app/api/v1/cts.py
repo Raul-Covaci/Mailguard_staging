@@ -36,6 +36,7 @@ from app.api.v1.auth import get_current_admin
 from app.api.v1.emails import _host_path
 # Reguli deterministe „mailuri automate -> marcheaza SOLVED in CTS" (feed: campul mark_as_solved).
 from app.services import cts_auto_solved
+from app.services.doc_stats import STATS_SINCE, clamp_from_date
 # Etichete departament (slug -> label) pentru campurile de clasificare din feed (faza 2).
 try:
     from app.services.department_classifier import DEPT_LABELS as _DEPT_LABELS
@@ -1335,8 +1336,10 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
 
     `ever_saved` = saved + deleted_after: un document sters a fost, prin definitie, salvat inainte.
     Fara asta, o stergere ar scadea si rata de succes a asocierii, desi asocierea chiar reusise.
+
+    Fereastra: `from_date` e plafonat la `doc_stats.STATS_SINCE` (24.08.2026) — documentele mai
+    vechi nu intra in statistica nici daca apelantul cere o data mai veche.
     """
-    where, qp = "TRUE", {}
     if from_date:
         _fd = (from_date or "").strip()
         try:
@@ -1345,7 +1348,10 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
              else _dt.strptime(_fd, "%Y-%m-%d"))
         except Exception:
             raise HTTPException(400, "from_date invalid (folositi YYYY-MM-DD sau ISO 8601)")
-        where, qp = "extracted_at >= :from_date", {"from_date": _fd}
+    # Plafon dur la fereastra de raportare a paginii „Procesare documente" (STATS_SINCE): un
+    # from_date lipsa sau mai vechi e ridicat la ea, deci nimic dinainte nu se contorizeaza.
+    from_date = clamp_from_date(from_date)
+    where, qp = "extracted_at >= :from_date", {"from_date": from_date}
 
     rows = db.execute(text(f"""
         SELECT COALESCE(category, 'necunoscut')                   AS category,
@@ -1379,7 +1385,8 @@ def cts_document_stats(from_date: Optional[str] = Query(None, description="Doar 
     tot["sent_pct"] = _pct(tot["total_sent"], tot["extracted"])
     tot["saved_pct"] = _pct(tot["ever_saved"], tot["total_sent"])
     tot["deleted_pct"] = _pct(tot["deleted_after"], tot["ever_saved"])
-    return {"ok": True, "from_date": from_date, "by_category": items, "total": tot}
+    return {"ok": True, "from_date": from_date, "since": STATS_SINCE,
+            "by_category": items, "total": tot}
 
 
 # ---------------------------------------------------------------- monitorizare (admin)

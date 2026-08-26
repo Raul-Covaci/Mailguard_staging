@@ -18259,6 +18259,12 @@ function DocProcessing(props) {
     return h(EmailDocView, { key: 'edv' + openEmail, emailId: openEmail, emailIds: navEmailIds, onNavEmail: function (id) { setOpenEmail(id); }, types: allTypes, onBack: function () { navOrderRef.current = null; setOpenEmail(null); load(); }, onChanged: load });
   }
   var S = stats || {};
+  // Fereastra de raportare vine din backend (doc_stats.STATS_SINCE) — nu o rescrie aici, altfel
+  // eticheta ar putea minti fata de ce s-a numarat efectiv.
+  function sinceLbl(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
+    return m ? ('din ' + m[3] + '.' + m[2] + '.' + m[1]) : '';
+  }
   function statCard(key, val, label, color, sub) {
     return h('div', { key: key, className: 'card', style: { flex: '1 1 140px', minWidth: 128, padding: '12px 15px', borderTop: '3px solid ' + (color || '#30363d') } }, [
       h('div', { key: 'l', style: { fontSize: 10, color: 'var(--t3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' } }, label),
@@ -18296,7 +18302,8 @@ function DocProcessing(props) {
         h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 700, color: 'var(--t2)' } },
           'Trasabilitate în CTS' + (hasData ? ' · ' + T.extracted + ' documente extrase' : '')),
         h('span', { key: 'h', style: { fontSize: 11, color: 'var(--t3)' } },
-          'extras → trimis → salvat pe entitate → șters de operator')
+          'extras → trimis → salvat pe entitate → șters de operator'),
+        C.since ? h('span', { key: 'sn', title: 'Documentele mai vechi nu sunt contorizate', style: { fontSize: 11, color: 'var(--t3)', border: '1px solid var(--bd)', borderRadius: 8, padding: '1px 7px' } }, sinceLbl(C.since)) : null
       ]),
       !hasData
         ? h('div', { key: 'empty', className: 'card', style: { padding: '14px 16px', fontSize: 12, color: 'var(--t3)' } },
@@ -18344,6 +18351,7 @@ function DocProcessing(props) {
   var statsCards = h('div', { key: 'stats', style: { marginBottom: 12 } }, [
     h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 } }, [
       h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 700, color: 'var(--t2)' } }, '📊 Statistici procesare' + (S.total != null ? ' · ' + S.total + ' documente' : '')),
+      S.since ? h('span', { key: 'sn', title: 'Documentele mai vechi nu sunt contorizate în nicio statistică de pe această pagină', style: { fontSize: 11, color: 'var(--t3)', border: '1px solid var(--bd)', borderRadius: 8, padding: '1px 7px' } }, sinceLbl(S.since)) : null,
       h('div', { key: 'sp', style: { flex: 1 } }),
       h('select', { key: 'eng', value: statsEngine, onChange: function (e) { setStatsEngine(e.target.value); }, title: 'Filtrează după motorul de extragere — „Doar IRIS" arată cât de pregătit e pentru migrare', style: { padding: '4px 8px', background: 'var(--bg2)', color: 'var(--tx)', border: '1px solid var(--bd)', borderRadius: 6, fontSize: 11.5 } }, [
         h('option', { key: 'a', value: 'all' }, 'Toate motoarele'),

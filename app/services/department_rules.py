@@ -79,6 +79,9 @@ DEFAULT_RULES = [
     {"department": "contabilitate", "from": "urbansiasociatii.ro", "subject": "", "note": "URBAN & ASOCIATII"},
     {"department": "contabilitate", "from": "mis.batch@btrl.ro", "subject": "", "note": "extrase BTRL"},
     {"department": "contabilitate", "from": "", "subject": "Tranzactii zilnice", "note": "tranzactii zilnice CARGOTRACK"},
+    # Notificarile ONRC (registrul comertului) merg mereu la Contabilitate, indiferent de subiect.
+    {"id": "onrc-notificari-01", "department": "contabilitate", "from": "onrc_notificari@onrc.ro",
+     "subject": "", "note": "Notificari ONRC -> Contabilitate"},
     # --- Suport 1 ---
     # Raport intern generat de aplicatie, trimis de pe office@cargotrack.ro. NU e cerere de
     # client: nu are serie de factura, dar contine citate din mailuri (inclusiv OP-uri), deci
