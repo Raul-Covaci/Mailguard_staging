@@ -931,8 +931,28 @@ def reprocess_email(email_id: int, background_tasks: BackgroundTasks, db: Sessio
         WHERE id = :id
     """), {"id": email_id})
 
-    # Reset document_extractions — vor fi reclasificate și retrimise la CTS
-    db.execute(text("DELETE FROM document_extractions WHERE email_id = :id"), {"id": email_id})
+    # Reset document_extractions — vor fi reclasificate și retrimise la CTS.
+    #
+    # ⛔ DOAR dacă mailul e încă în fereastra de procesare a documentelor (`doc_window`, plafon
+    # dur 1 zi). Drain-ul citește „am procesat asta" exclusiv din prezența rândurilor de aici și
+    # refuză mailurile din afara ferestrei: o ștergere acolo ar arunca extragerile fără să le
+    # poată reface nimeni, nici manual. Endpoint-ul a fost complet nefuncțional până la migrația
+    # 20260910_ai_intent_ensure.sql (UndefinedColumn pe UPDATE-ul de mai sus), deci nimeni nu a
+    # apăsat butonul pe un mail vechi — dar din clipa în care merge, ar fi putut.
+    #
+    # Rândurile `reviewed` (validate de om) rămân intacte în ambele cazuri — aceeași regulă ca la
+    # „Reprocesează ID-uri" din documents.py.
+    from app.services import doc_window
+    _docs_wd = doc_window.window_days(db)
+    _in_doc_window = bool(db.execute(text(
+        "SELECT received_at >= CURRENT_DATE - make_interval(days => :w) FROM emails WHERE id=:id"
+    ), {"w": _docs_wd, "id": email_id}).scalar())
+    if _in_doc_window:
+        db.execute(text("DELETE FROM document_extractions WHERE email_id = :id "
+                        "AND NOT COALESCE(reviewed, false)"), {"id": email_id})
+    else:
+        logger.info("reprocess_email %s: mail în afara ferestrei de documente (%d zi) — "
+                    "extragerile NU se șterg (nu ar mai putea fi refăcute)", email_id, _docs_wd)
 
     # Reset doc_discarded pe attachmente — permite reprocesarea lor
     db.execute(text("""
@@ -949,7 +969,8 @@ def reprocess_email(email_id: int, background_tasks: BackgroundTasks, db: Sessio
     background_tasks.add_task(process_one, email_id)
 
     logger.info("reprocess_email FULL: email_id=%s repus în pipeline de %s", email_id, getattr(admin, 'username', '?'))
-    return {"ok": True, "email_id": email_id, "status": "reprocessing"}
+    return {"ok": True, "email_id": email_id, "status": "reprocessing",
+            "documents_reset": _in_doc_window, "documents_window_days": _docs_wd}
 
 
 @router.post("/sync/run-now")

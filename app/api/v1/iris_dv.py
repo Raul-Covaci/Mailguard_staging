@@ -9,6 +9,9 @@ Două moduri de sincronizare, alese după `mode` declarat de view în /onboardin
                     nimic: un view incremental nu retrimite istoricul, deci un DELETE ar goli
                     tabela la prima rulare care aduce 3 rânduri.
 
+Paginile se scriu în DB pe măsură ce vin (`_iter_pages` + `_stream_into_table`), nu după ce
+s-a adunat tot view-ul în memorie: consumul e O(o pagină), nu O(tot view-ul).
+
 Fereastra de date: 2026-01-01 → azi, cu refresh pe ultimele 10 zile (overlap) la snapshot.
 Sincronizarea automată: `iris_dv_state.auto_sync` + `auto_sync_interval_minutes`, rulate de cron
 (POST /process/run-now, la 5 min) prin `app/services/iris_dv_autosync.py`.
@@ -332,8 +335,29 @@ def _extract_rows(payload):
     return []
 
 
-def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_ver: int = 0):
-    """Toate randurile din /data de la `since`, urmarind cursorul. -> (rows, columns, pages).
+class DVFetchError(RuntimeError):
+    """Esec la aducerea paginilor din /data, cu starea de scris in `iris_dv_state`.
+
+    De ce poarta starea in loc sa o scrie: de cand paginile se scriu pe masura ce vin,
+    generatorul ruleaza in INTERIORUL tranzactiei de scriere, iar `_update_state()` face
+    `commit()` — un commit de acolo ar consfinti un DELETE ramas fara INSERT-urile care il
+    urmau (tabela locala golita). Apelantul face intai rollback, abia apoi scrie starea."""
+
+    def __init__(self, message: str, **state):
+        super().__init__(message)
+        self.state = state
+
+
+def _iter_pages(view_name: str, api_key: str, since: str, schema_ver: int = 0):
+    """Generator: `(randuri_pagina, coloane, nr_pagina)` pentru fiecare pagina din /data.
+
+    Varianta anterioara (`_fetch_pages`) aduna toate paginile intr-o lista Python
+    (`all_rows.extend(rows)`) si abia apoi scria in DB. Pe `client_contact_email_log`
+    (1,07M randuri = 108 pagini) asta insemna 2-4 GB in heap-ul worker-ului la FIECARE
+    rulare, iar heap-ul CPython nu intoarce integral memoria la OS: RSS-ul urca in trepte
+    pana la OOM killer (workeri ucisi la 5,7 / 7,5 / 7,8 / 8,8 GB, aug-sept 2026).
+    Cu `yield` per pagina memoria e O(PAGE_LIMIT), indiferent de marimea view-ului — deci
+    plafonul `MAX_PAGES` (5M randuri) nu mai e o garantie de OOM.
 
     Un singur GET per pagina: varianta veche cerea pagina de doua ori (o data prin
     _http_get_with_retry, al carui raspuns se arunca, apoi inca o data cu httpx.get) — dublu
@@ -342,7 +366,7 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
     if schema_ver:
         headers = {**headers, "X-DV-Schema-Version": str(schema_ver)}
 
-    all_rows, columns_seen, cursor, page_num = [], None, None, 0
+    columns_seen, cursor, page_num, rows_total = None, None, 0, 0
     seen_cursors = set()
     while True:
         params = {"since": since, "limit": str(PAGE_LIMIT)}
@@ -350,25 +374,25 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
             params["cursor"] = cursor
         else:
             # Fara cursor oferit de server, avansam pe offset — altfel un view care pagineaza
-            # clasic ne-ar da mereu prima pagina.
+            # clasic ne-ar da mereu prima pagina. Contorul tine locul lui `len(all_rows)`:
+            # nu mai exista lista acumulata din care sa aflam cate randuri am luat.
             if page_num:
-                params["offset"] = str(len(all_rows))
+                params["offset"] = str(rows_total)
         try:
             resp = httpx.get(f"{DV_BASE}/{view_name}/data", params=params, headers=headers,
                              timeout=60, follow_redirects=True)
         except Exception as e:
-            _update_state(db, view_name, last_error=str(e), last_error_at=datetime.now(timezone.utc))
-            raise
+            raise DVFetchError(str(e), last_error=str(e),
+                               last_error_at=datetime.now(timezone.utc)) from e
 
         if resp.status_code == 410:
             # cursor expirat sau view apus
-            _update_state(db, view_name, etag=None, cursor_val=None,
-                          last_error="410 cursor expirat — re-sync complet la urmatoarea rulare")
-            raise RuntimeError("410 Gone — re-sync necesar")
+            raise DVFetchError(
+                "410 Gone — re-sync necesar", etag=None, cursor_val=None,
+                last_error="410 cursor expirat — re-sync complet la urmatoarea rulare")
         if resp.status_code != 200:
             msg = f"data raspuns {resp.status_code}: {resp.text[:200]}"
-            _update_state(db, view_name, last_error=msg, last_error_at=datetime.now(timezone.utc))
-            raise RuntimeError(msg)
+            raise DVFetchError(msg, last_error=msg, last_error_at=datetime.now(timezone.utc))
 
         payload = resp.json()
         rows = _extract_rows(payload)
@@ -384,10 +408,12 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
                 logger.warning("iris_dv %s: coloane cu nume invalid ignorate: %s",
                                view_name, [c for c in raw_cols if c not in columns_seen])
 
-        all_rows.extend(rows)
         page_num += 1
+        rows_total += len(rows)
         logger.info("iris_dv sync %s: pagina %d, %d randuri acum (has_more=%s, cursor=%s)",
-                    view_name, page_num, len(all_rows), has_more, bool(cursor))
+                    view_name, page_num, rows_total, has_more, bool(cursor))
+
+        yield rows, (columns_seen or ["id"]), page_num
 
         # Oprire. Ordinea conteaza: un `has_more` explicit False e autoritar; altfel continuam
         # cat timp pagina a venit PLINA (semnul clasic ca mai exista date) — asa nu ne mai
@@ -399,7 +425,7 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
         if page_num >= MAX_PAGES:
             logger.warning("iris_dv sync %s: oprit la plafonul de %d pagini (%d randuri) — "
                            "view-ul pare sa aiba mai multe date decat putem aduce intr-o rulare",
-                           view_name, MAX_PAGES, len(all_rows))
+                           view_name, MAX_PAGES, rows_total)
             break
         if cursor:
             if cursor in seen_cursors:
@@ -407,8 +433,6 @@ def _fetch_pages(view_name: str, api_key: str, db: Session, since: str, schema_v
                                view_name, cursor)
                 break
             seen_cursors.add(cursor)
-
-    return all_rows, (columns_seen or ["id"]), page_num
 
 
 def _row_values(row: dict, columns: list) -> dict:
@@ -435,6 +459,70 @@ def _insert_rows(db: Session, tbl: str, columns: list, rows: list, upsert: bool)
         db.execute(stmt, chunk)
 
 
+def _disable_idle_timeout(db: Session):
+    """Scoate `idle_in_transaction_session_timeout` pe DURATA tranzactiei curente.
+
+    De cand paginile se scriu pe masura ce vin, sesiunea sta „idle in transaction" intre doua
+    pagini (cat dureaza GET-ul catre IRIS, pana la 60 s) — inainte tranzactia era deschisa doar
+    cat tineau INSERT-urile. Daca serverul are timeout-ul setat (nu e implicit, dar Postgres-ul
+    asta e reglat manual: `temp_file_limit`, `max_wal_size`), sesiunea ar fi omorata in mijlocul
+    sync-ului si NICIUN snapshot nu s-ar mai termina vreodata.
+
+    `SET LOCAL` = doar pentru tranzactia in curs, se anuleaza singur la COMMIT/ROLLBACK, deci nu
+    scapa in pool pe alta cerere. Doar pe PostgreSQL — pe alt dialect (teste) e no-op."""
+    try:
+        if db.get_bind().dialect.name != "postgresql":
+            return
+    except Exception:
+        return
+    db.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
+
+
+def _stream_into_table(db: Session, view_name: str, pages, *, upsert: bool, purge: bool):
+    """Scrie paginile in tabela locala PE MASURA ce vin. -> (randuri, pagini, coloane).
+
+    Tranzactia de scriere se deschide dupa PRIMA pagina: abia atunci se cunosc coloanele,
+    deci abia atunci se poate crea/alinia tabela — iar `_create_local_table_if_needed()`
+    face `commit()`, deci nu are ce cauta in interiorul ei. `purge=True` (snapshot) sterge
+    continutul vechi in ACEEASI tranzactie cu inserarile, ca inlocuirea sa ramana atomica
+    pentru cititori (rapoartele care citesc tabela nu vad niciodata tabela goala).
+
+    ⚠️ Tranzactia ramane deschisa cat dureaza descarcarea (minute, pe un view de 1M randuri),
+    fata de secunde inainte. E pretul asumat pentru a nu mai tine tot setul in RAM. Din
+    acelasi motiv NIMIC din bucla nu are voie sa faca `commit` — vezi `DVFetchError`."""
+    tbl = _local_table_name(view_name)
+    rows_total, pages_done, columns = 0, 0, ["id"]
+    tx = None
+    try:
+        for rows, cols, pages_done in pages:
+            if tx is None:
+                columns = cols
+                _create_local_table_if_needed(db, view_name, columns)   # face commit
+                tx = db.begin_nested()
+                _disable_idle_timeout(db)
+                if purge:
+                    db.execute(text(f'DELETE FROM {tbl}'))
+            _insert_rows(db, tbl, columns, rows, upsert=upsert)
+            rows_total += len(rows)
+        if tx is None:
+            # Niciun raspuns cu randuri. La snapshot tabela tot trebuie golita — acelasi
+            # comportament ca inainte de streaming (view gol => tabela locala goala).
+            _create_local_table_if_needed(db, view_name, columns)
+            tx = db.begin_nested()
+            _disable_idle_timeout(db)
+            if purge:
+                db.execute(text(f'DELETE FROM {tbl}'))
+        tx.commit()
+    except DVFetchError as e:
+        db.rollback()
+        _update_state(db, view_name, **e.state)     # abia dupa rollback: _update_state comite
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return rows_total, pages_done, columns
+
+
 def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
     """mode=snapshot — inlocuire integrala atomica a tabelei locale."""
     state = _get_state(db, view_name)
@@ -450,14 +538,10 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
     new_freshness_at = fresh_data.get("view_updated_at")
     new_etag = fresh_resp.headers.get("ETag") or fresh_resp.headers.get("etag") or ""
 
-    all_rows, columns_seen, page_num = _fetch_pages(view_name, api_key, db, SYNC_FROM,
-                                                    remote_schema_ver)
-
-    tbl = _local_table_name(view_name)
-    _create_local_table_if_needed(db, view_name, columns_seen)
-    with db.begin_nested():
-        db.execute(text(f'DELETE FROM {tbl}'))
-        _insert_rows(db, tbl, columns_seen, all_rows, upsert=False)
+    rows_loaded, page_num, _cols = _stream_into_table(
+        db, view_name,
+        _iter_pages(view_name, api_key, SYNC_FROM, remote_schema_ver),
+        upsert=False, purge=True)
 
     _update_state(db, view_name,
         etag=new_etag,
@@ -466,12 +550,12 @@ def _sync_view_snapshot(view_name: str, api_key: str, db: Session):
         last_error_at=None,
         schema_version=remote_schema_ver,
         prompt_version=remote_prompt_ver,
-        total_rows=len(all_rows),
+        total_rows=rows_loaded,
         freshness_at=new_freshness_at,
         mode="snapshot"
     )
     db.commit()
-    return {"synced": True, "mode": "snapshot", "rows_loaded": len(all_rows),
+    return {"synced": True, "mode": "snapshot", "rows_loaded": rows_loaded,
             "pages": page_num, "schema_version": remote_schema_ver}
 
 
@@ -513,13 +597,12 @@ def _sync_view_incremental(view_name: str, api_key: str, db: Session):
     new_etag = fresh_resp.headers.get("ETag") or fresh_resp.headers.get("etag") or ""
     since = _since_for_incremental(state)
 
-    all_rows, columns_seen, page_num = _fetch_pages(view_name, api_key, db, since,
-                                                    remote_schema_ver)
+    rows_received, page_num, _cols = _stream_into_table(
+        db, view_name,
+        _iter_pages(view_name, api_key, since, remote_schema_ver),
+        upsert=True, purge=False)
 
     tbl = _local_table_name(view_name)
-    _create_local_table_if_needed(db, view_name, columns_seen)
-    with db.begin_nested():
-        _insert_rows(db, tbl, columns_seen, all_rows, upsert=True)
 
     try:
         total_local = int(db.execute(text(f'SELECT count(*) FROM {tbl}')).scalar() or 0)
@@ -533,12 +616,12 @@ def _sync_view_incremental(view_name: str, api_key: str, db: Session):
         last_error_at=None,
         schema_version=remote_schema_ver,
         prompt_version=remote_prompt_ver,
-        total_rows=total_local if total_local is not None else len(all_rows),
+        total_rows=total_local if total_local is not None else rows_received,
         freshness_at=new_freshness_at,
         mode="incremental"
     )
     db.commit()
-    return {"synced": True, "mode": "incremental", "rows_received": len(all_rows),
+    return {"synced": True, "mode": "incremental", "rows_received": rows_received,
             "rows_total_local": total_local, "since": since, "pages": page_num,
             "schema_version": remote_schema_ver}
 

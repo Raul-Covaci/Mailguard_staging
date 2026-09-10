@@ -153,6 +153,35 @@ retroactiv la repornirea filtrului.
 
 ---
 
+## 🧠 IRIS DATA VIEWS — sync-ul scrie PE MĂSURĂ ce vin paginile (2026-09-10)
+
+`app/api/v1/iris_dv.py`: `_iter_pages()` (generator, o pagină = 10.000 rânduri) +
+`_stream_into_table()`. Memoria e O(o pagină), nu O(tot view-ul).
+
+⛔ **Nu readuce acumularea într-o listă.** Varianta veche (`_fetch_pages` cu
+`all_rows.extend(rows)`) ținea 2-4 GB pe rulare pe `client_contact_email_log` (1,07M rânduri);
+heap-ul CPython nu întoarce integral memoria la OS, deci RSS-ul urca în trepte → 4 workeri
+gunicorn uciși de OOM killer (5,7 / 7,5 / 7,8 / 8,8 GB, 27 aug – 7 sept 2026), pe un server cu
+15 GB RAM.
+
+⚠️ **Nicio scriere din bucla de streaming nu are voie să facă `commit`.** Tranzacția de
+scriere stă deschisă cât durează descărcarea, iar `_update_state()` comite — un commit din
+mijloc ar consfinți un DELETE rămas fără INSERT-urile care îl urmau (tabela locală golită). De
+aceea erorile din generator ies ca `DVFetchError`, care **poartă** starea de scris; apelantul
+face `rollback`, abia apoi `_update_state`.
+
+**Snapshot ≠ ieftin.** Un view `snapshot` aduce tot setul și îl rescrie integral la FIECARE
+rulare. Podeaua din `iris_dv_autosync._effective_interval` oprește un snapshot cu ≥100.000
+rânduri sub 30 min, oricât s-ar seta în DB sau din UI. Intervalul poate coborî doar după
+trecerea view-ului pe `incremental` în `dv_registry` (partea IRIS) + `mode=NULL` în
+`iris_dv_state` local.
+
+⚠️ Intervalele de auto-sync se schimbă prin **migrație**, nu prin UPDATE pe staging — cele 5
+minute care au declanșat incidentul veneau chiar dintr-o migrație
+(`20260825_dv_autosync_email_log.sql`).
+
+---
+
 ## 🔀 MAIL-URI CTS — tab „Raport departamente" (2026-08-19)
 
 Traseul unui mail prin departamente. Sursa: **`cts_department_moves`** — un rând per eveniment
@@ -779,7 +808,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.7.0` (staging, 2026-08-20)
+**Versiunea curentă:** `v3.14.1` (staging, 2026-09-10)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:

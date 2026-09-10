@@ -26,9 +26,32 @@ logger = logging.getLogger("mailguard.iris_dv_autosync")
 LOCK_KEY = 778251           # pg_advisory_lock global pentru auto-sync-ul DV
 MAX_VIEWS_PER_TICK = 6      # plafon per rulare: un tick de cron nu trebuie sa tina minute intregi
 
+# Podea de interval pentru view-urile SNAPSHOT mari. Un snapshot aduce de fiecare data TOT
+# view-ul si il rescrie (DELETE + INSERT integral): pe `client_contact_email_log` (1,07M randuri)
+# la 5 minute au iesit ~34 de rescrieri complete pe zi, care au dus la 4 workeri ucisi de OOM
+# killer in august-septembrie 2026. Intervalul din DB poate doar sa LARGEASCA fereastra, nu sa o
+# stranga sub aceasta valoare. Nu se aplica la `incremental` (aduce doar delta, oricat de mare ar
+# fi view-ul) si nici la snapshot-urile mici, unde rescrierea e ieftina.
+SNAPSHOT_MIN_INTERVAL_MINUTES = 30
+SNAPSHOT_BIG_VIEW_ROWS = 100_000
+
+
+def _effective_interval(state: dict) -> int:
+    """Intervalul efectiv, dupa aplicarea podelei pentru snapshot-urile mari.
+    Vezi `SNAPSHOT_MIN_INTERVAL_MINUTES` pentru motiv."""
+    interval = int(state.get("auto_sync_interval_minutes") or 60)
+    mode = (state.get("mode") or "").strip().lower()
+    rows = int(state.get("total_rows") or 0)
+    if mode == "snapshot" and rows >= SNAPSHOT_BIG_VIEW_ROWS and interval < SNAPSHOT_MIN_INTERVAL_MINUTES:
+        logger.warning("auto-sync %s: interval %d min ridicat la %d — snapshot cu %d randuri "
+                       "(rescriere integrala la fiecare rulare)",
+                       state.get("view_name"), interval, SNAPSHOT_MIN_INTERVAL_MINUTES, rows)
+        return SNAPSHOT_MIN_INTERVAL_MINUTES
+    return interval
+
 
 def _due(state: dict, now: datetime) -> bool:
-    interval = int(state.get("auto_sync_interval_minutes") or 60)
+    interval = _effective_interval(state)
     last = state.get("last_sync_at")
     if not last:
         return True

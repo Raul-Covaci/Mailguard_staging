@@ -8,6 +8,76 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.14.1 - 2026-09-10
+
+### PATCH — sync-ul IRIS Data Views nu mai ține tot view-ul în RAM (cauza celor 4 OOM-uri)
+
+Workerii gunicorn creșteau în trepte până erau uciși de OOM killer: 27 aug (5,7 GB), 28 aug
+(7,5 GB), 7 sept 04:26 (7,8 GB), 7 sept 13:11 (8,8 GB), din 15 GB pe server. `Restart=always`
+a mascat incidentele — utilizatorii au văzut doar cereri întrerupte.
+
+Cauza: `_fetch_pages()` din `app/api/v1/iris_dv.py` descărca TOATE paginile într-o listă Python
+(`all_rows.extend(rows)`) și abia apoi scria în DB. Pe `client_contact_email_log` (1,07M rânduri
+= 108 pagini × 10.000) asta însemna 2-4 GB pe rulare; heap-ul CPython nu întoarce integral
+memoria la OS, deci RSS-ul urca la fiecare din cele ~34 de sincronizări zilnice.
+
+- **Streaming per pagină.** `_fetch_pages()` → `_iter_pages()` (generator) + `_stream_into_table()`:
+  fiecare pagină se scrie în DB imediat ce a venit. Memoria e O(o pagină) = 10.000 rânduri,
+  indiferent de mărimea view-ului — deci plafonul `MAX_PAGES` (5M rânduri) nu mai e o garanție
+  de OOM. Semantica nu se schimbă: snapshot rămâne DELETE + INSERT atomic (cititorii nu văd
+  niciodată tabela goală), incremental rămâne UPSERT fără DELETE.
+- ⚠️ **Tranzacția de scriere rămâne deschisă cât durează descărcarea** (minute pe un view de 1M
+  rânduri), față de secunde înainte. Preț asumat. Consecință directă: **nimic din bucla de
+  scriere nu are voie să facă `commit`** — `_update_state()` comite, iar un commit din mijlocul
+  streamingului ar consfinți un DELETE rămas fără INSERT-urile care îl urmau. De aceea erorile
+  de rețea/HTTP din generator ies ca `DVFetchError`, care POARTĂ starea de scris; apelantul face
+  întâi `rollback`, abia apoi `_update_state`. Nu introduce `commit` acolo.
+- `migrations/20260910_dv_email_log_sync_interval.sql`: intervalul de auto-sync pentru
+  `client_contact_email_log` revine de la 5 la 60 min (implicitul aplicației) — ~3 rescrieri
+  integrale pe zi în loc de ~34. Cei 5 minute veneau din `20260825_dv_autosync_email_log.sql`,
+  nu dintr-un UPDATE manual, deci corecția trebuia să fie tot o migrație ca să ajungă pe prod.
+  `client_contact_email_department_log` rămâne la 5 min: e incremental, aduce doar delta.
+- **Podea de interval pentru snapshot-urile mari** (`iris_dv_autosync._effective_interval`):
+  un view `snapshot` cu ≥100.000 rânduri nu se sincronizează mai des de 30 min, oricât s-ar seta
+  în DB sau din UI. Blochează recidiva; nu atinge view-urile incrementale sau mici.
+- `_disable_idle_timeout()`: `SET LOCAL idle_in_transaction_session_timeout = 0` pe durata
+  tranzacției de sync. Sesiunea stă acum „idle in transaction" între două pagini (cât durează
+  GET-ul către IRIS, până la 60 s) — dacă serverul are timeout-ul setat, sesiunea ar fi omorâtă
+  la mijloc și niciun snapshot nu s-ar mai încheia. `SET LOCAL` expiră singur la COMMIT/ROLLBACK,
+  deci nu scapă în pool. No-op pe alt dialect decât PostgreSQL.
+- `systemd/mailguard-api.service`: `--max-requests 500 --max-requests-jitter 50` — reciclare
+  grațioasă a workerilor, ca plasă de siguranță pentru orice acumulare viitoare.
+  ⚠️ Unitățile systemd NU se propagă prin `git pull` — se copiază manual (vezi antetul unității).
+
+**Rămâne de făcut, pe partea IRIS (coordonare cu Răzvan):** trecerea view-ului pe
+`mode='incremental'` + `incremental_column='updated_at'` în `dv_registry`, apoi
+`UPDATE iris_dv_state SET mode=NULL WHERE view_name='client_contact_email_log';` local, ca modul
+să se re-rezolve din `/onboarding`. View-ul geamăn `client_contact_email_department_log` e deja
+incremental, deci precedentul există. Abia atunci intervalul poate coborî sub 30 min.
+
+### PATCH — „Reprocesează email" nu mai cade pe coloane inexistente
+
+`POST /emails/{id}/reprocess` (`app/api/v1/emails.py:926`) resetează `ai_intent` / `ai_intent_at`,
+coloane care lipsesc din `emails` pe staging → `UndefinedColumn`, endpoint complet nefuncțional.
+Migrația care le adaugă (`20260610_ai_intent.sql`) există, dar e marcată aplicată în
+`_release_migrations` fără să fi rulat pe baza curentă (restaurare dintr-un dump anterior,
+împreună cu tabelul de evidență), iar `migrate.sh` decide după numele fișierului.
+
+- `migrations/20260910_ai_intent_ensure.sql` — același DDL sub nume nou, idempotent și aditiv.
+  Coloanele rămân în cod: sunt folosite de poarta `ai_intent_gate` din `process_email.py`.
+
+⚠️ Repararea endpoint-ului îl repune în funcțiune, deci `DELETE`-ul lui pe `document_extractions`
+devine efectiv pentru prima dată. Ștergerea e acum condiționată:
+
+- **doar dacă mailul e în fereastra de procesare a documentelor** (`doc_window`, plafon dur 1 zi).
+  Drain-ul refuză mailurile din afara ferestrei, deci o ștergere acolo ar fi aruncat extragerile
+  fără ca nimeni — nici operatorul, nici cronul — să le mai poată reface. Răspunsul întoarce
+  `documents_reset` + `documents_window_days`.
+- **rândurile `reviewed` rămân intacte**, aceeași regulă ca la „Reprocesează ID-uri".
+
+Nu e risc de cost AI: fereastra de 1 zi se aplică oricum la selecția candidaților, deci un mail
+vechi nu se reprocesează nici dacă i s-ar șterge extragerile.
+
 ## v3.14.0 - 2026-08-26
 
 ### MINOR — plafon DUR: nu se procesează documente din mailuri mai vechi de 1 zi
