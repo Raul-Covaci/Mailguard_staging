@@ -795,6 +795,18 @@ _EMPLOYED_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_e
                                  AND (h_e.valid_to IS NULL OR h_e.valid_to > {day}))"""
 
 
+def _iris_int(val) -> Optional[int]:
+    """`employee_department_mapping.iris_id` e TEXT — un rand cu valoare ne-numerica (import
+    manual, camp completat gresit) nu are voie sa doboare tot raportul cu ValueError. Returneaza
+    None, adica „nu se poate lega de DV-ul de concedii"."""
+    if val is None:
+        return None
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _leave_dates_per_emp(db: Session, emp_ids: list, iris_to_emp: dict,
                          first: _dt.date, last: _dt.date, holidays: set) -> dict:
     """{employee_id: set(zile L-V de concediu din luna)} — union din cele DOUA surse.
@@ -873,7 +885,7 @@ def _pre_start_leave_hours(db: Session, department: str, first: _dt.date, last: 
     if not ops:
         return 0.0
     emp_ids = [r[0] for r in ops]
-    iris_to_emp = {int(r[2]): r[0] for r in ops if r[2] is not None}
+    iris_to_emp = {i: r[0] for r in ops for i in [_iris_int(r[2])] if i is not None}
     work_hours = {r[0]: int(r[1] or _DEFAULT_WORK_HOURS) for r in ops}
     per_emp = _leave_dates_per_emp(db, emp_ids, iris_to_emp, first, last, holidays)
     total = 0.0
@@ -1738,8 +1750,8 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
         {"d": department, "wh": _DEFAULT_WORK_HOURS, "first": first, "last_day": last},
     ).fetchall()
     op_ids_all = [r[0] for r in ops]
-    op_iris_ids = [int(r[3]) for r in ops if r[3] is not None]
-    iris_to_edm = {int(r[3]): r[0] for r in ops if r[3] is not None}
+    op_iris_ids = [i for r in ops for i in [_iris_int(r[3])] if i is not None]
+    iris_to_edm = {i: r[0] for r in ops for i in [_iris_int(r[3])] if i is not None}
     op_meta = {r[0]: {"name": r[1], "work_hours": int(r[2] or _DEFAULT_WORK_HOURS)} for r in ops}
 
     # 2) Pontaj real per operator — sursa de adevar pentru prezenta/absenta.
@@ -1828,9 +1840,6 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
         ore_planificate += (len(zile_prezent) + len(zile_absent_pontaj)) * wh
         absence_hours += len(zile_absent_pontaj) * wh
 
-    # Pastreaza compatibilitate cu codul de raportare care afiseaza leave_hours
-    leave_hours = absence_hours
-
     ore_disponibile = max(0.0, ore_planificate - absence_hours)
 
     # 3) ore_planificate = calendar ideal (zile_lucratoare_cal × work_hours per operator activ).
@@ -1862,8 +1871,6 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     ore_concediu_pre_start = _pre_start_leave_hours(db, department, first, last, holidays,
                                                     zile_lucratoare_cal)
     _ore_concediu_report += ore_concediu_pre_start
-
-    leave_hours = _ore_concediu_report
 
     baza_procent = float(cfg["baza_procent"]) if cfg else 95.0
 
@@ -2577,6 +2584,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
             "status": "fara_obiective",
             "baza_procent": None,
             "zile_lucratoare": 0,
+            "ore_concediu_pre_start": 0.0,
             "ore_planificate": 0.0,
             "ore_disponibile": 0.0,
             "coeficient": None,
@@ -2611,8 +2619,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
         {"d": department, "wh": _DEFAULT_WORK_HOURS, "first": first_tgt, "last_day": last_tgt},
     ).fetchall()
     op_ids = [r[0] for r in ops]
-    op_iris_ids_fc = [int(r[3]) for r in ops if r[3] is not None]
-    iris_to_edm_fc = {int(r[3]): r[0] for r in ops if r[3] is not None}
+    iris_to_edm_fc = {i: r[0] for r in ops for i in [_iris_int(r[3])] if i is not None}
     op_meta = {r[0]: {"name": r[1], "work_hours": int(r[2] or _DEFAULT_WORK_HOURS)} for r in ops}
 
     # Zile de concediu in luna tinta per angajat (aceleasi doua surse ca la raportul lunar —

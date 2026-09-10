@@ -25,6 +25,9 @@ Decizie business: zilele lui de concediu se scad acum din `ore_disponibile`, de�
 - Lunile cu snapshot deja emis rămân pe cifrele fixate (regula existentă de imutabilitate).
 - Refactor colateral: sursele de concediu erau copiate în două locuri (raport + estimare) și puteau
   diverge; acum sunt într-un singur helper, `_leave_dates_per_emp()`.
+- `iris_id` e coloană TEXT: o valoare ne-numerică arunca `ValueError` și dobora tot raportul
+  (risc preexistent în rostere, plus calea nouă). Se ignoră acum acel rând la legarea de DV
+  (`_iris_int`), în loc să pice raportul întregului departament.
 
 ## v3.16.0 - 2026-09-11
 
