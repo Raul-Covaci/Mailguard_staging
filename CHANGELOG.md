@@ -8,6 +8,24 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.1 - 2026-09-11
+
+### PATCH — concediile celor cu „start productivitate" în viitor scad orele disponibile
+
+Un angajat cu `productivity_start_date` în octombrie nu intră în calculul lunii septembrie — corect
+pentru `ore_planificate`, dar dacă are concediu în septembrie, absența lui nu se vedea nicăieri.
+Decizie business: zilele lui de concediu se scad acum din `ore_disponibile`, deși omul nu apare în
+`ore_planificate` și nici în lista de operatori.
+
+- Motor: `productivity._pre_start_leave_hours()`, aplicat identic în raportul lunar și în estimare.
+- Se numără DOAR concediile (`employee_schedule` + `cts_dv_employee_vacation_request` status 1/2,
+  deduplicate pe zi, plafonate la zilele lucrătoare ale lunii), nu și zilele de lucru pe proiecte.
+- Câmp nou în răspuns: `ore_concediu_pre_start`, afișat ca subtitlu la „Ore disponibile", ca
+  diferența față de „Ore planificate" să nu pară o eroare.
+- Lunile cu snapshot deja emis rămân pe cifrele fixate (regula existentă de imutabilitate).
+- Refactor colateral: sursele de concediu erau copiate în două locuri (raport + estimare) și puteau
+  diverge; acum sunt într-un singur helper, `_leave_dates_per_emp()`.
+
 ## v3.16.0 - 2026-09-11
 
 ### MINOR — istoric de departament per angajat (productivitatea istorică nu se mai rescrie)

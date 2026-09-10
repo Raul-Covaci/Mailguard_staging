@@ -313,6 +313,19 @@ fără niciun rând → inactivă DOAR dacă toți angajații activi ai departam
 aprobat (`employee_schedule` / `cts_dv_employee_vacation_request`); altfel e gaură de sync și se
 cade pe program (altfel o pană de pontaj ar face toate scorurile 100%).
 
+**Start productivitate ≠ absență din disponibil (2026-09-11).** Un angajat cu
+`productivity_start_date` într-o lună viitoare NU intră în `ore_planificate` (nu i se planifică
+muncă), dar concediul lui din luna raportată SE SCADE din `ore_disponibile` — decizie business:
+disponibilul trebuie să arate capacitatea reală a departamentului. Motor:
+`productivity._pre_start_leave_hours()`, aplicat identic în `department_report` și
+`forecast_report`; valoarea e expusă ca `ore_concediu_pre_start` și afișată sub cardul „Ore
+disponibile". Zilele de lucru pe proiecte/refurbished NU se numără aici (omul n-are încă muncă
+planificată în departament). Lunile cu snapshot deja emis rămân pe cifrele fixate.
+
+Sursele de concediu (`employee_schedule` + `cts_dv_employee_vacation_request`, status 1/2,
+deduplicate pe zi) sunt într-un singur loc: `productivity._leave_dates_per_emp()` — folosit atât de
+raport cât și de estimare, ca cele două să nu poată diverge.
+
 ⚠️ Logica există în DOUĂ locuri și trebuie schimbată în OGLINDĂ:
 `_BizCache._dept_window` din `app/services/productivity.py` (mailuri, apeluri, operațiuni) și
 funcția SQL `business_minutes_emp` (task-uri) — vezi

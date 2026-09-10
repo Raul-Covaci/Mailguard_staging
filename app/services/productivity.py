@@ -795,6 +795,93 @@ _EMPLOYED_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_e
                                  AND (h_e.valid_to IS NULL OR h_e.valid_to > {day}))"""
 
 
+def _leave_dates_per_emp(db: Session, emp_ids: list, iris_to_emp: dict,
+                         first: _dt.date, last: _dt.date, holidays: set) -> dict:
+    """{employee_id: set(zile L-V de concediu din luna)} — union din cele DOUA surse.
+
+    Sursa 1: `employee_schedule` (kind='vacation_approved' sau entry_source='manual') — populata de
+    sync-ul DV->ES cand `iris_id` e setat, plus concediile adaugate manual din Utilizatori.
+    Sursa 2: `cts_dv_employee_vacation_request` cu status IN (1,2) — fallback pentru angajatii fara
+    `iris_id` mapat sau cand sync-ul n-a rulat inca. status=1 (in asteptare, fara aprobator) se
+    trateaza ca ACCEPTAT la calculul orelor disponibile (cerinta 2026-07-30); 3/4 au decizie finala
+    de respingere, deci sunt excluse.
+    Zilele se deduplica per angajat, deci suprapunerea celor doua surse nu numara de doua ori.
+
+    `iris_to_emp`: {iris_id(int): employee_id} pentru traducerea randurilor din DV.
+    """
+    if not emp_ids:
+        return {}
+    rows = db.execute(text("""
+        SELECT es.employee_id, es.start_date, es.end_date
+        FROM employee_schedule es
+        WHERE es.employee_id = ANY(:ids)
+          AND (es.kind = 'vacation_approved' OR es.entry_source = 'manual')
+          AND es.start_date <= :last
+          AND es.end_date   >= :first
+    """), {"ids": emp_ids, "first": first, "last": last}).fetchall()
+    rows = [(r[0], r[1], r[2]) for r in rows]
+
+    iris_ids = [i for i in iris_to_emp.keys()]
+    if iris_ids:
+        _dv_exists = db.execute(text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name='cts_dv_employee_vacation_request' LIMIT 1"
+        )).fetchone()
+        if _dv_exists:
+            dv_raw = db.execute(text("""
+                SELECT v.employee_id::int, v.period_begin::date, v.period_end::date
+                FROM cts_dv_employee_vacation_request v
+                WHERE v.employee_id::int = ANY(:iris_ids)
+                  AND v.status::int IN (1, 2)
+                  AND v.deleted_at IS NULL
+                  AND v.period_begin::date <= :last
+                  AND v.period_end::date   >= :first
+            """), {"iris_ids": iris_ids, "first": first, "last": last}).fetchall()
+            rows += [(iris_to_emp[r[0]], r[1], r[2]) for r in dv_raw if r[0] in iris_to_emp]
+
+    from collections import defaultdict as _dd
+    out: dict = _dd(set)
+    for emp_id, sd, ed in rows:
+        d = max(sd, first)
+        end = min(ed, last)
+        while d <= end:
+            if d.isoweekday() < 6 and d.isoformat() not in holidays:
+                out[emp_id].add(d)
+            d += _dt.timedelta(days=1)
+    return dict(out)
+
+
+def _pre_start_leave_hours(db: Session, department: str, first: _dt.date, last: _dt.date,
+                           holidays: set, zile_lucratoare_cal: int) -> float:
+    """Orele de concediu ale membrilor departamentului care NU intra inca in calcul.
+
+    Un angajat cu `productivity_start_date` in viitor (ex. octombrie, cand raportam septembrie) nu
+    apare in `ore_planificate` — nu i se planifica munca. Dar daca are concediu in luna raportata,
+    zilele acelea se scad din `ore_disponibile`: decizie business 2026-09-11, ca disponibilul sa
+    reflecte capacitatea reala a departamentului in luna respectiva.
+
+    Se numara DOAR concediile, nu si zilele de lucru pe proiecte/refurbished: acelea sunt munca
+    planificata pe alt scop, iar omul nu are inca munca planificata aici.
+    """
+    ops = db.execute(text(
+        "SELECT id, COALESCE(work_hours, :wh) AS work_hours, iris_id "
+        "FROM employee_department_mapping "
+        "WHERE id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:first AS date))) "
+        "  AND productivity_start_date IS NOT NULL "
+        "  AND productivity_start_date > :last_day"
+    ), {"d": department, "wh": _DEFAULT_WORK_HOURS, "first": first, "last_day": last}).fetchall()
+    if not ops:
+        return 0.0
+    emp_ids = [r[0] for r in ops]
+    iris_to_emp = {int(r[2]): r[0] for r in ops if r[2] is not None}
+    work_hours = {r[0]: int(r[1] or _DEFAULT_WORK_HOURS) for r in ops}
+    per_emp = _leave_dates_per_emp(db, emp_ids, iris_to_emp, first, last, holidays)
+    total = 0.0
+    for emp_id, days in per_emp.items():
+        total += min(len(days), zile_lucratoare_cal) * work_hours[emp_id]
+    return total
+
+
 # ---------------------------------------------------------------- surse bottom-up per tip obiectiv
 def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: Optional[list] = None,
                       biz: Optional["_BizCache"] = None):
@@ -1757,48 +1844,11 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     )
     ore_plan_ideale = sum(op_meta[oid]["work_hours"] * zile_lucratoare_cal for oid in op_ids)
 
-    # Concedii aprobate (+ in asteptare, tratate ca acceptate) per operator activ, union de zile L-V.
-    # Sursa 1: employee_schedule cu kind='vacation_approved' sau entry_source='manual' (sync DV->ES cand iris_id e populat)
-    # Sursa 2: cts_dv_employee_vacation_request status IN (1,2) (fallback cand iris_id nu e setat si sync-ul nu a rulat)
-    #   status=1: in asteptare (fara approved_by) -> tratat ca acceptat la calculul ore_disponibile, cerinta 2026-07-30
-    #   status=2: aprobat. status=3/4: au approved_by populat (decizie finala, non-aprobat) -> excluse.
-    # Ambele surse combinate, deduplicate per zi.
+    # Concedii aprobate (+ in asteptare, tratate ca acceptate) per operator activ, union de zile L-V
+    # din cele doua surse — vezi `_leave_dates_per_emp` pentru surse si reguli de status.
     _ore_concediu_report = 0.0
     if op_ids:
-        _leave_rows = db.execute(text("""
-            SELECT es.employee_id, es.start_date, es.end_date
-            FROM employee_schedule es
-            WHERE es.employee_id = ANY(:ids)
-              AND (es.kind = 'vacation_approved' OR es.entry_source = 'manual')
-              AND es.start_date <= :last
-              AND es.end_date   >= :first
-        """), {"ids": op_ids, "first": first, "last": last}).fetchall()
-        _dv_tbl_exists = db.execute(text(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name='cts_dv_employee_vacation_request' LIMIT 1"
-        )).fetchone()
-        if _dv_tbl_exists and op_iris_ids:
-            _dv_rows_raw = db.execute(text("""
-                SELECT v.employee_id::int, v.period_begin::date, v.period_end::date
-                FROM cts_dv_employee_vacation_request v
-                WHERE v.employee_id::int = ANY(:iris_ids)
-                  AND v.status::int IN (1, 2)
-                  AND v.deleted_at IS NULL
-                  AND v.period_begin::date <= :last
-                  AND v.period_end::date   >= :first
-            """), {"iris_ids": op_iris_ids, "first": first, "last": last}).fetchall()
-            _dv_rows = [(iris_to_edm[r[0]], r[1], r[2]) for r in _dv_rows_raw if r[0] in iris_to_edm]
-            _leave_rows = list(_leave_rows) + _dv_rows
-        from collections import defaultdict as _dd
-        _emp_dates: dict = _dd(set)
-        for _eid, _sd, _ed in _leave_rows:
-            _ov_start = max(_sd, first)
-            _ov_end = min(_ed, last)
-            _d = _ov_start
-            while _d <= _ov_end:
-                if _d.isoweekday() < 6 and _d.isoformat() not in holidays:
-                    _emp_dates[_eid].add(_d)
-                _d += _dt.timedelta(days=1)
+        _emp_dates = _leave_dates_per_emp(db, op_ids, iris_to_edm, first, last, holidays)
         # Zile libere extra (proiecte / refurbished) — se adauga peste zilele de concediu,
         # suma fiind plafonata la zilele lucratoare ale lunii, ca la concedii.
         _extra_days = _extra_days_per_emp(db, op_ids, year, month)
@@ -1806,6 +1856,12 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
             _nd = len(_emp_dates.get(_eid, set())) + _extra_days.get(_eid, 0)
             _wh = op_meta[_eid]["work_hours"]
             _ore_concediu_report += min(_nd, zile_lucratoare_cal) * _wh
+
+    # Concediile celor care intra in calcul abia dintr-o luna VIITOARE (productivity_start_date):
+    # nu au ore planificate, dar absenta lor se vede in disponibil. Vezi _pre_start_leave_hours.
+    ore_concediu_pre_start = _pre_start_leave_hours(db, department, first, last, holidays,
+                                                    zile_lucratoare_cal)
+    _ore_concediu_report += ore_concediu_pre_start
 
     leave_hours = _ore_concediu_report
 
@@ -1822,6 +1878,9 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     if _snap is not None:
         ore_planificate = _snap["ore_planificate"]
         ore_disponibile = _snap["ore_disponibile"]
+        # Orele vin fixate din snapshot: nu putem sti daca au fost emise inainte sau dupa regula
+        # concediilor pre-start, deci nu afisam o defalcare care ar putea contrazice cifra.
+        ore_concediu_pre_start = 0.0
         coeficient      = _snap["coeficient"]
         obiectiv_real   = _snap["obiectiv_real"]
         obiectiv_minim  = _snap["obiectiv_minim"]
@@ -2125,6 +2184,9 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
         "ore_planificate": round(ore_planificate, 2),
         "ore_disponibile": round(ore_disponibile, 2),
         "ore_plan_ideale": round(ore_plan_ideale, 2),
+        # Cat din `ore_disponibile` s-a scazut pentru oameni care nu sunt inca in calcul
+        # (productivity_start_date in viitor) — altfel diferenta plan/disponibil pare inexplicabila.
+        "ore_concediu_pre_start": round(ore_concediu_pre_start, 2),
         "coeficient": round(coeficient, 4) if coeficient is not None else None,
         "obiectiv_real": round(obiectiv_real, 2) if obiectiv_real is not None else None,
         "obiectiv_minim": round(obiectiv_minim, 2) if obiectiv_minim is not None else None,
@@ -2309,6 +2371,7 @@ def aggregate_reports(reports: list) -> dict:
     ore_plan = sum(r.get("ore_planificate") or 0 for r in reports)
     ore_disp = sum(r.get("ore_disponibile") or 0 for r in reports)
     ore_plan_ideale_total = sum(r.get("ore_plan_ideale") or r.get("ore_planificate") or 0 for r in reports)
+    ore_concediu_pre_start = sum(r.get("ore_concediu_pre_start") or 0 for r in reports)
     volum = sum(r.get("volum") or 0 for r in reports)
     excluse = sum(r.get("excluse") or 0 for r in reports)
     measurable_total = sum(r.get("measurable") or 0 for r in reports)
@@ -2478,6 +2541,7 @@ def aggregate_reports(reports: list) -> dict:
         "zile_lucratoare": zile,
         "ore_planificate": round(ore_plan, 2),
         "ore_disponibile": round(ore_disp, 2),
+        "ore_concediu_pre_start": round(ore_concediu_pre_start, 2),
         "coeficient": coeficient,
         "obiectiv_real": obiectiv_real,
         "obiectiv_minim": obiectiv_minim,
@@ -2551,47 +2615,11 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
     iris_to_edm_fc = {int(r[3]): r[0] for r in ops if r[3] is not None}
     op_meta = {r[0]: {"name": r[1], "work_hours": int(r[2] or _DEFAULT_WORK_HOURS)} for r in ops}
 
-    # Zile de concediu in luna tinta per angajat:
+    # Zile de concediu in luna tinta per angajat (aceleasi doua surse ca la raportul lunar —
+    # `_leave_dates_per_emp`, ca Rapoarte si Estimare sa nu poata diverge).
     leave_days_per_emp: dict = {}
     if op_ids:
-        leave_rows = db.execute(
-            text("""
-                SELECT es.employee_id, es.start_date, es.end_date
-                FROM employee_schedule es
-                WHERE es.employee_id = ANY(:ids)
-                  AND (es.kind = 'vacation_approved' OR es.entry_source = 'manual')
-                  AND es.start_date <= :last
-                  AND es.end_date   >= :first
-            """),
-            {"ids": op_ids, "first": first_tgt, "last": last_tgt},
-        ).fetchall()
-        _dv_tbl_exists2 = db.execute(text(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_name='cts_dv_employee_vacation_request' LIMIT 1"
-        )).fetchone()
-        if _dv_tbl_exists2 and op_iris_ids_fc:
-            _dv_rows2_raw = db.execute(text("""
-                SELECT v.employee_id::int, v.period_begin::date, v.period_end::date
-                FROM cts_dv_employee_vacation_request v
-                WHERE v.employee_id::int = ANY(:iris_ids)
-                  AND v.status::int IN (1, 2)
-                  AND v.deleted_at IS NULL
-                  AND v.period_begin::date <= :last
-                  AND v.period_end::date   >= :first
-            """), {"iris_ids": op_iris_ids_fc, "first": first_tgt, "last": last_tgt}).fetchall()
-            _dv_rows2 = [(iris_to_edm_fc[r[0]], r[1], r[2]) for r in _dv_rows2_raw if r[0] in iris_to_edm_fc]
-            leave_rows = list(leave_rows) + _dv_rows2
-        # Calcul L-V zile per angajat cu deduplicare prin union de intervale
-        from collections import defaultdict
-        emp_dates: dict = defaultdict(set)
-        for emp_id, sd, ed in leave_rows:
-            overlap_start = max(sd, first_tgt)
-            overlap_end = min(ed, last_tgt)
-            d = overlap_start
-            while d <= overlap_end:
-                if d.isoweekday() < 6 and d.isoformat() not in holidays:
-                    emp_dates[emp_id].add(d)
-                d += _dt.timedelta(days=1)
+        emp_dates = _leave_dates_per_emp(db, op_ids, iris_to_edm_fc, first_tgt, last_tgt, holidays)
         # Zile libere extra (proiecte / refurbished) — numar de zile pe luna, fara date
         # concrete, deci adunate peste zilele de concediu. Iterez pe op_ids (nu pe emp_dates)
         # ca sa prind si angajatii care au DOAR zile extra, fara concediu in luna.
@@ -2600,6 +2628,11 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
             total = len(emp_dates.get(emp_id, set())) + extra_days_per_emp.get(emp_id, 0)
             if total:
                 leave_days_per_emp[emp_id] = min(total, zile_lucratoare)
+
+    # Concediile celor cu productivity_start_date in viitor: nu au ore planificate, dar absenta lor
+    # scade disponibilul (aceeasi regula ca in department_report).
+    ore_concediu_pre_start = _pre_start_leave_hours(db, department, first_tgt, last_tgt,
+                                                    holidays, zile_lucratoare)
 
     # Ore planificate (toti prezenti, caz ideal) si ore disponibile (minus concedii aprobate)
     baza_procent = float(cfg["baza_procent"])
@@ -2615,6 +2648,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
     if _snap_fc is not None:
         ore_planificate = _snap_fc["ore_planificate"]
         ore_disponibile = _snap_fc["ore_disponibile"]
+        ore_concediu_pre_start = 0.0   # idem department_report: orele sunt fixate in snapshot
         coeficient      = _snap_fc["coeficient"]
         obiectiv_real   = _snap_fc["obiectiv_real"]
         obiectiv_minim  = _snap_fc["obiectiv_minim"]
@@ -2622,7 +2656,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
         ore_planificate = sum(op_meta[oid]["work_hours"] * zile_lucratoare for oid in op_ids)
         ore_concediu = sum(
             op_meta[oid]["work_hours"] * leave_days_per_emp.get(oid, 0) for oid in op_ids
-        )
+        ) + ore_concediu_pre_start
         ore_disponibile = max(0.0, ore_planificate - ore_concediu)
         # coeficient = obiectiv per ora disponibila (baza_procent / ore_ideale_totale)
         # obiectiv_real = ore_disponibile * coeficient — ajustat cu concediile reale
@@ -2924,6 +2958,9 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
         # arunca UnboundLocalError -> forecast_report crapa pe TOATE departamentele, deci
         # dashboard-ul afisa lista de obiective goala (constatat 2026-07-29).
         "ore_concediu": round(max(0.0, float(ore_planificate) - float(ore_disponibile)), 2),
+        # Partea din `ore_concediu` care vine de la oameni ce nu sunt inca in calcul
+        # (productivity_start_date in viitor) — vezi _pre_start_leave_hours.
+        "ore_concediu_pre_start": round(float(ore_concediu_pre_start), 2),
         "coeficient": coeficient,
         "obiectiv_real": round(obiectiv_real, 2),
         "obiectiv_minim": round(obiectiv_minim, 2),

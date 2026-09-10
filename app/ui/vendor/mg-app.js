@@ -12254,7 +12254,10 @@ function ProdDeptCard({ d, isForecast, dailyMonth }) {
         h(ProdMetric, { key:'coef', label:'Coeficient', value:(d.coeficient == null ? '—' : Number(d.coeficient).toFixed(4)), col:'var(--am)' }),
         h(ProdMetric, { key:'zl', label:'Zile lucrătoare', value:prodNum(d.zile_lucratoare), col:'var(--t3)' }),
         h(ProdMetric, { key:'plan', label:'Ore planificate', value:prodNum(d.ore_planificate), col:'var(--yw)' }),
-        h(ProdMetric, { key:'disp', label:'Ore disponibile', value:prodNum(d.ore_disponibile), col:'var(--gn)' })
+        // Concediile oamenilor care nu sunt inca in calcul (start productivitate in viitor) se scad
+        // din disponibil, dar nu apar in planificate — fara nota, diferenta pare o eroare.
+        h(ProdMetric, { key:'disp', label:'Ore disponibile', value:prodNum(d.ore_disponibile), col:'var(--gn)',
+          sub: (d.ore_concediu_pre_start ? ('− ' + prodNum(d.ore_concediu_pre_start) + ' h concediu, oameni încă neincluși') : null) })
       ])
     ]),
     d.note_masurare && !isForecast ? h('div', { key:'note', style:{ background:'var(--bg3)', border:'1px solid var(--bd)', borderRadius:'var(--r-sm)', padding:'8px 12px', marginBottom:12, fontSize:12, color:'var(--t2)' } }, d.note_masurare) : null,
