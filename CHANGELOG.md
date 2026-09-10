@@ -8,6 +8,45 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.5 - 2026-09-10
+
+### PATCH — Monitor operațional: „deschis" se citea din listă albă de stări (muncă invizibilă)
+
+Double-check pe bara „Restanță" din v3.16.4. Trei defecte găsite, toate pe definiția lui „deschis";
+două existau dinainte, unul venea din v3.16.4.
+
+**1. `unallocated` nu era numărat nicăieri** (preexistent). Contoarele zilei foloseau liste albe
+(`cts_status = 'new'`, `t.status IN ('new','postponed')`), dar setul confirmat de vendor
+(Razvan, 2026-07-02) e `unallocated, new, in_progress, postponed, closed, solved`. Un task
+`unallocated` — pe care nu l-a luat NIMENI, adică exact munca de semnalat — nu apărea pe monitor.
+Idem `status` NULL (`cts_status` e nullable) și ortografia `in_progress` cu underscore, pe care
+feed-ul o folosește în paralel cu `in progress` (task-urile o scriu cu spațiu, dar
+`cts_groundtruth_sync` verifică mailurile pe underscore).
+
+„Deschis" se scrie acum ca NEGARE — `lower(btrim(COALESCE(status,''))) NOT IN ('solved','closed')`
+— peste tot în endpoint: contoare de grup, carduri per departament și graficul pe ore (care avea
+deja forma corectă, dar fără `lower`/`btrim`). „În lucru" = ambele ortografii de in_progress; tot
+restul deschis merge la „Noi" (nepreluate). Cele două bare ale zilei acoperă acum tot ce a intrat
+azi și e încă deschis.
+
+⚠️ **Cifrele de pe monitor cresc după acest fix** — munca era acolo, doar nu se afișa.
+
+**2. Fereastra restanței cădea între bare pe fus UTC** (introdus în v3.16.4). `< CURRENT_DATE`
+compara ziua serverului DB cu o dată convertită în Europe/Bucharest. Dacă Postgres rulează pe UTC,
+între 00:00 și 03:00 local cele două nu coincid, iar un rând sosit atunci nu era nici „de azi", nici
+„< azi": dispărea din toate barele. Acum e `IS DISTINCT FROM CURRENT_DATE` — negarea exactă a
+ferestrei zilei, deci partiția e completă în orice fus și acoperă și sosirea NULL fără ramură
+separată.
+
+**3. Restanța folosea și ea o listă albă** de stări (introdus în v3.16.4) — aceeași cauză ca (1).
+
+Verificat: toate combinațiile status × dată (55 de rânduri, inclusiv majuscule, spații și NULL), în
+ambele scenarii de fus — fiecare rând deschis cade pe exact o bară, niciunul dublat, niciunul
+pierdut. Pe scenariul UTC, varianta din v3.16.4 pierdea 3 din 5 rânduri deschise. Cele 25 de
+interogări ale endpointului parsează ca Postgres valid; predicatele contorului de grup sunt
+identice cu cele per departament (invariantul „suma cardurilor = totalul"), iar expresia restanței
+e aceeași în toate cele 4 locuri unde apare.
+
 ## v3.16.4 - 2026-09-10
 
 ### MINOR — Monitor operațional: bară nouă „Restanță" (deschis din zilele trecute)

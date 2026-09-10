@@ -769,14 +769,33 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     # ziua curentă, fiindcă exact amestecul lor cu restanța istorică a dus la limitarea din
     # 2026-08-13 (CTS lasă tichete deschise la nesfârșit — Financiar avea 769 'new', unele din
     # martie). Restanța e o BARĂ SEPARATĂ, deci nimic nu se pierde și nimic nu se contaminează.
-    # Sosirea NULL intră tot la restanță: nu poate fi de azi, iar un rând deschis nu are voie să
-    # dispară din monitor doar fiindcă îi lipsește data (join LEFT pe `emails`).
-    _EMAIL_BEFORE_TODAY = (f"({_EMAIL_ARRIVED_LOCAL} IS NULL "
-                           f"OR DATE({_EMAIL_ARRIVED_LOCAL}) < CURRENT_DATE)")
-    _EMAIL_OPEN_STATES = "g.cts_status IN ('new','in progress')"
-    _TASK_BEFORE_TODAY = (f"(t.cts_created_at IS NULL "
-                          f"OR DATE(t.cts_created_at AT TIME ZONE '{_TZ}') < CURRENT_DATE)")
-    _TASK_OPEN_STATES = "t.status IN ('new','postponed','in progress')"
+    # „Deschis" = NEterminal, adică NOT IN ('solved','closed') — NU o listă albă de stări.
+    # `status` e text liber în ambele tabele („enum CTS TBD" în migrația 20260702), iar setul
+    # confirmat de vendor (Razvan, 2026-07-02) e: unallocated, new, in_progress, postponed, closed,
+    # solved. O listă albă ar rata `unallocated` (task alocat nimănui — exact munca pe care nimeni
+    # n-a preluat-o) și ar depinde de ortografia lui in_progress, scrisă în feed în ambele feluri
+    # („in progress" cu spațiu la task-uri, „in_progress" în `cts_groundtruth_sync`). `lower` +
+    # `COALESCE` sunt aceeași convenție ca `cts_tasks_sync._pending_task_anchor`, care definește
+    # „pending" pentru backfill; forma complementară e deja folosită de `h_mail_open`/`h_task_open`
+    # mai jos. Ștergerile: mailurile prin `cts_deleted_at IS NULL` (în WHERE), task-urile n-au
+    # coloană de ștergere.
+    _EMAIL_OPEN_STATES = "lower(btrim(COALESCE(g.cts_status,''))) NOT IN ('solved','closed')"
+    _TASK_OPEN_STATES = "lower(btrim(COALESCE(t.status,''))) NOT IN ('solved','closed')"
+    # „În lucru" = preluat de cineva. Ambele ortografii, fiindcă feed-ul le scrie pe amândouă:
+    # task-urile ca „in progress" (nota veche de la `task_row`), iar `cts_groundtruth_sync` verifică
+    # mailurile pe „in_progress". Restul stărilor deschise (new, unallocated, postponed, NULL) sunt
+    # NEPRELUATE, deci merg la „Noi" — vezi mai jos de ce contează.
+    _EMAIL_WIP = "lower(btrim(COALESCE(g.cts_status,''))) IN ('in progress','in_progress')"
+    _TASK_WIP = "lower(btrim(COALESCE(t.status,''))) IN ('in progress','in_progress')"
+    # „Nu e din ziua curentă" ca NEGARE EXACTĂ a ferestrei folosite de barele zilei, nu ca
+    # `< CURRENT_DATE`. Motivul: `CURRENT_DATE` e ziua serverului DB, iar data comparată e convertită
+    # în Europe/Bucharest. Dacă Postgres rulează pe UTC, între 00:00 și 03:00 local cele două nu
+    # coincid, și un rând sosit atunci n-ar fi nici „de azi" nici „< azi" — ar dispărea din toate
+    # barele, tăcut. `IS DISTINCT FROM` acoperă și sosirea NULL (join LEFT pe `emails`,
+    # `cts_created_at` nullable), deci cele trei bare partiționează exact rândurile deschise.
+    _EMAIL_BEFORE_TODAY = f"(DATE({_EMAIL_ARRIVED_LOCAL}) IS DISTINCT FROM CURRENT_DATE)"
+    _TASK_BEFORE_TODAY = (f"(DATE(t.cts_created_at AT TIME ZONE '{_TZ}') "
+                          f"IS DISTINCT FROM CURRENT_DATE)")
 
     # Expresia de departament efectiv, refolosita in GROUP BY / WHERE.
     _EFF_DEPT_EMAIL = "COALESCE(g.cts_department, edm.department)"
@@ -808,9 +827,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT
             COUNT(*) FILTER (WHERE g.cts_status IN ('solved','closed')
                              AND DATE(g.cts_solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
-            COUNT(*) FILTER (WHERE g.cts_status = 'in progress'
+            COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND {_EMAIL_WIP}
                              AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS in_lucru,
-            COUNT(*) FILTER (WHERE g.cts_status = 'new'
+            COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND NOT {_EMAIL_WIP}
                              AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS noi,
             COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND {_EMAIL_BEFORE_TODAY})           AS restanta
         FROM cts_ground_truth g
@@ -832,9 +851,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT
             COUNT(*) FILTER (WHERE t.status IN ('solved','closed')
                              AND DATE(t.cts_updated_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
-            COUNT(*) FILTER (WHERE t.status = 'in progress'
+            COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_WIP}
                              AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS in_progress,
-            COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
+            COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND NOT {_TASK_WIP}
                              AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS pending,
             COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY})              AS restanta
         FROM {_SRC_TASK} t
@@ -1149,7 +1168,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         {_dep_email}
         {_J_EMAIL_EXCL}
         WHERE g.cts_deleted_at IS NULL
-          AND g.cts_status NOT IN ('solved','closed')
+          AND {_EMAIL_OPEN_STATES}
           AND {_EMAIL_ARRIVED_LOCAL} IS NOT NULL
           AND {_EMAIL_EXCLUDE_SQL}
           AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE
@@ -1160,7 +1179,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         SELECT EXTRACT(hour FROM t.cts_created_at AT TIME ZONE '{_TZ}')::int AS h, COUNT(*)
         FROM {_SRC_TASK} t
         {_dep_task}
-        WHERE t.status NOT IN ('solved','closed')
+        WHERE {_TASK_OPEN_STATES}
           AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE
           AND {_EFF_DEPT_TASK} = ANY(:depts)
         GROUP BY 1
@@ -1253,9 +1272,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             SELECT COALESCE(g.cts_department, edm.department) AS dept,
                    COUNT(*) FILTER (WHERE g.cts_status IN ('solved','closed')
                                     AND DATE(g.cts_solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
-                   COUNT(*) FILTER (WHERE g.cts_status = 'in progress'
+                   COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND {_EMAIL_WIP}
                                     AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS in_lucru,
-                   COUNT(*) FILTER (WHERE g.cts_status = 'new'
+                   COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND NOT {_EMAIL_WIP}
                                     AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS noi,
                    COUNT(*) FILTER (WHERE {_EMAIL_ARRIVED_LOCAL} IS NOT NULL
                                     AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE) AS intrate_azi,
@@ -1276,9 +1295,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             SELECT COALESCE(t.department, edm.department) AS dept,
                    COUNT(*) FILTER (WHERE t.status IN ('solved','closed')
                                     AND DATE(t.cts_updated_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
-                   COUNT(*) FILTER (WHERE t.status = 'in progress'
+                   COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_WIP}
                                     AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)   AS in_progress,
-                   COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
+                   COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND NOT {_TASK_WIP}
                                     AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)   AS noi,
                    COUNT(*) FILTER (WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS intrate_azi,
                    COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY})     AS restanta

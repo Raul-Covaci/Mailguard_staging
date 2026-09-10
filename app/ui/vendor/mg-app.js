@@ -14024,8 +14024,8 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
 
   // Culoare pe STARE, nu pe categorie: soluționat = verde, în lucru = galben, nou = albastru.
   // Aceeași stare are aceeași culoare peste toate categoriile, deci se citește dintr-o privire.
-  // Restanța (deschis din zilele trecute) are culoare proprie, gri-albastru: nu e o stare a zilei,
-  // deci nu are voie să concureze vizual cu barele care descriu ziua curentă.
+  // Restanța (deschis, dar nu din ziua curentă) are culoare proprie, gri neutru (--t3): nu e o
+  // stare a zilei, deci nu are voie să concureze vizual cu barele care descriu ziua curentă.
   var C_DONE = 'var(--gn)', C_WIP = 'var(--yw)', C_NEW = 'var(--bl)', C_OLD = 'var(--t3)';
 
   // `icon` + `accent`: badge per categorie, ca secțiunile să se distingă dintr-o privire pe un
@@ -14035,10 +14035,12 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   // „Soluționate" = închise azi; „În lucru" / „Noi" = din ce a SOSIT azi, cât e încă deschis
   // (backend, 2026-08-13 — înainte, stările deschise se numărau fără limită de vechime și cardul
   // arăta restanța istorică din CTS, nu ziua).
-  // „Restanță" (2026-09-10) = deschis ACUM, sosit înainte de azi, fără limită de vechime: un mail
-  // din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09. Stă pe bară SEPARATĂ tocmai
-  // ca să nu se repete greșeala de dinainte de 2026-08-13 — amestecat în „Noi", un tichet abandonat
-  // din martie ar arăta ca muncă a zilei.
+  // „Restanță" (2026-09-10) = deschis ACUM, dar NU din ziua curentă, fără limită de vechime: un
+  // mail din 02.09 rămas deschis trebuie să se vadă și pe 03.09. Stă pe bară SEPARATĂ tocmai ca să
+  // nu se repete greșeala de dinainte de 2026-08-13 — amestecat în „Noi", un tichet abandonat din
+  // martie ar arăta ca muncă a zilei.
+  // „În lucru" = preluat (in progress); „Noi" = tot restul deschis din azi, inclusiv `unallocated`
+  // și `postponed` (backend, v3.16.5). Cele două acoperă împreună tot ce a intrat azi și e deschis.
   var groups = [
     { name: 'Mail-uri', icon: 'mail', accent: 'var(--am)', azi: true, bars: [
       { label: 'Soluționate', v: em.rezolvate_azi || 0, c: C_DONE },
@@ -14077,14 +14079,18 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   // Totalul soluționat azi = pulsul departamentului pe toate canalele; restanțele = ce
   // rămâne deschis acum. Ambele se derivă din date deja aduse, fără cereri suplimentare.
   var totalSolutionatAzi = (em.rezolvate_azi || 0) + (tk.rezolvate_azi || 0) + (ap.azi || 0);
-  // „Deschis" numără doar ce a intrat azi și n-a fost încă închis — nu restanța istorică.
-  var totalDeschis = (em.in_lucru || 0) + (tk.in_progress || 0);
-  // Restanța, pe toate canalele: deschis acum, sosit înainte de azi. Se afișează separat de
-  // „Deschis din azi" — sunt seturi disjuncte, nu se însumează într-o singură cifră.
+  // „Deschis azi" = TOT ce a intrat azi și e încă deschis: în lucru + nepreluate. Până la v3.16.5
+  // suma omitea „Noi", deci un departament cu 15 mailuri noi și zero preluate afișa „Deschis azi: 0"
+  // — cu atât mai derutant lângă „Restanță", care numără toate stările deschise.
+  var totalDeschis = (em.in_lucru || 0) + (em.noi || 0)
+                   + (tk.in_progress || 0) + (tk.noi || tk.pending || 0);
+  // Restanța, pe toate canalele: deschis acum, dar nu din ziua curentă. Se afișează separat de
+  // „Deschis azi" — sunt seturi disjuncte, nu se însumează într-o singură cifră.
   var totalRestanta = (em.restanta || 0) + (tk.restanta || 0);
-  // Ritmul se raportează la VOLUMUL INTRAT azi (intrate_azi), nu la câte au rămas în starea
-  // 'new'. Barele „Noi" arată restanța neatinsă; numitorul de aici trebuie să fie tot ce a
-  // sosit azi, altfel ritmul iese absurd (166 rezolvate / 1 nou = 16600%).
+  // Ritmul se raportează la VOLUMUL INTRAT azi (`intrate_azi`), nu la câte au rămas deschise.
+  // Bara „Noi" arată doar ce n-a fost încă atins; numitorul trebuie să fie tot ce a sosit azi,
+  // altfel ritmul iese absurd (166 rezolvate / 1 nou = 16600%). `restanta` NU intră în numitor:
+  // e un STOC din zilele trecute, nu debitul zilei — l-ar dilua fără sens.
   // Apelurile intrate = răspunse + pierdute: un apel pierdut a sosit, chiar dacă n-a fost tratat.
   var totalIntratAzi = (em.intrate_azi || 0) + (tk.intrate_azi || 0) + (ap.azi || 0) + (ap.pierdute_azi || 0);
   // Ritm = rezolvat azi / intrat azi. Peste 100% înseamnă că se lichidează și restanțe din

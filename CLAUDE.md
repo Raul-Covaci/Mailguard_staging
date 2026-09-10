@@ -334,18 +334,34 @@ ingestul se oprește. Se schimbă `WHILE1_API_TOKEN` în `.env` pe server (nu e 
   (decizie 2026-08-13). Fără limita asta, CTS lasă tichete deschise la nesfârșit (notificări
   automate, tichete abandonate) și monitorul de perete arăta o restanță istorică pe care nimeni
   n-o mai lucrează: Suport 1 avea 26 'new', din care doar 3 din ultimele 7 zile.
-- `restanta` = **deschis ACUM, sosit înainte de azi, fără limită de vechime** (cerere 2026-09-10:
-  un mail din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09).
+- `restanta` = **deschis ACUM, dar NU din ziua curentă, fără limită de vechime** (cerere
+  2026-09-10: un mail din 02.09 rămas deschis trebuie să se vadă și pe 03.09).
 
 ⛔ **Nu le uni într-un singur contor.** Cele două cerințe se contrazic doar dacă se amestecă:
 separate, orice rând deschis e numărat exact o dată (`noi` + `in_lucru` + `restanta` = total
 deschise) și un tichet din martie nu se mai deghizează în muncă a zilei. Predicatele sunt fragmente
-locale în `get_monitor_live` — `_EMAIL_BEFORE_TODAY` / `_EMAIL_OPEN_STATES` /
-`_TASK_BEFORE_TODAY` / `_TASK_OPEN_STATES` — refolosite de contorul de grup ȘI de cel per
-departament, ca suma cardurilor să rămână egală cu totalul.
+locale în `get_monitor_live` — `_EMAIL_OPEN_STATES` / `_EMAIL_WIP` / `_EMAIL_BEFORE_TODAY` (+
+echivalentele `_TASK_*`) — refolosite de contorul de grup, de cel per departament ȘI de graficul pe
+ore, ca suma cardurilor să rămână egală cu totalul.
 
-⚠️ Sosirea NULL intră la `restanta`, nu se aruncă: join-ul pe `emails` e LEFT, iar un rând deschis
-nu are voie să dispară din monitor doar fiindcă îi lipsește data.
+⛔ **„Deschis" se scrie ca NEGARE, nu ca listă albă de stări:**
+`lower(btrim(COALESCE(status,''))) NOT IN ('solved','closed')`. `status` e text liber în ambele
+tabele („enum CTS TBD", migrația 20260702), iar setul confirmat de vendor (Razvan, 2026-07-02) e
+`unallocated, new, in_progress, postponed, closed, solved`. O listă albă `IN ('new','in progress')`
+ratează `unallocated` (task pe care nu l-a luat nimeni — exact munca invizibilă), ratează ortografia
+cu underscore (feed-ul o scrie în ambele feluri: „in progress" la task-uri, „in_progress" în
+`cts_groundtruth_sync`) și ratează `status` NULL. `lower`+`btrim`+`COALESCE` fac expresia imună la
+majuscule, spații și NULL — iar `COALESCE` e ce permite `NOT {_WIP}` fără capcana logicii ternare.
+
+⚠️ **„În lucru" = `IN ('in progress','in_progress')`; TOT restul deschis e „Noi"** (nepreluat),
+inclusiv `unallocated`, `postponed` și NULL. Altfel cele două bare ale zilei nu acoperă tot ce a
+intrat azi și rândurile rămase cad între ele, tăcut.
+
+⚠️ **Fereastra restanței e `IS DISTINCT FROM CURRENT_DATE`, nu `< CURRENT_DATE`.** `CURRENT_DATE` e
+ziua serverului DB, iar data comparată e convertită în Europe/Bucharest. Dacă Postgres rulează pe
+UTC, între 00:00 și 03:00 local cele două nu coincid: un rând sosit atunci n-ar fi nici „de azi",
+nici „< azi" — ar dispărea din toate barele. Negarea exactă acoperă și sosirea NULL (join LEFT pe
+`emails`, `cts_created_at` nullable), deci partiția e completă în orice fus.
 
 ⚠️ **Barele au DOUĂ scale în UI** (`MonitorDeptCard`, `maxV` / `maxOld`). Restanța e cumulativă și
 poate fi cu două ordine de mărime peste cifrele zilei (Financiar: 769 restante vs. ~5/zi); pe scală
