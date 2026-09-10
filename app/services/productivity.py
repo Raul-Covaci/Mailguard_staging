@@ -795,22 +795,6 @@ _EMPLOYED_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_e
                                  AND (h_e.valid_to IS NULL OR h_e.valid_to > {day}))"""
 
 
-def dept_members_at(db: Session, department: str, day: _dt.date) -> list:
-    """Membrii departamentului in luna care contine `day` — [(id, name, work_hours, iris_id)].
-
-    Fara cache: o corectie de istoric facuta din UI trebuie sa se vada la urmatorul reload al
-    raportului, altfel adminul crede ca functia e stricata.
-    """
-    rows = db.execute(
-        text("SELECT e.id, e.name, COALESCE(e.work_hours, :wh) AS work_hours, e.iris_id "
-             "FROM employee_department_mapping e "
-             "WHERE e.id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:day AS date))) "
-             "ORDER BY e.name"),
-        {"d": department, "day": day, "wh": _DEFAULT_WORK_HOURS},
-    ).fetchall()
-    return [(r[0], r[1], int(r[2] or _DEFAULT_WORK_HOURS), r[3]) for r in rows]
-
-
 # ---------------------------------------------------------------- surse bottom-up per tip obiectiv
 def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: Optional[list] = None,
                       biz: Optional["_BizCache"] = None):
@@ -1040,7 +1024,7 @@ _APEL_AGENT_CTE = """
 # (`total` vs `measurable`).
 # _APEL_AGENT_JOIN aduce si randul CTS al apelului (`g`), folosit atat pentru timpul de raspuns
 # (vezi _APEL_MINS_SQL) cat si ca ultima treapta de atribuire.
-_APEL_AGENT_JOIN = r"""
+_APEL_AGENT_JOIN_TPL = r"""
     -- LATERAL + LIMIT 1: 10 apeluri au DOUA randuri in cts_calls_ground_truth, iar un LEFT JOIN
     -- simplu le-ar numara de doua ori. Se prefera randul care are timp de raspuns.
     LEFT JOIN LATERAL (
@@ -1064,10 +1048,7 @@ _APEL_AGENT_JOIN = r"""
     LEFT JOIN LATERAL (
         SELECT CASE WHEN count(*) = 1 THEN min(e3.id) END AS id
         FROM employee_department_mapping e3
-        WHERE EXISTS (SELECT 1 FROM employee_department_history h3
-                       WHERE h3.employee_id = e3.id
-                         AND h3.valid_from <= c.started_at::date
-                         AND (h3.valid_to IS NULL OR h3.valid_to > c.started_at::date))
+        WHERE {_EMPLOYED_AT_SQL_E3}
           AND c.agent_extension IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM unnest(regexp_split_to_array(lower(trim(c.agent_extension)), '\s+')) tok
@@ -1087,6 +1068,13 @@ _APEL_AGENT_JOIN = r"""
     JOIN employee_department_mapping edm
       ON edm.id = COALESCE(am.employee_id, edm_n.id, edm_c.id)
 """
+_APEL_AGENT_JOIN = _APEL_AGENT_JOIN_TPL.replace(
+    "{_EMPLOYED_AT_SQL_E3}",
+    _EMPLOYED_AT_SQL.format(e="e3", day="c.started_at::date"))
+# Placeholder-ul TREBUIE sa dispara: altfel fragmentul ajunge intr-un f-string cu acolade
+# neinlocuite si query-ul crapa abia la rulare, pe pagina Apeluri.
+assert "{" not in _APEL_AGENT_JOIN, "_APEL_AGENT_JOIN a ramas cu placeholder nerezolvat"
+
 _APEL_MINS_SQL = "COALESCE(c.ring_seconds, g.cts_response_seconds)"
 
 # Un rind din `calls` NU e un apel: centrala scrie cite un rind per LEG (ring paralel pe mai multe

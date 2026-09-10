@@ -137,7 +137,7 @@ def device_ops_list(
         "       do_.finished_at, do_.closed_at, do_.closed_by_raw, po.limita_minute, "
         "       CASE WHEN do_.status = 'finalizat' AND do_.cts_created_at IS NOT NULL "
         "                 AND do_.cts_updated_at IS NOT NULL AND do_.assignee_employee_id IS NOT NULL "
-        "            THEN business_minutes_emp(edm.department, edm.id, do_.cts_created_at, do_.cts_updated_at, ARRAY[]::date[]) "
+        "            THEN business_minutes_emp(COALESCE(employee_dept_at(edm.id, do_.cts_created_at::date), edm.department), edm.id, do_.cts_created_at, do_.cts_updated_at, ARRAY[]::date[]) "
         "            ELSE NULL END AS resolution_minutes, "
         "       CASE WHEN do_.finished_at IS NOT NULL AND do_.closed_at IS NOT NULL "
         "            THEN EXTRACT(EPOCH FROM (do_.closed_at - do_.finished_at)) / 60.0 "

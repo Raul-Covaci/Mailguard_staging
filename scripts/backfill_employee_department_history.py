@@ -18,7 +18,8 @@ Reguli:
     pauza intre doua luni cu acelasi departament e absorbita;
   * ultimul interval primeste departamentul CURENT din `employee_department_mapping` (scalarul e
     adevarul pentru azi); pentru angajatii dezactivati se inchide dupa ultima luna cu pontaj;
-  * angajatii care au deja un interval `manual` (corectat din UI) sunt SARITI complet.
+  * angajatii care au deja un interval `manual` (corectat din UI) sau `trigger` (mutare observata
+    in DB) sunt SARITI complet — o deductie din pontaj nu suprascrie o observatie.
 
 Rulare:
   cd /opt/iris-mailguard && sudo venv/bin/python -m scripts.backfill_employee_department_history
@@ -105,8 +106,11 @@ def main():
             "SELECT id, name, department, enabled FROM employee_department_mapping "
             + ("WHERE id = :eid " if emp_filter else "") + "ORDER BY name"
         ), ({"eid": emp_filter} if emp_filter else {})).fetchall()
+        # Se sar angajatii cu istoric OBSERVAT: 'manual' (corectat de admin) si 'trigger' (mutare
+        # prinsa in DB, deci reala). Pontajul e o deductie — nu are voie sa suprascrie o observatie.
         manual = {int(r[0]) for r in db.execute(text(
-            "SELECT DISTINCT employee_id FROM employee_department_history WHERE source='manual'"
+            "SELECT DISTINCT employee_id FROM employee_department_history "
+            "WHERE source IN ('manual','trigger')"
         )).fetchall()}
         picks = _monthly_picks(db, emp_filter)
 
@@ -137,7 +141,7 @@ def main():
                 # Trigger-ul ar reactiona la rescriere; il oprim explicit pentru tranzactia asta.
                 db.execute(text("SET LOCAL mailguard.skip_dept_history = 'on'"))
                 db.execute(text("DELETE FROM employee_department_history "
-                                "WHERE employee_id=:id AND source IN ('seed','backfill','trigger')"),
+                                "WHERE employee_id=:id AND source IN ('seed','backfill')"),
                            {"id": emp_id})
                 for d, vfrom, vto in new_chain:
                     db.execute(text(

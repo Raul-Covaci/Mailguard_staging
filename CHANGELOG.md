@@ -35,6 +35,11 @@ IRIS, care scrie departamentul în loc.
   scrisă din maparea curentă, deci o re-sincronizare a unei luni vechi muta și orele).
 - Snapshot-urile lunilor închise rămân fixate; se resetează doar luna curentă și cele viitoare, iar
   API-ul întoarce `warnings[]` cu lunile al căror obiectiv rămâne cel raportat.
+- Lista Apeluri arată departamentul de la DATA APELULUI, iar SLA-ul din Task-uri CTS, Operațiuni
+  și health (`business_minutes_emp`) primește departamentul de atunci, nu pe cel de azi.
+- Editările de istoric se fac pe LANȚ: o corecție pe o lună veche nu mai șterge mutările
+  ulterioare, intervalele lipite cu același departament se contopesc, iar o editare care ar
+  acoperi alt interval e refuzată cu 409 în loc să pice pe constrângerea din DB.
 - Ștergerea unui angajat cu istoric e refuzată (409) — se folosește `enabled=false`.
 - `business_minutes_emp` (SLA task-uri, SQL) trece și ea pe istoric —
   `migrations/20260911b_business_minutes_dept_history.sql`, oglinda lui `_BizCache._dept_window`.

@@ -547,7 +547,7 @@ def stats_tasks_daily(days: int = Query(14, ge=1, le=90),
         ),
         resolved_agg AS (
             SELECT date(gt.cts_updated_at) AS d, COUNT(*) AS resolved,
-                   AVG(business_minutes_emp(edm.department, edm.id, gt.cts_created_at, gt.cts_updated_at, ARRAY[]::date[])) AS avg_resolution_minutes
+                   AVG(business_minutes_emp(COALESCE(employee_dept_at(edm.id, gt.cts_created_at::date), edm.department), edm.id, gt.cts_created_at, gt.cts_updated_at, ARRAY[]::date[])) AS avg_resolution_minutes
             FROM cts_task_ground_truth gt
             JOIN employee_department_mapping edm ON edm.id = gt.assignee_employee_id
             WHERE lower(gt.status) IN ('solved', 'closed')
@@ -587,7 +587,7 @@ def stats_tasks_overview(date_from: Optional[str] = Query(None),
     Cu date_from/date_to, toate agregatele se restrang la perioada ceruta."""
     rf, rp = _range_filter("gt.cts_created_at", date_from, date_to)
     avg_resolution = db.execute(text(f"""
-        SELECT AVG(business_minutes_emp(edm.department, edm.id, gt.cts_created_at, gt.cts_updated_at, ARRAY[]::date[]))
+        SELECT AVG(business_minutes_emp(COALESCE(employee_dept_at(edm.id, gt.cts_created_at::date), edm.department), edm.id, gt.cts_created_at, gt.cts_updated_at, ARRAY[]::date[]))
         FROM cts_task_ground_truth gt
         JOIN employee_department_mapping edm ON edm.id = gt.assignee_employee_id
         WHERE lower(gt.status) IN ('solved', 'closed') AND gt.cts_created_at IS NOT NULL AND gt.cts_updated_at IS NOT NULL

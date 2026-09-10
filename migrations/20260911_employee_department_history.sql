@@ -130,9 +130,14 @@ BEGIN
 
     IF TG_OP = 'INSERT' THEN
         IF NEW.enabled THEN
+            -- valid_from = epoca, NU luna crearii randului. Un angajat poate fi creat local mult
+            -- dupa ce a inceput sa lucreze — `import_employee_by_email` il aduce abia cand apare
+            -- primul task/apel al lui — si atunci toata munca lui anterioara ar cadea in afara
+            -- oricarui departament. Pentru un angajat chiar nou nu schimba nimic: nu are randuri
+            -- inainte, iar rosterul lunar cere oricum o urma de pontaj in luna.
+            -- Perioada de proba se exprima separat, prin `productivity_start_date`.
             INSERT INTO employee_department_history (employee_id, department, valid_from, source, created_by)
-            VALUES (NEW.id, NEW.department,
-                    date_trunc('month', COALESCE(NEW.productivity_start_date, CURRENT_DATE))::date,
+            VALUES (NEW.id, NEW.department, date '2000-01-01',
                     'trigger', COALESCE(NEW.created_by, 'trigger'))
             ON CONFLICT DO NOTHING;
         END IF;
@@ -169,6 +174,24 @@ BEGIN
         SELECT * INTO op FROM employee_department_history
          WHERE employee_id = NEW.id AND valid_to IS NULL
          ORDER BY valid_from DESC LIMIT 1;
+
+        -- Sync-ul rescrie `department` si pe randurile dezactivate (vezi
+        -- iris_employee_sync._upsert_one_employee), dar mutarea nu se inregistreaza atunci: omul
+        -- nu era in niciun departament. La revenire, intervalul redeschis poate avea departamentul
+        -- VECHI, deci il aducem in oglinda cu scalarul — altfel raportul lunii curente ar folosi
+        -- alt departament decat cel afisat in Utilizatori.
+        IF op.id IS NOT NULL AND op.department IS DISTINCT FROM NEW.department THEN
+            IF op.valid_from >= m_cur THEN
+                UPDATE employee_department_history SET department = NEW.department WHERE id = op.id;
+            ELSE
+                UPDATE employee_department_history SET valid_to = m_cur WHERE id = op.id;
+                INSERT INTO employee_department_history (employee_id, department, valid_from, source)
+                VALUES (NEW.id, NEW.department, m_cur, 'trigger')
+                ON CONFLICT (employee_id, valid_from)
+                DO UPDATE SET department = EXCLUDED.department, valid_to = NULL;
+            END IF;
+            RETURN NULL;
+        END IF;
     END IF;
 
     -- MUTARE

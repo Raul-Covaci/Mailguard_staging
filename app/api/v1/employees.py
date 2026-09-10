@@ -447,26 +447,55 @@ def _refresh_open_snapshots(db: Session, departments, since: _dt.date) -> list:
     comunicata oamenilor nu se rescrie retroactiv. Se intorc ca avertismente, sa le vada adminul.
     """
     from app.services import productivity as P
+    deps = sorted({d for d in departments if d})
+    if not deps:
+        return []
     today = _dt.date.today()
+    # O singura interogare, nu o bucla luna-cu-luna: un interval editat poate incepe la
+    # `valid_from` = 2000-01-01 (randul seedat de migratie), adica ~300 de luni de parcurs degeaba.
+    rows = db.execute(text(
+        "SELECT department, year, month, snapshot_at FROM productivity_monthly_snapshot "
+        "WHERE department = ANY(:deps) "
+        "  AND (year > :y OR (year = :y AND month >= :m)) "
+        "ORDER BY year, month"
+    ), {"deps": deps, "y": since.year, "m": since.month}).fetchall()
+
     warnings = []
-    y, m = since.year, since.month
-    while (y, m) <= (today.year, today.month):
-        for dep in departments:
-            if (y, m) >= (today.year, today.month):
-                P.reset_snapshot(db, dep, y, m)
-            else:
-                row = db.execute(text(
-                    "SELECT snapshot_at FROM productivity_monthly_snapshot "
-                    "WHERE department=:d AND year=:y AND month=:m"
-                ), {"d": dep, "y": y, "m": m}).fetchone()
-                if row:
-                    warnings.append({"department": dep, "month": f"{y:04d}-{m:02d}",
-                                     "snapshot_at": str(row[0]),
-                                     "reason": "obiectiv fixat — se recalculeaza doar volumul"})
-        m += 1
-        if m == 13:
-            m, y = 1, y + 1
+    for dep, yy, mm, snap_at in rows:
+        if (int(yy), int(mm)) >= (today.year, today.month):
+            P.reset_snapshot(db, dep, int(yy), int(mm))
+        else:
+            warnings.append({"department": dep, "month": f"{int(yy):04d}-{int(mm):02d}",
+                             "snapshot_at": str(snap_at),
+                             "reason": "obiectiv fixat — se recalculeaza doar volumul"})
+    # Luna curenta poate sa nu aiba inca snapshot (se emite la prima accesare) — nimic de resetat.
+    if len(warnings) > 12:
+        extra = len(warnings) - 12
+        warnings = warnings[-12:]
+        warnings.append({"department": "", "month": "", "snapshot_at": "",
+                         "reason": f"încă {extra} luni mai vechi cu obiectiv fixat"})
     return warnings
+
+
+def _merge_adjacent_departments(db: Session, emp_id: int) -> None:
+    """Contopește intervalele lipite cu ACELAȘI departament.
+
+    O corecție („de fapt s-a mutat din august, nu din septembrie") produce altfel două rânduri
+    consecutive identice — corecte ca date, dar derutante în listă.
+    """
+    rows = db.execute(text(
+        "SELECT id, department, valid_from, valid_to FROM employee_department_history "
+        "WHERE employee_id=:id ORDER BY valid_from"
+    ), {"id": emp_id}).fetchall()
+    keep = None
+    for r in rows:
+        if keep is not None and keep[1] == r[1] and keep[3] == r[2]:
+            db.execute(text("DELETE FROM employee_department_history WHERE id=:hid"), {"hid": r[0]})
+            db.execute(text("UPDATE employee_department_history SET valid_to = :vt WHERE id=:hid"),
+                       {"vt": r[3], "hid": keep[0]})
+            keep = (keep[0], keep[1], keep[2], r[3])
+            continue
+        keep = (r[0], r[1], r[2], r[3])
 
 
 def _sync_current_department(db: Session, emp_id: int) -> None:
@@ -497,10 +526,12 @@ def employee_department_history(emp_id: int, db: Session = Depends(get_db),
 @router.post("/settings/employees/{emp_id}/department-history")
 def add_employee_department(emp_id: int, body: dict, db: Session = Depends(get_db),
                             admin=Depends(get_current_admin)):
-    """Mută angajatul în alt departament începând cu o lună.
+    """Înregistrează o mutare: din luna X angajatul e în departamentul D.
 
-    Editare de LANȚ: intervalul care acoperă luna se taie la `valid_from`, tot ce urmează după e
-    înlocuit, iar noul interval rămâne deschis. Așa nu pot apărea nici goluri, nici suprapuneri.
+    Inserare ÎN LANȚ, nu suprascriere: intervalul care acoperă luna se taie la `valid_from`, iar
+    noul interval ține până la următoarea mutare cunoscută (sau rămâne deschis dacă nu există
+    una). Mutările ULTERIOARE se păstrează — altfel o corecție pe o lună veche ar șterge tăcut
+    promovările de după ea.
     """
     emp = db.execute(text("SELECT id, enabled FROM employee_department_mapping WHERE id=:id"),
                      {"id": emp_id}).fetchone()
@@ -522,27 +553,46 @@ def add_employee_department(emp_id: int, body: dict, db: Session = Depends(get_d
     if prev is not None and prev[1] == dept and (prev[3] is None or prev[3] >= start):
         raise HTTPException(409, f"Angajatul era deja în {dept} în luna respectivă.")
 
-    # Tot ce începe la sau după luna țintă e înlocuit de intrarea nouă.
-    db.execute(text("DELETE FROM employee_department_history "
-                    "WHERE employee_id=:id AND valid_from >= CAST(:s AS date)"),
-               {"id": emp_id, "s": start})
-    if prev is not None:
-        db.execute(text("UPDATE employee_department_history SET valid_to = CAST(:s AS date) "
-                        "WHERE id=:hid"), {"s": start, "hid": prev[0]})
-    row = db.execute(text(
-        "INSERT INTO employee_department_history "
-        "(employee_id, department, valid_from, valid_to, source, note, created_by) "
-        "VALUES (:id, :d, CAST(:s AS date), NULL, 'manual', :n, :by) RETURNING id"
-    ), {"id": emp_id, "d": dept, "s": start, "n": note, "by": created_by}).fetchone()
-    _sync_current_department(db, emp_id)
-    _audit_dept_history(db, created_by, emp_id, "add",
-                        {"department": dept, "valid_from": str(start), "note": note})
-    db.commit()
+    same = db.execute(text(
+        "SELECT id FROM employee_department_history "
+        "WHERE employee_id=:id AND valid_from = CAST(:s AS date)"
+    ), {"id": emp_id, "s": start}).fetchone()
+    nxt = db.execute(text(
+        "SELECT valid_from FROM employee_department_history "
+        "WHERE employee_id=:id AND valid_from > CAST(:s AS date) ORDER BY valid_from LIMIT 1"
+    ), {"id": emp_id, "s": start}).fetchone()
+
+    try:
+        if same is not None:
+            # O singură schimbare per lună (employee_dept_hist_start_uidx): ultima decizie câștigă.
+            db.execute(text("UPDATE employee_department_history "
+                            "SET department=:d, source='manual', note=COALESCE(:n, note) "
+                            "WHERE id=:hid"), {"d": dept, "n": note, "hid": same[0]})
+            hid = same[0]
+        else:
+            if prev is not None:
+                db.execute(text("UPDATE employee_department_history SET valid_to = CAST(:s AS date) "
+                                "WHERE id=:hid"), {"s": start, "hid": prev[0]})
+            row = db.execute(text(
+                "INSERT INTO employee_department_history "
+                "(employee_id, department, valid_from, valid_to, source, note, created_by) "
+                "VALUES (:id, :d, CAST(:s AS date), CAST(:e AS date), 'manual', :n, :by) RETURNING id"
+            ), {"id": emp_id, "d": dept, "s": start,
+                "e": (nxt[0] if nxt is not None else None), "n": note, "by": created_by}).fetchone()
+            hid = row[0]
+        _merge_adjacent_departments(db, emp_id)
+        _sync_current_department(db, emp_id)
+        _audit_dept_history(db, created_by, emp_id, "add",
+                            {"department": dept, "valid_from": str(start), "note": note})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Intervalul se suprapune peste altul existent — verifică istoricul.")
     depts = {dept} | ({prev[1]} if prev is not None else set())
     warnings = _refresh_open_snapshots(db, depts, start)
-    return {"id": row[0], "employee_id": emp_id, "department": dept,
-            "valid_from": str(start), "valid_to": None, "source": "manual",
-            "warnings": warnings}
+    return {"id": hid, "employee_id": emp_id, "department": dept,
+            "valid_from": str(start), "valid_to": (str(nxt[0]) if nxt is not None else None),
+            "source": "manual", "warnings": warnings}
 
 
 @router.put("/settings/employees/{emp_id}/department-history/{hid}")
@@ -565,27 +615,41 @@ def update_employee_department(emp_id: int, hid: int, body: dict, db: Session = 
     if cur[3] is not None and start >= cur[3]:
         raise HTTPException(400, "valid_from trebuie să fie înainte de sfârșitul intervalului.")
 
+    # Mutarea inceputului mai devreme nu are voie sa treaca peste alte intervale: acelea ar ramane
+    # pe loc si s-ar suprapune (respins de employee_dept_hist_no_overlap, deci 500 in loc de mesaj).
+    clash = db.execute(text(
+        "SELECT count(*) FROM employee_department_history "
+        "WHERE employee_id=:id AND id <> :hid "
+        "  AND valid_from >= CAST(:s AS date) "
+        "  AND valid_from < COALESCE(CAST(:e AS date), DATE '9999-12-31')"
+    ), {"id": emp_id, "hid": hid, "s": start, "e": cur[3]}).fetchone()
+    if clash and int(clash[0] or 0) > 0:
+        raise HTTPException(409, "Ar acoperi alt interval din istoric — șterge-l pe acela întâi.")
+
     prev = db.execute(text(
         "SELECT id, valid_from FROM employee_department_history "
         "WHERE employee_id=:id AND id <> :hid AND valid_from < CAST(:s AS date) "
         "ORDER BY valid_from DESC LIMIT 1"
     ), {"id": emp_id, "hid": hid, "s": start}).fetchone()
-    if prev is not None and prev[1] >= start:
-        raise HTTPException(409, "Intervalul s-ar suprapune peste cel precedent.")
-    # Ordinea contează: întâi scurtăm precedentul, abia apoi mutăm începutul (constrângerea de
-    # non-suprapunere din DB respinge starea intermediară inversă).
-    if prev is not None:
-        db.execute(text("UPDATE employee_department_history SET valid_to = CAST(:s AS date) "
-                        "WHERE id=:pid"), {"s": start, "pid": prev[0]})
-    db.execute(text(
-        "UPDATE employee_department_history SET department=:d, valid_from=CAST(:s AS date), "
-        "source='manual' WHERE id=:hid"
-    ), {"d": dept, "s": start, "hid": hid})
-    _sync_current_department(db, emp_id)
-    actor = admin.get("username") or admin.get("email") or "admin"
-    _audit_dept_history(db, actor, emp_id, "update",
-                        {"id": hid, "department": dept, "valid_from": str(start)})
-    db.commit()
+    try:
+        # Ordinea contează: întâi scurtăm precedentul, abia apoi mutăm începutul (constrângerea de
+        # non-suprapunere din DB respinge starea intermediară inversă).
+        if prev is not None:
+            db.execute(text("UPDATE employee_department_history SET valid_to = CAST(:s AS date) "
+                            "WHERE id=:pid"), {"s": start, "pid": prev[0]})
+        db.execute(text(
+            "UPDATE employee_department_history SET department=:d, valid_from=CAST(:s AS date), "
+            "source='manual' WHERE id=:hid"
+        ), {"d": dept, "s": start, "hid": hid})
+        _merge_adjacent_departments(db, emp_id)
+        _sync_current_department(db, emp_id)
+        actor = admin.get("username") or admin.get("email") or "admin"
+        _audit_dept_history(db, actor, emp_id, "update",
+                            {"id": hid, "department": dept, "valid_from": str(start)})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Intervalul se suprapune peste altul existent — verifică istoricul.")
     warnings = _refresh_open_snapshots(db, {dept, cur[1]}, min(start, cur[2]))
     return {"id": hid, "employee_id": emp_id, "department": dept,
             "valid_from": str(start), "valid_to": str(cur[3]) if cur[3] else None,
@@ -617,6 +681,7 @@ def delete_employee_department(emp_id: int, hid: int, db: Session = Depends(get_
     db.execute(text("DELETE FROM employee_department_history WHERE id=:hid"), {"hid": hid})
     db.execute(text("UPDATE employee_department_history SET valid_to = :vt WHERE id=:pid"),
                {"vt": cur[2], "pid": prev[0]})
+    _merge_adjacent_departments(db, emp_id)
     _sync_current_department(db, emp_id)
     actor = admin.get("username") or admin.get("email") or "admin"
     _audit_dept_history(db, actor, emp_id, "delete", {"id": hid})

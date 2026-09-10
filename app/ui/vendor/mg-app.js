@@ -8253,8 +8253,10 @@ function EmployeesPanel() {
         // se recalculeaza doar volumul. Adminul trebuie sa stie care sunt.
         var w = (res && res.warnings) || [];
         var base = isEdit ? 'Interval actualizat.' : 'Departament înregistrat.';
-        setHistMsg(w.length
-          ? base + ' Obiectivele rămân fixate pentru: ' + w.map(function(x){ return x.month + ' / ' + x.department; }).join(', ') + ' — se recalculează doar volumul.'
+        var wl = w.filter(function(x){ return x.month; }).map(function(x){ return x.month + ' / ' + x.department; });
+        var rest = w.filter(function(x){ return !x.month; }).map(function(x){ return x.reason; });
+        setHistMsg(wl.length
+          ? base + ' Obiectivele rămân fixate pentru: ' + wl.join(', ') + (rest.length ? ' (' + rest.join('; ') + ')' : '') + ' — se recalculează doar volumul.'
           : base);
         setHistForm(null); refreshHist(leaveModal.id); load();
       })

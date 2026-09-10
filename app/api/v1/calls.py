@@ -123,7 +123,9 @@ def list_calls(
                c.ai_category, c.ai_result, c.ai_priority, c.ai_assignee,
                c.client_id, cl.name AS client_name, c.queue_status, c.call_status,
                c.ring_seconds, c.agent_extension,
-               edm.name AS operator_name, edm.department AS operator_department
+               edm.name AS operator_name,
+               -- departamentul de la DATA APELULUI, ca lista sa spuna acelasi lucru ca filtrul
+               COALESCE(employee_dept_at(edm.id, c.started_at::date), edm.department) AS operator_department
         FROM calls c
         {_APEL_AGENT_JOIN_LEFT}
         LEFT JOIN clients cl ON cl.id = c.client_id
