@@ -8,6 +8,38 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.0 - 2026-09-11
+
+### MINOR — istoric de departament per angajat (productivitatea istorică nu se mai rescrie)
+
+Un angajat promovat își muta retroactiv tot istoricul în departamentul nou: `department` e un scalar
+mutabil, iar toate interogările de productivitate îl rezolvau „acum". La mutarea lui Ticus Ovidiu
+Alexandru (suport_2 → suport_3 din septembrie 2026), lunile deja raportate ale Suport 2 pierdeau
+volumul lui, iar Suport 3 primea muncă pe care n-o făcuse. Același efect îl producea sync-ul zilnic
+IRIS, care scrie departamentul în loc.
+
+- Tabelă nouă `employee_department_history` — intervale `[valid_from, valid_to)` pe lună, cu un
+  singur interval deschis per angajat și `EXCLUDE USING gist` contra suprapunerilor. Migrație:
+  `migrations/20260911_employee_department_history.sql` (seed = departamentul curent din 2000-01-01,
+  deci instalarea nu schimbă nicio cifră prin ea însăși).
+- Captură automată prin trigger (prinde și sync-ul IRIS, care face UPDATE în lot) + editare manuală
+  din **Utilizatori → angajat → „Istoric departament"**. Mutarea contează de la 1 ale lunii alese.
+- Rapoartele, breakdown-urile, forecast-ul, analiza pe interval, calendarul de pontaj, filtrele de
+  apeluri și lista Apeluri rezolvă acum departamentul la DATA rândului
+  (`employee_dept_members` / `employee_dept_at`, fragmentele `_DEPT_AT_SQL` / `_DEPT_AT_LATERAL`).
+- `enabled=true` a fost scos din căile istorice: cine a plecat din firmă își păstrează lunile
+  vechi (plecarea închide intervalul). ⚠️ Volumele lunilor trecute **cresc** acolo unde existau
+  oameni plecați — munca lor era pur și simplu aruncată înainte.
+- Selectorul de operator din tab Analiză și breakdown trimit `month`, deci arată echipa lunii alese.
+- Orele din pontaj se filtrează pe apartenență, nu pe `employee_attendance.department` (coloana e
+  scrisă din maparea curentă, deci o re-sincronizare a unei luni vechi muta și orele).
+- Snapshot-urile lunilor închise rămân fixate; se resetează doar luna curentă și cele viitoare, iar
+  API-ul întoarce `warnings[]` cu lunile al căror obiectiv rămâne cel raportat.
+- Ștergerea unui angajat cu istoric e refuzată (409) — se folosește `enabled=false`.
+- `business_minutes_emp` (SLA task-uri, SQL) trece și ea pe istoric —
+  `migrations/20260911b_business_minutes_dept_history.sql`, oglinda lui `_BizCache._dept_window`.
+- Backfill din pontaj: `scripts/backfill_employee_department_history.py` (dry-run implicit).
+
 ## v3.15.1 - 2026-09-10
 
 ### PATCH — 500 la adăugarea de concedii manuale (`:param::tip` nu e bind param în SQLAlchemy)

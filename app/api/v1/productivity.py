@@ -437,14 +437,23 @@ def get_breakdown(tip: str = Query(..., description="'email' | 'task' | 'apel' |
 
 @router.get("/productivity/department-users")
 def get_department_users(department: Optional[str] = Query(None),
+                         month: Optional[str] = Query(None, description="YYYY-MM; implicit luna curenta"),
                          db: Session = Depends(get_db), admin=Depends(get_current_admin)):
-    """Lista operatorilor activi dintr-un departament, pentru selectorul din tab Analiză."""
+    """Operatorii unui departament pentru selectorul din tab Analiză.
+
+    Cu `month` -> componenta departamentului IN LUNA ACEEA (employee_department_history), ca
+    selectorul sa arate oamenii care erau atunci acolo, nu pe cei de azi. Fara `month` -> luna
+    curenta, adica exact comportamentul dinainte.
+    """
     dep = (department or "").strip().lower()
     if not dep or dep in ("operational", "general", "all", "toate", "__all__"):
         return []
+    y, m = _parse_month(db, month)
     rows = db.execute(
-        text("SELECT id, name FROM employee_department_mapping WHERE department=:d AND enabled=true ORDER BY name"),
-        {"d": dep},
+        text("SELECT id, name FROM employee_department_mapping "
+             "WHERE id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:first AS date))) "
+             "ORDER BY name"),
+        {"d": dep, "first": f"{y:04d}-{m:02d}-01"},
     ).fetchall()
     return [{"id": r[0], "name": r[1]} for r in rows]
 

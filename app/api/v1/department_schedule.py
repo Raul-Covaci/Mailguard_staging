@@ -113,10 +113,17 @@ def monthly_attendance(
         m = r._mapping
         working_weekdays.setdefault(m["department"], set()).add(int(m["weekday"]))
 
-    # Angajati enabled per departament
+    # Componenta departamentelor IN LUNA AFISATA (employee_department_history): calendarul lui
+    # august trebuie sa arate echipa din august, nu pe cea de azi. Pentru luna curenta rezultatul
+    # e identic cu `enabled=true` + departamentul curent, fiindca trigger-ul tine intervalul
+    # deschis in oglinda cu scalarul.
     emp_rows = db.execute(text(
-        "SELECT id, name, department FROM employee_department_mapping WHERE enabled=true ORDER BY name"
-    )).fetchall()
+        "SELECT e.id, e.name, h.department "
+        "FROM employee_department_history h "
+        "JOIN employee_department_mapping e ON e.id = h.employee_id "
+        "WHERE h.valid_from <= :mend AND (h.valid_to IS NULL OR h.valid_to > :mstart) "
+        "ORDER BY e.name"
+    ), {"mstart": month_start, "mend": month_end}).fetchall()
     dept_employees: dict = {}  # dept -> list of {id, name}
     for r in emp_rows:
         m = r._mapping

@@ -211,7 +211,8 @@ minute care au declanșat incidentul veneau chiar dintr-o migrație
 Traseul unui mail prin departamente. Sursa: **`cts_department_moves`** — un rând per eveniment
 (alocare inițială + fiecare schimbare de departament), populat de **trigger-ul**
 `trg_cts_gt_department_move` pe `cts_ground_truth` (migrația `20260819_cts_department_moves.sql`,
-singurul trigger din proiect; face și backfill din `cts_department_prev`/`changed_at`).
+primul trigger din proiect — celelalte două sunt `trg_edm_dept_hist_ins`/`_upd` pe istoricul de
+departament al angajaților; face și backfill din `cts_department_prev`/`changed_at`).
 
 - API: `GET /cts-training/dept-report` (3 statistici + trasee) și `/dept-report/cases` (drill-down),
   ambele cu `source=auto|log|moves`; `GET /dept-report/mail-steps?message_id=` (alocările brute).
@@ -242,6 +243,62 @@ Motor: `app/services/cts_email_log.py` (`chain_cte()` expune `mail` + `ch` cu AC
 
 ---
 
+## 🧭 ISTORIC DEPARTAMENT — apartenența se rezolvă LA LUNA RAPORTATĂ (2026-09-11)
+
+`employee_department_mapping.department` e adevărul pentru **acum**. Apartenența folosită în
+rapoartele istorice vine din **`employee_department_history`** — intervale `[valid_from, valid_to)`
+aliniate la lună (ziua 1, `valid_to` exclusiv, NULL = deschis). Migrație:
+`migrations/20260911_employee_department_history.sql`.
+
+Motivul: la promovarea lui Ticus Ovidiu Alexandru (suport_2 → suport_3 din 2026-09) toate mailurile,
+task-urile și apelurile lui din lunile trecute se re-atribuiau retroactiv lui suport_3, fiindcă
+fiecare interogare rezolva departamentul live. Același efect îl produce sync-ul zilnic IRIS, care
+face `UPDATE ... SET department=...` în loc.
+
+- Rezolvare în SQL: `employee_dept_members(dept, month_start)` (filtre) și `employee_dept_at(emp, day)`
+  (etichetare per rând), plus fragmentele `productivity._DEPT_AT_SQL` / `_DEPT_AT_LATERAL` /
+  `_EMPLOYED_AT_SQL` și helperul `productivity.dept_members_at()`.
+- Scriere: trigger-ele `trg_edm_dept_hist_ins` / `trg_edm_dept_hist_upd` (al doilea și al treilea
+  trigger din proiect, după `trg_cts_gt_department_move`) + editare manuală din UI
+  (Utilizatori → angajat → „Istoric departament", `GET/POST/PUT/DELETE
+  /settings/employees/{id}/department-history`).
+- Backfill din pontaj: `scripts/backfill_employee_department_history.py` (`--apply`; implicit dry-run).
+
+⛔ **`enabled` NU se mai filtrează în căile istorice.** E o proprietate a lui azi: un om plecat din
+firmă trebuie să-și păstreze lunile trecute, iar plecarea închide deja intervalul (trigger). Filtrarea
+pe `enabled=true` rămâne doar în vederile „acum" (dashboard/monitor live, selectoare, clasificatoare).
+Consecință așteptată la instalare: volumul lunilor vechi **crește** în departamentele care au avut
+oameni plecați între timp — munca lor era pur și simplu aruncată înainte.
+
+⚠️ **Granularitate LUNĂ.** O mutare pe 15 septembrie contează de la 1 septembrie; două mutări în
+aceeași lună se colapsează la ultima (`employee_dept_hist_start_uidx`). Corecțiile se fac din UI.
+
+⚠️ **Fără goluri.** Migrația seedează `valid_from = 2000-01-01`, iar API-ul face editări de LANȚ
+(taie precedentul, înlocuiește ce urmează), nu inserări libere. Un gol ar face angajatul să dispară
+din TOATE departamentele în lunile respective, tăcut. Constrângerile din DB: un singur interval
+deschis per angajat + `EXCLUDE USING gist` pe suprapuneri (cere `btree_gist`).
+
+⚠️ **Reactivarea redeschide intervalul închis, nu inserează unul nou.** Reconcilierea din
+`iris_employee_sync` poate dezactiva în masă la un feed trunchiat; un rând nou ar pica pe
+constrângerea de suprapunere și ar dobora tot UPDATE-ul sync-ului.
+
+⚠️ `employee_attendance.department` **nu** mai e folosit ca sursă de apartenență (nici în
+`_BizCache`, nici la orele per operator): coloana e scrisă de `pontaj_sync` din maparea CURENTĂ, deci
+o re-sincronizare a unei luni vechi după o mutare ar muta și orele. Rămâne doar sursă de backfill.
+
+⚠️ Regula e oglindită în PATRU locuri: `productivity.py` (fragmentele de mai sus),
+`calls_analytics.dept_agent_windows` + `_agent_dept_filter` (filtrare pe ferestre de timp, fără
+cache — maparea nume→angajat rămâne în cache 5 min, e invariantă), `calls.py` (lista Apeluri) și
+funcția SQL `business_minutes_emp` (task-uri) — `migrations/20260911b_business_minutes_dept_history.sql`,
+oglinda lui `_BizCache._dept_window`.
+
+**Snapshot-urile lunilor închise rămân fixate.** O corecție de istoric recalculează volumele, dar
+`productivity_monthly_snapshot` (ore/obiective) se resetează doar pentru luna curentă și cele
+viitoare (`_refresh_open_snapshots` din `employees.py`); pentru lunile închise API-ul întoarce
+`warnings[]`, afișate în UI.
+
+---
+
 ## ⏱️ PRODUCTIVITATE — fereastra de timp = PONTAJ (2026-08-19)
 
 Minutele de lucru (SLA mailuri/task-uri/apeluri/operațiuni) se numără pe **acoperirea
@@ -259,7 +316,8 @@ cade pe program (altfel o pană de pontaj ar face toate scorurile 100%).
 ⚠️ Logica există în DOUĂ locuri și trebuie schimbată în OGLINDĂ:
 `_BizCache._dept_window` din `app/services/productivity.py` (mailuri, apeluri, operațiuni) și
 funcția SQL `business_minutes_emp` (task-uri) — vezi
-`migrations/20260819d_business_minutes_pontaj_first.sql`.
+`migrations/20260819d_business_minutes_pontaj_first.sql` și, pentru apartenența la departament,
+`migrations/20260911b_business_minutes_dept_history.sql`.
 
 📞 **Apeluri — leg-uri duplicate.** Centrala scrie un CDR per canal apelat, deci un apel apare de
 două ori: leg `NO ANSWER` de 0s + leg-ul răspuns. În LISTE/statistici se ascunde leg-ul nerăspuns

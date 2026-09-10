@@ -82,8 +82,15 @@ def list_calls(
     if agent and agent.strip():
         where.append("c.agent_extension = :agent"); params["agent"] = agent.strip()
     if department and department.strip():
-        # Departamentul operatorului care a raspuns, prin aceeasi atribuire ca Productivitatea.
-        where.append("edm.department = :department"); params["department"] = department.strip()
+        # Departamentul operatorului care a raspuns, prin aceeasi atribuire ca Productivitatea —
+        # dar la DATA APELULUI (`employee_department_history`), nu cel de azi: altfel o promovare
+        # ar muta retroactiv toate apelurile vechi ale omului in departamentul nou.
+        where.append(
+            "EXISTS (SELECT 1 FROM employee_department_history h_c "
+            "         WHERE h_c.employee_id = edm.id AND h_c.department = :department "
+            "           AND h_c.valid_from <= c.started_at::date "
+            "           AND (h_c.valid_to IS NULL OR h_c.valid_to > c.started_at::date))")
+        params["department"] = department.strip()
     if status and status.strip():
         cond = _STATUS_SQL.get(status.strip().lower())
         if cond is None:

@@ -400,11 +400,21 @@ class _BizCache:
         for dept, wd, st, et, req_att in sched_rows:
             self._sched[(dept, int(wd))] = (st, et, bool(req_att))
 
+        # Departamentul zilei se ia din ISTORIC, nu din `employee_attendance.department`: coloana
+        # aceea e scrisa de pontaj_sync din maparea CURENTA (angajatii sunt cautati in bucketul
+        # departamentului de azi), deci o re-sincronizare a unei luni vechi dupa o promovare ar
+        # muta si orele. Fallback pe coloana proprie pentru randurile fara istoric acoperitor.
         att_rows = db.execute(
-            text("SELECT employee_id, department, work_date, present, begin_time, end_time "
-                 "FROM employee_attendance "
-                 "WHERE department = ANY(:depts) AND work_date BETWEEN :df AND :dt "
-                 "AND employee_id IS NOT NULL"),
+            text("SELECT a.employee_id, COALESCE(h.department, a.department) AS department, "
+                 "       a.work_date, a.present, a.begin_time, a.end_time "
+                 "FROM employee_attendance a "
+                 "LEFT JOIN employee_department_history h "
+                 "  ON h.employee_id = a.employee_id "
+                 " AND h.valid_from <= a.work_date "
+                 " AND (h.valid_to IS NULL OR h.valid_to > a.work_date) "
+                 "WHERE a.work_date BETWEEN :df AND :dt "
+                 "AND a.employee_id IS NOT NULL "
+                 "AND COALESCE(h.department, a.department) = ANY(:depts)"),
             {"depts": list(departments), "df": date_from, "dt": date_to},
         ).fetchall()
         self._att: dict = {}
@@ -436,11 +446,18 @@ class _BizCache:
         # Angajatii activi per departament + concediile lor aprobate. Necesare ca sa deosebim
         # „zi in care nu a fost NIMENI la lucru" (concediu -> zi inactiva, ca duminica) de
         # „zi fara pontaj importat" (gaura de sync -> nu penalizam). Vezi is_working_day_for_dept.
+        # Apartenenta se ia din istoric pentru PERIOADA ceruta, nu din departamentul de azi:
+        # altfel un om promovat ar fi socotit prezent/absent in departamentul gresit pe lunile
+        # vechi. Vezi employee_department_history + _DEPT_AT_SQL.
         self._dept_emp: dict = {}
         for r in db.execute(text(
-            "SELECT department, id, iris_id FROM employee_department_mapping "
-            "WHERE enabled = true AND department = ANY(:depts)"),
-                {"depts": list(departments)}).fetchall():
+            "SELECT h.department, e.id, e.iris_id "
+            "FROM employee_department_history h "
+            "JOIN employee_department_mapping e ON e.id = h.employee_id "
+            "WHERE h.department = ANY(:depts) "
+            "  AND h.valid_from <= :dt AND (h.valid_to IS NULL OR h.valid_to > :df) "
+            "GROUP BY h.department, e.id, e.iris_id"),
+                {"depts": list(departments), "df": date_from, "dt": date_to}).fetchall():
             self._dept_emp.setdefault(r[0], []).append((int(r[1]), (str(r[2]) if r[2] else None)))
         emp_ids = [e[0] for lst in self._dept_emp.values() for e in lst]
         iris_ids = [e[1] for lst in self._dept_emp.values() for e in lst if e[1]]
@@ -739,6 +756,61 @@ _EMAIL_CLIENT_SQL = (
 )
 
 
+# ---------------------------------------------------------------- apartenenta la departament LA MOMENTUL X
+#
+# Sursa: `employee_department_history` (migrations/20260911_employee_department_history.sql).
+# Inlocuieste PESTE TOT in caile ISTORICE perechea `edm.department=:d AND edm.enabled=true`:
+#   * departamentul se rezolva la data randului, nu „acum" — altfel o promovare muta retroactiv tot
+#     istoricul omului in noul departament (Ticus Ovidiu Alexandru, suport_2 -> suport_3 din 2026-09);
+#   * `enabled` nu mai are ce cauta aici: e o proprietate a lui AZI, nu a lunii raportate, iar un om
+#     plecat din firma trebuie sa-si pastreze lunile trecute. Plecarea inchide intervalul (trigger),
+#     deci nu apare in lunile de dupa.
+# `{e}`    = aliasul lui employee_department_mapping in query-ul gazda;
+# `{dept}` = `:d` (un departament) sau o expresie de comparatie proprie;
+# `{day}`  = expresia DATE a randului: `:first` la rapoartele lunare (ziua 1 a lunii), sau coloana
+#            de data a randului la rapoartele pe interval.
+_DEPT_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_
+                           WHERE h_.employee_id = {e}.id
+                             AND h_.department = {dept}
+                             AND h_.valid_from <= {day}
+                             AND (h_.valid_to IS NULL OR h_.valid_to > {day}))"""
+
+# Varianta care PROIECTEAZA departamentul istoric — pentru rapoartele pe mai multe departamente
+# (analytics), care grupeaza dupa departament si ii dau valoarea mai departe lui business_minutes.
+# Se pune in FROM, dupa JOIN-ul pe employee_department_mapping.
+_DEPT_AT_LATERAL = """
+    LEFT JOIN LATERAL (
+        SELECT h2.department FROM employee_department_history h2
+         WHERE h2.employee_id = {e}.id
+           AND h2.valid_from <= {day}
+           AND (h2.valid_to IS NULL OR h2.valid_to > {day})
+         ORDER BY h2.valid_from DESC LIMIT 1
+    ) {alias} ON true"""
+
+# „A fost angajat la data X" — fara conditie de departament. Inlocuieste `enabled=true` acolo unde
+# acesta juca rol de dezambiguizare la potrivirea pe nume (vezi _APEL_AGENT_CTE), nu de filtrare.
+_EMPLOYED_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_e
+                               WHERE h_e.employee_id = {e}.id
+                                 AND h_e.valid_from <= {day}
+                                 AND (h_e.valid_to IS NULL OR h_e.valid_to > {day}))"""
+
+
+def dept_members_at(db: Session, department: str, day: _dt.date) -> list:
+    """Membrii departamentului in luna care contine `day` — [(id, name, work_hours, iris_id)].
+
+    Fara cache: o corectie de istoric facuta din UI trebuie sa se vada la urmatorul reload al
+    raportului, altfel adminul crede ca functia e stricata.
+    """
+    rows = db.execute(
+        text("SELECT e.id, e.name, COALESCE(e.work_hours, :wh) AS work_hours, e.iris_id "
+             "FROM employee_department_mapping e "
+             "WHERE e.id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:day AS date))) "
+             "ORDER BY e.name"),
+        {"d": department, "day": day, "wh": _DEFAULT_WORK_HOURS},
+    ).fetchall()
+    return [(r[0], r[1], int(r[2] or _DEFAULT_WORK_HOURS), r[3]) for r in rows]
+
+
 # ---------------------------------------------------------------- surse bottom-up per tip obiectiv
 def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: Optional[list] = None,
                       biz: Optional["_BizCache"] = None):
@@ -758,7 +830,7 @@ def _fetch_email_rows(db: Session, department: str, first: _dt.date, holidays: O
             LEFT JOIN emails e ON e.id = cgt.email_id
             LEFT JOIN clients pex ON pex.id = e.client_id
             WHERE cgt.cts_status='solved' AND cgt.cts_direction='received'
-              AND edm.department=:d AND edm.enabled=true
+              AND {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
               AND {_EMAIL_EXCLUDE_SQL}
               AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='cgt')}
               AND date_trunc('month', (COALESCE(cgt.cts_solved_at, cgt.cts_solved_seen_at, cgt.cts_reply_at)
@@ -866,7 +938,7 @@ def _fetch_task_rows(db: Session, department: str, first: _dt.date, categorie: O
                    ctgt.cts_updated_at AS p_end
             FROM cts_task_ground_truth ctgt
             JOIN employee_department_mapping edm ON edm.id = ctgt.assignee_employee_id
-            WHERE edm.department=:d AND edm.enabled=true
+            WHERE {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
               AND lower(ctgt.status) = 'solved'
               AND ctgt.cts_created_at IS NOT NULL AND ctgt.cts_updated_at IS NOT NULL
               AND {fam_filter}
@@ -952,7 +1024,9 @@ _APEL_AGENT_CTE = """
             JOIN cts_calls_ground_truth g2 ON g2.call_local_id = c2.id
             JOIN employee_department_mapping e2
               ON lower(e2.email) = lower(g2.cts_assignee_email)
-            WHERE c2.agent_extension IS NOT NULL AND e2.enabled = true
+            -- Fara `e2.enabled`: cheia de join e egalitatea de email, deci nu exista ambiguitate
+            -- de dezambiguizat, iar un om plecat din firma trebuie sa-si pastreze apelurile vechi.
+            WHERE c2.agent_extension IS NOT NULL
             GROUP BY 1, 2
         ) t WHERE rn = 1
     )
@@ -990,7 +1064,10 @@ _APEL_AGENT_JOIN = r"""
     LEFT JOIN LATERAL (
         SELECT CASE WHEN count(*) = 1 THEN min(e3.id) END AS id
         FROM employee_department_mapping e3
-        WHERE e3.enabled = true
+        WHERE EXISTS (SELECT 1 FROM employee_department_history h3
+                       WHERE h3.employee_id = e3.id
+                         AND h3.valid_from <= c.started_at::date
+                         AND (h3.valid_to IS NULL OR h3.valid_to > c.started_at::date))
           AND c.agent_extension IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM unnest(regexp_split_to_array(lower(trim(c.agent_extension)), '\s+')) tok
@@ -1006,11 +1083,9 @@ _APEL_AGENT_JOIN = r"""
     -- agentului (`agent_extension` NULL) -- 788 de apeluri primite pe august. Ordinea conteaza:
     -- pentru "cine a raspuns", centrala telefonica e sursa de adevar, nu cine a preluat tichetul.
     LEFT JOIN employee_department_mapping edm_c
-      ON edm_c.enabled = true
-     AND lower(edm_c.email) = lower(g.cts_assignee_email)
+      ON lower(edm_c.email) = lower(g.cts_assignee_email)
     JOIN employee_department_mapping edm
       ON edm.id = COALESCE(am.employee_id, edm_n.id, edm_c.id)
-     AND edm.enabled = true
 """
 _APEL_MINS_SQL = "COALESCE(c.ring_seconds, g.cts_response_seconds)"
 
@@ -1127,17 +1202,17 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
             FROM calls c
             {_APEL_AGENT_JOIN}
             LEFT JOIN department_attendance da
-                ON da.department = edm.department
+                ON da.department = :d
                 AND da.work_date = {_APEL_DAY_SQL}
             LEFT JOIN department_schedule ds
-                ON ds.department = edm.department
+                ON ds.department = :d
                 AND ds.weekday = EXTRACT(ISODOW FROM c.started_at)::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
                 FROM department_schedule WHERE active = true
-            ) dsc ON dsc.department = edm.department
-            WHERE edm.department=:d
+            ) dsc ON dsc.department = :d
+            WHERE {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
               AND c.direction = 'inbound'
               AND {_APEL_REAL_CALL_SQL}
               AND {_APEL_EXCLUDE_SQL.format(c='c')}
@@ -1206,13 +1281,13 @@ def _fetch_reclamatie_rows(db: Session, department: str, first: _dt.date, catego
                 SELECT e1.id FROM cts_dv_employee dv1
                 JOIN employee_department_mapping e1 ON lower(e1.email) = lower(dv1.email)
                 WHERE dv1.admin_id = qe.updated_by::text
-                  AND e1.enabled = true AND e1.department = :d
+                  AND {_DEPT_AT_SQL.format(e='e1', dept=':d', day=':first')}
                 ORDER BY e1.id LIMIT 1
             ) edm_u ON true
             -- altfel: echipa care proceseaza reclamatiile (un singur rand cand e un singur om)
             LEFT JOIN LATERAL (
                 SELECT e2.id FROM employee_department_mapping e2
-                WHERE e2.department = :d AND e2.enabled = true
+                WHERE {_DEPT_AT_SQL.format(e='e2', dept=':d', day=':first')}
                 ORDER BY e2.id LIMIT 1
             ) edm_any ON true
             WHERE qe.deleted_at IS NULL
@@ -1293,7 +1368,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 LEFT JOIN clients cx ON cx.iris_client_id = NULLIF(g.raw->'extra'->>'client_id','')::bigint
                 LEFT JOIN clients pex ON pex.id = e.client_id
                 WHERE g.cts_status='solved' AND g.cts_direction='received'
-                  AND edm.department=:d AND edm.enabled=true
+                  AND {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
                   AND {_EMAIL_EXCLUDE_SQL}
                   AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='g')}
                   AND date_trunc('month', (COALESCE(g.cts_solved_at, g.cts_solved_seen_at, g.cts_reply_at)
@@ -1354,7 +1429,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 -- numerele se suprapun, deci join-ul gresit nu dadea NULL, ci alt rand.
                 -- `cts_tasks_training.py` folosea deja corect `iris_client_id`.
                 LEFT JOIN clients cl ON cl.iris_client_id = t.client_id
-                WHERE edm.department=:d AND edm.enabled=true
+                WHERE {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
                   AND lower(t.status) = 'solved'
                   AND t.cts_created_at IS NOT NULL AND t.cts_updated_at IS NOT NULL
                   AND {fam_filter}
@@ -1452,17 +1527,19 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                     SELECT e1.id, e1.name FROM cts_dv_employee dv1
                     JOIN employee_department_mapping e1 ON lower(e1.email) = lower(dv1.email)
                     WHERE dv1.admin_id = qe.updated_by::text
-                      AND e1.enabled = true AND e1.department = :d
+                      AND {_DEPT_AT_SQL.format(e='e1', dept=':d', day=':first')}
                     ORDER BY e1.id LIMIT 1
                 ) edm_u ON true
                 LEFT JOIN LATERAL (
                     SELECT e2.id, e2.name FROM employee_department_mapping e2
-                    WHERE e2.department = :d AND e2.enabled = true
+                    WHERE {_DEPT_AT_SQL.format(e='e2', dept=':d', day=':first')}
                     ORDER BY e2.id LIMIT 1
                 ) edm_any ON true
                 -- persoana EVALUATA (responsible_id = admin din CTS), pentru context in lista
                 LEFT JOIN LATERAL (
-                    SELECT e3.name, e3.department FROM cts_dv_employee dv3
+                    SELECT e3.name,
+                           COALESCE(employee_dept_at(e3.id, CAST(:first AS date)), e3.department) AS department
+                    FROM cts_dv_employee dv3
                     JOIN employee_department_mapping e3 ON lower(e3.email) = lower(dv3.email)
                     WHERE dv3.admin_id = qe.responsible_id::text
                     ORDER BY e3.id LIMIT 1
@@ -1532,7 +1609,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 FROM calls c
                 {_APEL_AGENT_JOIN}
                 LEFT JOIN clients cl ON cl.id = c.client_id
-                WHERE edm.department=:d
+                WHERE {_DEPT_AT_SQL.format(e='edm', dept=':d', day=':first')}
                   AND c.direction = 'inbound'
                   AND {_APEL_REAL_CALL_SQL}
                   AND {_APEL_EXCLUDE_SQL.format(c='c')}
@@ -1573,14 +1650,17 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     # Zile lucrătoare reale = L-V + ≥2 angajati prezenti in dept + nu sărbătoare legală
     wd = biz.working_days_in_range(department, first, last, holidays)
 
-    # 1) operatori din departament (enabled=true) — toti, inclusiv cei fara activitate luna asta
+    # 1) operatorii departamentului IN LUNA RAPORTATA (employee_department_history) — toti,
+    #    inclusiv cei fara activitate luna asta si cei plecati intre timp din firma. `enabled` NU
+    #    se filtreaza aici: e o proprietate a lui azi, iar plecarea inchide deja intervalul.
     #    Excludem angajatii cu productivity_start_date > ultima zi a lunii (inca in perioada de proba).
     ops = db.execute(
         text("SELECT id, name, COALESCE(work_hours, :wh) AS work_hours, iris_id "
-             "FROM employee_department_mapping WHERE department=:d AND enabled=true "
+             "FROM employee_department_mapping "
+             "WHERE id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:first AS date))) "
              "AND (productivity_start_date IS NULL OR productivity_start_date <= :last_day) "
              "ORDER BY name"),
-        {"d": department, "wh": _DEFAULT_WORK_HOURS, "last_day": last},
+        {"d": department, "wh": _DEFAULT_WORK_HOURS, "first": first, "last_day": last},
     ).fetchall()
     op_ids_all = [r[0] for r in ops]
     op_iris_ids = [int(r[3]) for r in ops if r[3] is not None]
@@ -1600,9 +1680,9 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
     if op_ids_all:
         pa = db.execute(
             text("SELECT employee_id, work_date, present FROM employee_attendance "
-                 "WHERE department=:dept AND work_date BETWEEN :first AND :last "
+                 "WHERE work_date BETWEEN :first AND :last "
                  "AND employee_id IS NOT NULL AND employee_id = ANY(:ids)"),
-            {"dept": department, "first": first, "last": last, "ids": op_ids_all},
+            {"first": first, "last": last, "ids": op_ids_all},
         ).fetchall()
         for emp_id, work_date, present in pa:
             wd_date = work_date if isinstance(work_date, _dt.date) else _dt.date.fromisoformat(str(work_date))
@@ -2468,13 +2548,15 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
         if _is_working_day(_dt.date(year, month, d), holidays)
     )
 
-    # Operatori activi — excludem cei cu productivity_start_date > ultima zi a lunii tinta
+    # Operatorii departamentului in luna tinta (employee_department_history) — excludem cei cu
+    # productivity_start_date > ultima zi a lunii tinta.
     ops = db.execute(
         text("SELECT id, name, COALESCE(work_hours, :wh) AS work_hours, iris_id "
-             "FROM employee_department_mapping WHERE department=:d AND enabled=true "
+             "FROM employee_department_mapping "
+             "WHERE id IN (SELECT employee_id FROM employee_dept_members(:d, CAST(:first AS date))) "
              "AND (productivity_start_date IS NULL OR productivity_start_date <= :last_day) "
              "ORDER BY name"),
-        {"d": department, "wh": _DEFAULT_WORK_HOURS, "last_day": last_tgt},
+        {"d": department, "wh": _DEFAULT_WORK_HOURS, "first": first_tgt, "last_day": last_tgt},
     ).fetchall()
     op_ids = [r[0] for r in ops]
     op_iris_ids_fc = [int(r[3]) for r in ops if r[3] is not None]
@@ -2612,7 +2694,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                         JOIN emails e ON e.id = g.email_id
                         JOIN employee_department_mapping edm ON lower(edm.email) = lower(g.cts_assignee_email)
                         LEFT JOIN clients pex ON pex.id = e.client_id
-                        WHERE edm.department = :dept
+                        WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                           AND {_EMAIL_EXCLUDE_SQL}
                           AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='g')}
                           AND date_trunc('month', g.cts_reply_at AT TIME ZONE 'Europe/Bucharest') =
@@ -2627,13 +2709,13 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
 
             elif tip == "apel":
                 rows = db.execute(
-                    text("""
+                    text(f"""
                         SELECT COUNT(*) as vol,
                                COUNT(CASE WHEN cgt.cts_response_seconds <= :lim THEN 1 END) as intmp,
                                COUNT(*) as meas
                         FROM cts_calls_ground_truth cgt
                         JOIN employee_department_mapping edm ON lower(edm.email) = lower(cgt.cts_assignee_email)
-                        WHERE edm.department = :dept
+                        WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                           AND date_trunc('month', cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest') =
                               date_trunc('month', CAST(:hfirst AS timestamp))
                     """),
@@ -2656,7 +2738,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                                          AND tgt.cts_updated_at IS NOT NULL THEN 1 END) as meas
                         FROM cts_task_ground_truth tgt
                         JOIN employee_department_mapping edm ON edm.id = tgt.assignee_employee_id
-                        WHERE edm.department = :dept AND edm.enabled = true
+                        WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                           AND lower(tgt.status) = 'solved'
                           AND {_TASK_EXCLUDE_SQL.format(t='tgt')}
                           AND date_trunc('month', tgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest') =
@@ -2740,12 +2822,12 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                 email_obj = next((x for x in objectives if x["tip"] == "email"), None)
                 if email_obj:
                     erows = db.execute(
-                        text("""
+                        text(f"""
                             SELECT edm.id as emp_id, COUNT(*) as vol
                             FROM cts_ground_truth g
                             JOIN emails e ON e.id = g.email_id
                             JOIN employee_department_mapping edm ON lower(edm.email) = lower(g.cts_assignee_email)
-                            WHERE edm.department = :dept
+                            WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                               AND date_trunc('month', g.cts_reply_at AT TIME ZONE 'Europe/Bucharest') =
                                   date_trunc('month', CAST(:hfirst AS timestamp))
                             GROUP BY edm.id
@@ -2762,11 +2844,11 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                 apel_obj = next((x for x in objectives if x["tip"] == "apel"), None)
                 if apel_obj:
                     arows = db.execute(
-                        text("""
+                        text(f"""
                             SELECT edm.id as emp_id, COUNT(*) as vol
                             FROM cts_calls_ground_truth cgt
                             JOIN employee_department_mapping edm ON lower(edm.email) = lower(cgt.cts_assignee_email)
-                            WHERE edm.department = :dept
+                            WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                               AND date_trunc('month', cgt.cts_started_at AT TIME ZONE 'Europe/Bucharest') =
                                   date_trunc('month', CAST(:hfirst AS timestamp))
                             GROUP BY edm.id
@@ -2787,7 +2869,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
                             SELECT tgt.assignee_employee_id as emp_id, COUNT(*) as vol
                             FROM cts_task_ground_truth tgt
                             JOIN employee_department_mapping edm ON edm.id = tgt.assignee_employee_id
-                            WHERE edm.department = :dept AND edm.enabled = true
+                            WHERE {_DEPT_AT_SQL.format(e='edm', dept=':dept', day='CAST(:hfirst AS date)')}
                               AND lower(tgt.status) = 'solved'
                               AND {_TASK_EXCLUDE_SQL.format(t='tgt')}
                               AND date_trunc('month', tgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest') =
@@ -2917,7 +2999,7 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
     uid_params = {"uid": user_id} if user_id is not None else {}
     raw_rows = db.execute(
         text(rf"""
-            SELECT edm.id AS op_id, edm.name AS op_name, edm.department AS dept,
+            SELECT edm.id AS op_id, edm.name AS op_name, hd.department AS dept,
                    lower(COALESCE(NULLIF(cgt.cts_category,''), e.ai_category)) AS categorie,
                    (COALESCE(cgt.cts_solved_at, cgt.cts_solved_seen_at, cgt.cts_reply_at)
                         AT TIME ZONE 'Europe/Bucharest')::date AS solved_day,
@@ -2928,9 +3010,9 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
             FROM cts_ground_truth cgt
             JOIN employee_department_mapping edm ON lower(cgt.cts_assignee_email) = lower(edm.email)
             LEFT JOIN emails e ON e.id = cgt.email_id
-            LEFT JOIN clients pex ON pex.id = e.client_id
+            LEFT JOIN clients pex ON pex.id = e.client_id{_DEPT_AT_LATERAL.format(e='edm', day="(COALESCE(cgt.cts_solved_at, cgt.cts_solved_seen_at, cgt.cts_reply_at) AT TIME ZONE 'Europe/Bucharest')::date", alias='hd')}
             WHERE cgt.cts_status='solved' AND cgt.cts_direction='received'
-              AND edm.enabled=true AND edm.department = ANY(:depts)
+              AND hd.department = ANY(:depts)
               AND {_EMAIL_EXCLUDE_SQL}
               AND {_EMAIL_EXCLUDE_CTS_SQL.format(g='cgt')}
               """ + uid_filter + """
@@ -3060,18 +3142,18 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
     raw_task_rows = db.execute(
         text(rf"""
             SELECT edm.id AS op_id,
-                   edm.department AS dept,
+                   hd.department AS dept,
                    (ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date AS solved_day,
                    ctgt.task_type,
                    ctgt.cts_created_at AS created_ts,
                    ctgt.cts_in_progress_at AS in_progress_ts,
                    ctgt.cts_updated_at AS updated_ts
             FROM cts_task_ground_truth ctgt
-            JOIN employee_department_mapping edm ON edm.id = ctgt.assignee_employee_id
+            JOIN employee_department_mapping edm ON edm.id = ctgt.assignee_employee_id{_DEPT_AT_LATERAL.format(e='edm', day="(ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date", alias='hd')}
             WHERE lower(ctgt.status) = 'solved'
               AND ctgt.cts_created_at IS NOT NULL AND ctgt.cts_updated_at IS NOT NULL
               AND {_TASK_EXCLUDE_SQL.format(t='ctgt')}
-              AND edm.enabled = true AND edm.department = ANY(:depts)
+              AND hd.department = ANY(:depts)
               """ + task_uid_filter + """
               AND (ctgt.cts_updated_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt
         """),
@@ -3210,19 +3292,19 @@ def analytics_report(db: Session, departments: list, date_from: _dt.date, date_t
                    {_APEL_MINS_SQL} AS secs,
                    c.duration_seconds AS dur_secs
             FROM calls c
-            {_APEL_AGENT_JOIN}
+            {_APEL_AGENT_JOIN}{_DEPT_AT_LATERAL.format(e='edm', day=_APEL_DAY_SQL, alias='hd')}
             LEFT JOIN department_attendance da
-                ON da.department = edm.department
+                ON da.department = hd.department
                 AND da.work_date = {_APEL_DAY_SQL}
             LEFT JOIN department_schedule ds
-                ON ds.department = edm.department
+                ON ds.department = hd.department
                 AND ds.weekday = EXTRACT(ISODOW FROM c.started_at)::int
                 AND ds.active = true
             LEFT JOIN (
                 SELECT DISTINCT department, true AS configured
                 FROM department_schedule WHERE active = true
-            ) dsc ON dsc.department = edm.department
-            WHERE edm.department = ANY(:depts)
+            ) dsc ON dsc.department = hd.department
+            WHERE hd.department = ANY(:depts)
               AND c.direction = 'inbound'
               AND {_APEL_REAL_CALL_SQL}
               AND {_APEL_EXCLUDE_SQL.format(c='c')}

@@ -54,6 +54,12 @@ def _bl_filter() -> str:
 #     SQL de JOIN, folosite de raportul de productivitate si de lista din `calls.py`;
 #   * `_AGENT_MAP_SQL` de mai jos — aceleasi trepte, dar rezolvate O SINGURA DATA per interogare
 #     intr-o mapare nume->angajat, tinuta in cache 5 minute, din care se construieste un IN.
+#
+# ⚠️ Apartenenta la DEPARTAMENT nu mai vine din `employee_department_mapping.department`, ci din
+# `employee_department_history`, la DATA APELULUI (`dept_agent_windows` + `_agent_dept_filter`).
+# Maparea nume->angajat ramane in cache — e invarianta in timp; ferestrele de departament NU se
+# cacheaza, ca o corectie facuta din UI sa se vada imediat. `enabled` a fost scos din mapare:
+# altfel apelurile vechi ale unui om plecat ramaneau neatribuite.
 # Forma difera fiindca aici filtram (avem nevoie de lista de nume), nu imbogatim randuri. Daca se
 # schimba regula de potrivire (ex. prefixul de 4 litere), se schimba in AMBELE. Refolosirea
 # directa a fragmentelor din productivity ar elimina duplicarea — vezi nota din CLAUDE.md.
@@ -73,7 +79,7 @@ _AGENT_MAP_SQL = r"""
             JOIN cts_calls_ground_truth g2 ON g2.call_local_id = c2.id
             JOIN employee_department_mapping e2
               ON lower(e2.email) = lower(g2.cts_assignee_email)
-            WHERE c2.agent_extension IS NOT NULL AND e2.enabled = true
+            WHERE c2.agent_extension IS NOT NULL
             GROUP BY 1, 2
         ) t WHERE rn = 1
     ),
@@ -89,8 +95,7 @@ _AGENT_MAP_SQL = r"""
     LEFT JOIN LATERAL (
         SELECT CASE WHEN count(*) = 1 THEN min(e3.id) END AS id
         FROM employee_department_mapping e3
-        WHERE e3.enabled = true
-          AND NOT EXISTS (
+        WHERE NOT EXISTS (
               SELECT 1 FROM unnest(regexp_split_to_array(lower(trim(n.n)), '\s+')) tok
               WHERE NOT EXISTS (
                   SELECT 1 FROM unnest(
@@ -101,7 +106,7 @@ _AGENT_MAP_SQL = r"""
           )
     ) nm ON true
     JOIN employee_department_mapping e
-      ON e.id = COALESCE(am.employee_id, nm.id) AND e.enabled = true
+      ON e.id = COALESCE(am.employee_id, nm.id)
 """
 
 
@@ -119,7 +124,11 @@ def _agent_name_map(db) -> list:
 
 
 def dept_agent_names(db, department: Optional[str] = None, agent: Optional[str] = None) -> list:
-    """Numele de agent (`calls.agent_extension`) ale unui departament sau ale unui operator."""
+    """Numele de agent (`calls.agent_extension`) ale unui departament sau ale unui operator.
+
+    ⚠️ Pe departament raspunde pentru ACUM. Pentru un interval din trecut foloseste
+    `dept_agent_windows`: un om promovat nu are voie sa-si duca apelurile vechi in departamentul nou.
+    """
     rows = _agent_name_map(db)
     if agent:
         want = agent.strip().lower()
@@ -130,39 +139,88 @@ def dept_agent_names(db, department: Optional[str] = None, agent: Optional[str] 
     return []
 
 
+def dept_agent_windows(db, department: str) -> list:
+    """[(agent_extension, valid_from, valid_to)] — cand a apartinut fiecare agent departamentului.
+
+    Maparea nume->angajat (cache 5 min) e invarianta in timp; apartenenta la departament NU e, si
+    se citeste de fiecare data din `employee_department_history` — o corectie facuta din UI trebuie
+    sa se vada la urmatorul reload, nu peste 5 minute.
+    """
+    want = (department or "").strip().lower()
+    if not want:
+        return []
+    by_emp: dict = {}
+    for r in _agent_name_map(db):
+        if r.get("employee_id") and r.get("agent_extension"):
+            by_emp.setdefault(int(r["employee_id"]), set()).add(r["agent_extension"])
+    if not by_emp:
+        return []
+    rows = db.execute(text(
+        "SELECT employee_id, valid_from, valid_to FROM employee_department_history "
+        "WHERE department = :d AND employee_id = ANY(:ids)"
+    ), {"d": want, "ids": list(by_emp.keys())}).fetchall()
+    out = []
+    for emp_id, vfrom, vto in rows:
+        for name in by_emp.get(int(emp_id), ()):
+            out.append((name, vfrom, vto))
+    return sorted(out, key=lambda x: (x[0], x[1]))
+
+
 def _agent_dept_filter(agent: Optional[str], department: Optional[str], params: dict, db=None) -> str:
-    """Fragment SQL pentru filtrare agent/departament. `agent` (email) are prioritate."""
+    """Fragment SQL pentru filtrare agent/departament. `agent` (email) are prioritate.
+
+    Pe DEPARTAMENT filtrarea e datata: un agent intra in rezultat doar pentru apelurile din
+    perioada in care chiar apartinea departamentului (`employee_department_history`). Altfel o
+    promovare ar muta retroactiv tot istoricul de apeluri in departamentul nou.
+    """
     if not agent and not department:
         return ""
     if db is None:      # apelant vechi, fara sesiune -> nu se filtreaza (mai bine tot decat nimic)
         return ""
 
+    # Treapta 3: apelurile pe care centrala nu le-a legat de un agent (`agent_extension` NULL)
+    # se atribuie dupa assignee-ul tichetului CTS — la fel ca in raportul de productivitate.
     if agent:
         params["_ad_email"] = agent.strip().lower()
         cts_pred = "lower(e3.email) = :_ad_email"
     else:
         params["_ad_dept"] = (department or "").strip().lower()
-        cts_pred = "e3.department = :_ad_dept"
-
-    names = dept_agent_names(db, department=department, agent=agent)
-    # Treapta 3: apelurile pe care centrala nu le-a legat de un agent (`agent_extension` NULL)
-    # se atribuie dupa assignee-ul tichetului CTS — la fel ca in raportul de productivitate.
+        cts_pred = ("EXISTS (SELECT 1 FROM employee_department_history h3"
+                    "         WHERE h3.employee_id = e3.id AND h3.department = :_ad_dept"
+                    "           AND h3.valid_from <= c.started_at::date"
+                    "           AND (h3.valid_to IS NULL OR h3.valid_to > c.started_at::date))")
     cts_branch = (
         "(c.agent_extension IS NULL AND EXISTS ("
         "  SELECT 1 FROM cts_calls_ground_truth g3"
         "  JOIN employee_department_mapping e3 ON lower(e3.email) = lower(g3.cts_assignee_email)"
-        f" WHERE g3.call_local_id = c.id AND e3.enabled = true AND {cts_pred}"
+        f" WHERE g3.call_local_id = c.id AND {cts_pred}"
         "))"
     )
-    if not names:
-        return " AND " + cts_branch
 
-    keys = []
-    for i, nm in enumerate(names):
-        k = f"_ad_n{i}"
-        params[k] = nm
-        keys.append(":" + k)
-    return f" AND (c.agent_extension IN ({', '.join(keys)}) OR {cts_branch})"
+    if agent:
+        names = dept_agent_names(db, agent=agent)
+        if not names:
+            return " AND " + cts_branch
+        keys = []
+        for i, nm in enumerate(names):
+            k = f"_ad_n{i}"
+            params[k] = nm
+            keys.append(":" + k)
+        return f" AND (c.agent_extension IN ({', '.join(keys)}) OR {cts_branch})"
+
+    windows = dept_agent_windows(db, department)
+    if not windows:
+        return " AND " + cts_branch
+    parts = []
+    for i, (nm, vfrom, vto) in enumerate(windows):
+        params[f"_ad_n{i}"] = nm
+        params[f"_ad_f{i}"] = vfrom
+        cond = f"(c.agent_extension = :_ad_n{i} AND c.started_at >= CAST(:_ad_f{i} AS date)"
+        if vto is not None:
+            params[f"_ad_t{i}"] = vto
+            cond += f" AND c.started_at < CAST(:_ad_t{i} AS date)"
+        parts.append(cond + ")")
+    return " AND (" + " OR ".join(parts) + " OR " + cts_branch + ")"
 
 
 # ── Dashboard KPI ──────────────────────────────────────────────────────────────

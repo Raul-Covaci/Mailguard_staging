@@ -8140,6 +8140,12 @@ function EmployeesPanel() {
   var [extraForm, setExtraForm] = useState(null);
   var [extraBusy, setExtraBusy] = useState(false);
   var [extraMsg, setExtraMsg] = useState(null);
+  // Istoric departament — apartenenta e datata pe LUNA (employee_department_history); rapoartele
+  // istorice de productivitate citesc de acolo, nu din departamentul curent.
+  var [histData, setHistData] = useState({});
+  var [histForm, setHistForm] = useState(null);
+  var [histBusy, setHistBusy] = useState(false);
+  var [histMsg, setHistMsg] = useState(null);
 
   function openAllSched() {
     setShowAllSched(true);
@@ -8222,6 +8228,52 @@ function EmployeesPanel() {
         .catch(function(){ setLeaveData(function(d){ var n=Object.assign({},d); n[emp.id]=[]; return n; }); });
     }
     if (!extraData[emp.id]) refreshExtra(emp.id);
+    setHistForm(null); setHistMsg(null);
+    refreshHist(emp.id);
+  }
+
+  function refreshHist(empId) {
+    api('/settings/employees/' + empId + '/department-history')
+      .then(function(rows){ setHistData(function(d){ var n=Object.assign({},d); n[empId]=rows||[]; return n; }); })
+      .catch(function(){ setHistData(function(d){ var n=Object.assign({},d); n[empId]=[]; return n; }); });
+  }
+
+  function saveHist() {
+    if (!leaveModal || !histForm) return;
+    var f = histForm;
+    if (!f.department) { setHistMsg('Alege departamentul.'); return; }
+    if (!f.valid_from) { setHistMsg('Alege luna de la care se aplică.'); return; }
+    setHistBusy(true); setHistMsg(null);
+    var isEdit = !!f.id;
+    var url = '/settings/employees/' + leaveModal.id + '/department-history' + (isEdit ? ('/' + f.id) : '');
+    api(url, { method: isEdit ? 'PUT' : 'POST',
+               body: JSON.stringify({ department: f.department, valid_from: f.valid_from, note: f.note || null }) })
+      .then(function(res){
+        // Lunile deja inchise isi pastreaza obiectivul fixat (productivity_monthly_snapshot):
+        // se recalculeaza doar volumul. Adminul trebuie sa stie care sunt.
+        var w = (res && res.warnings) || [];
+        var base = isEdit ? 'Interval actualizat.' : 'Departament înregistrat.';
+        setHistMsg(w.length
+          ? base + ' Obiectivele rămân fixate pentru: ' + w.map(function(x){ return x.month + ' / ' + x.department; }).join(', ') + ' — se recalculează doar volumul.'
+          : base);
+        setHistForm(null); refreshHist(leaveModal.id); load();
+      })
+      .catch(function(e){ setHistMsg('Eroare: ' + e); })
+      .finally(function(){ setHistBusy(false); });
+  }
+
+  function deleteHist(hid) {
+    if (!leaveModal) return;
+    Swal.fire({ icon:'warning', title:'Ștergi intervalul?',
+                text:'Intervalul precedent se extinde peste el, ca să nu rămână luni fără departament.',
+                showCancelButton:true, confirmButtonText:'Șterge', cancelButtonText:'Renunț',
+                background:'var(--bg2)', color:'var(--tx)' })
+      .then(function(r){
+        if (!r.isConfirmed) return;
+        api('/settings/employees/' + leaveModal.id + '/department-history/' + hid, { method:'DELETE' })
+          .then(function(){ setHistMsg('Interval șters.'); refreshHist(leaveModal.id); load(); })
+          .catch(function(e){ setHistMsg('Eroare: ' + e); });
+      });
   }
 
   function saveProdStart(emp) {
@@ -8413,7 +8465,8 @@ function EmployeesPanel() {
               h('td', { key: 'n', style: td }, [
                 h('span', { key:'nm' }, emp.name),
                 emp.productivity_start_date ? h('span', { key:'psd', title:'Start productivitate: ' + String(emp.productivity_start_date).slice(0,7), style:{ marginLeft:6, fontSize:11, color:'var(--t2)', background:'var(--bg3)', border:'1px solid var(--bd)', borderRadius:4, padding:'1px 6px' } }, 'start ' + String(emp.productivity_start_date).slice(0,7)) : null,
-                h('button', { key:'lvm', title:'Gestionare concedii aprobate / data start productivitate', onClick:function(){ openLeaveModal(emp); }, style: Object.assign({}, schedBtn, { marginLeft: 8, color: 'var(--tx)', fontWeight: 500 }) }, 'Concedii' + (emp.leave_count > 0 ? ' (' + emp.leave_count + ')' : '')),
+                (emp.dept_history_count > 1 ? h('span', { key:'dh', title:'Are istoric de departament — rapoartele vechi îl păstrează în departamentul de atunci', style:{ marginLeft:6, fontSize:11, color:'var(--t2)', background:'var(--bg3)', border:'1px solid var(--bd)', borderRadius:4, padding:'1px 6px' } }, 'ist. dept ' + emp.dept_history_count) : null),
+                h('button', { key:'lvm', title:'Concedii aprobate / start productivitate / istoric departament', onClick:function(){ openLeaveModal(emp); }, style: Object.assign({}, schedBtn, { marginLeft: 8, color: 'var(--tx)', fontWeight: 500 }) }, 'Concedii' + (emp.leave_count > 0 ? ' (' + emp.leave_count + ')' : '')),
                 (emp.planned_count ? h('button', { key:'cc', title:'Vezi concediile planificate', onClick:function(){ openSchedModal(emp,'planned_leave'); }, style: schedBtn }, '📅 ' + emp.planned_count) : null),
                 ((emp.work_hours || emp.break_minutes) ? h('span', { key:'wh', style:{ marginLeft:8, fontSize:11, color:'var(--t3)' } },
                   (emp.work_hours ? (emp.work_hours + 'h') : '') + (emp.break_minutes ? (' · pauză ' + emp.break_minutes + 'm') : '')) : null),
@@ -8483,7 +8536,7 @@ function EmployeesPanel() {
     leaveModal ? h('div', { key:'lvmodal', className:'modal-bg', onMouseDown:function(e){ if(e.target===e.currentTarget){ setLeaveModal(null); setLeaveForm(null); setLeaveMsg(null); } } },
       h('div', { className:'modal', style:{ width:780, maxHeight:'85vh', display:'flex', flexDirection:'column' } }, [
         h('div', { key:'hdr', style:{ display:'flex', alignItems:'center', gap:12, padding:'14px 18px', borderBottom:'1px solid var(--bd)', flexShrink:0, flexWrap:'wrap' } }, [
-          h('h3', { key:'t', style:{ margin:0, flex:1, fontSize:16 } }, 'Concedii — ' + leaveModal.name),
+          h('h3', { key:'t', style:{ margin:0, flex:1, fontSize:16 } }, 'Concedii și departamente — ' + leaveModal.name),
           h('div', { key:'ps', style:{ display:'flex', alignItems:'center', gap:8, background:'var(--bg3)', border:'1px solid var(--bd)', borderRadius:'var(--r-sm)', padding:'6px 12px' } }, [
             h('label', { key:'l', style:{ fontSize:12, color:'var(--t2)', whiteSpace:'nowrap', fontWeight:600 } }, 'Start productivitate:'),
             h('input', { key:'m', type:'month', value:prodStartEdit,
@@ -8563,6 +8616,71 @@ function EmployeesPanel() {
                 (leaveForm && leaveForm.id ? h('button', { key:'cn', className:'btn secondary', style:{ padding:'7px 12px', alignSelf:'flex-end' }, onClick:function(){ setLeaveForm(null); setLeaveMsg(null); } }, 'Anulează') : null),
               ]),
             ]),
+            // --- Istoric departament (employee_department_history) ---
+            // Rapoartele istorice de productivitate citesc apartenenta DE AICI: un om promovat
+            // trebuie sa ramana in departamentul vechi pe lunile vechi.
+            h('div', { key:'depthist', style:{ background:'var(--bg2)', borderRadius:8, border:'1px solid var(--bd)', padding:'14px 16px', marginTop:14 } }, (function(){
+              var hrows = histData[leaveModal.id];
+              var hloading = (hrows === undefined);
+              var hf = histForm || {};
+              function monthLabel(v){ return v ? String(v).slice(0,7) : '—'; }
+              return [
+                h('h4', { key:'ht', style:{ margin:'0 0 4px', fontSize:13, fontWeight:600 } }, 'Istoric departament'),
+                h('div', { key:'hh', style:{ fontSize:12, color:'var(--t2)', margin:'0 0 12px', lineHeight:1.45 } },
+                  'Din ce lună a lucrat în fiecare departament. Rapoartele de productivitate folosesc ' +
+                  'departamentul din luna raportată, nu pe cel de azi — o promovare nu mai mută munca ' +
+                  'veche în departamentul nou. Se lucrează pe luni întregi: o mutare la mijlocul lunii ' +
+                  'contează de la 1 ale lunii alese.'),
+                (histMsg ? h('div', { key:'hm', style:{ fontSize:12, marginBottom:10, color:'var(--t2)' } }, histMsg) : null),
+                h('div', { key:'hlist', style:{ marginBottom:12 } },
+                  hloading
+                    ? h('div', { style:{ fontSize:12, color:'var(--t3)' } }, 'Se încarcă…')
+                    : (hrows.length === 0
+                        ? h('div', { style:{ fontSize:12, color:'var(--t3)' } }, 'Fără istoric.')
+                        : h('table', { style:{ width:'100%', borderCollapse:'collapse', fontSize:12 } }, [
+                            h('thead', { key:'th' }, h('tr', null, [
+                              h('th', { key:'d', style:{ textAlign:'left', padding:'4px 6px', color:'var(--t2)', fontWeight:600 } }, 'Departament'),
+                              h('th', { key:'f', style:{ textAlign:'left', padding:'4px 6px', color:'var(--t2)', fontWeight:600 } }, 'Din luna'),
+                              h('th', { key:'t2', style:{ textAlign:'left', padding:'4px 6px', color:'var(--t2)', fontWeight:600 } }, 'Până în luna'),
+                              h('th', { key:'s', style:{ textAlign:'left', padding:'4px 6px', color:'var(--t2)', fontWeight:600 } }, 'Sursă'),
+                              h('th', { key:'a', style:{ textAlign:'right', padding:'4px 6px', color:'var(--t2)', fontWeight:600 } }, ''),
+                            ])),
+                            h('tbody', { key:'tb' }, hrows.map(function(r, i){
+                              return h('tr', { key:r.id, style:{ borderTop:'1px solid var(--bd)' } }, [
+                                h('td', { key:'d', style:{ padding:'5px 6px' } }, DEPT_LABELS[r.department] || r.department),
+                                h('td', { key:'f', style:{ padding:'5px 6px' } }, monthLabel(r.valid_from)),
+                                h('td', { key:'t2', style:{ padding:'5px 6px', color: r.valid_to ? 'var(--tx)' : 'var(--t3)' } },
+                                  r.valid_to ? monthLabel(r.valid_to) + ' (exclusiv)' : 'în prezent'),
+                                h('td', { key:'s', style:{ padding:'5px 6px', color:'var(--t3)' } }, r.source || ''),
+                                h('td', { key:'a', style:{ padding:'5px 6px', textAlign:'right', whiteSpace:'nowrap' } }, [
+                                  h('button', { key:'e', className:'btn secondary', style:{ padding:'2px 8px', fontSize:11, marginRight:6 },
+                                    onClick:function(){ setHistMsg(null); setHistForm({ id:r.id, department:r.department, valid_from:String(r.valid_from).slice(0,7), note:r.note || '' }); } }, 'Editează'),
+                                  (i > 0 ? h('button', { key:'x', className:'btn secondary', style:{ padding:'2px 8px', fontSize:11 },
+                                    onClick:function(){ deleteHist(r.id); } }, 'Șterge') : null),
+                                ]),
+                              ]);
+                            })),
+                          ]))),
+                h('div', { key:'hform', style:{ display:'flex', gap:10, alignItems:'flex-end', flexWrap:'wrap', borderTop:'1px solid var(--bd)', paddingTop:12 } }, [
+                  h('div', { key:'d' }, [
+                    h('label', { key:'l', style:{ fontSize:12, color:'var(--t2)', display:'block', marginBottom:3 } }, 'Departament'),
+                    h('select', { value: hf.department || leaveModal.department || 'suport_1',
+                      onChange:function(e){ var v=e.target.value; setHistForm(function(f){ return Object.assign({}, f||{}, { department:v }); }); setHistMsg(null); },
+                      style:Object.assign({}, inp, { minWidth:150 }) },
+                      DEPTS.map(function(d){ return h('option', { key:d, value:d }, DEPT_LABELS[d]); })),
+                  ]),
+                  h('div', { key:'f' }, [
+                    h('label', { key:'l', style:{ fontSize:12, color:'var(--t2)', display:'block', marginBottom:3 } }, 'Din luna'),
+                    h('input', { type:'month', value: hf.valid_from || '',
+                      onChange:function(e){ var v=e.target.value; setHistForm(function(f){ return Object.assign({}, f||{}, { valid_from:v }); }); setHistMsg(null); },
+                      style:Object.assign({}, inp, { minWidth:140 }) }),
+                  ]),
+                  h('button', { key:'sv', className:'btn primary', style:{ padding:'7px 18px', alignSelf:'flex-end' }, onClick:saveHist, disabled:histBusy },
+                    histBusy ? 'Se salvează…' : (hf.id ? 'Salvează modificările' : 'Adaugă mutarea')),
+                  (hf.id ? h('button', { key:'cn', className:'btn secondary', style:{ padding:'7px 12px', alignSelf:'flex-end' }, onClick:function(){ setHistForm(null); setHistMsg(null); } }, 'Anulează') : null),
+                ]),
+              ];
+            })()),
             // --- Zile libere extra: lucru pe proiecte / refurbished ---
             h('div', { key:'extra', style:{ background:'var(--bg2)', borderRadius:8, border:'1px solid var(--bd)', padding:'14px 16px', marginTop:14 } }, (function(){
               var xrows = extraData[leaveModal.id];
@@ -11598,10 +11716,11 @@ function ProdBreakdownModal({ dept, tip, categorie, month, limita, onClose }) {
   var PAGE_SIZE = 100;
 
   useEffect(function(){
-    api('/productivity/department-users?department=' + encodeURIComponent(dept))
+    // `month` conteaza: selectorul trebuie sa arate operatorii care erau in departament ATUNCI.
+    api('/productivity/department-users?department=' + encodeURIComponent(dept) + '&month=' + encodeURIComponent(month))
       .then(function(r){ setUsers((r && r.users) || (Array.isArray(r) ? r : []) || []); })
       .catch(function(){});
-  }, [dept]);
+  }, [dept, month]);
 
   useEffect(function(){
     var qs = ['tip=' + encodeURIComponent(tip), 'department=' + encodeURIComponent(dept),
@@ -14255,10 +14374,10 @@ function Productivity({ user, setTopbarRight }) {
   // Încarcă operatorii când se schimbă dept (doar Analiză)
   useEffect(function(){
     if (sub !== 'analiza' || dept === 'operational' || dept === 'financiar') { setUsers([]); setUserId(''); return; }
-    api('/productivity/department-users?department=' + encodeURIComponent(dept))
+    api('/productivity/department-users?department=' + encodeURIComponent(dept) + '&month=' + encodeURIComponent(month))
       .then(function(d){ setUsers(Array.isArray(d) ? d : []); setUserId(''); })
       .catch(function(){ setUsers([]); setUserId(''); });
-  }, [dept, sub]);
+  }, [dept, sub, month]);
 
   var inp = { background: 'var(--bg3)', border: '1px solid var(--bd)', borderRadius: 'var(--r-sm)', padding: '6px 8px', color: 'var(--tx)', fontSize: 13 };
   var RANGE_OPTS = [{ k:'1L', l:'1 lună' }, { k:'3L', l:'3 luni' }, { k:'6L', l:'6 luni' }, { k:'12L', l:'12 luni' }];
