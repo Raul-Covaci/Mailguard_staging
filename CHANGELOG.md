@@ -8,6 +8,56 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.15.0 - 2026-09-10
+
+### MINOR — snapshot-urile de COD sunt dezactivate (versionarea trece pe GitHub)
+
+Decizie Raul Covaci, 2026-09-10. Arhivele `mailguard_code_*.tar.gz` dublau ce ține deja git-ul și
+ocupau ~17,8 GB pe staging (6,8 GB în `storage/backups` + 11 GB în `/home/mail-data/backups`),
+din 36 GB folosiți. Retenția din `cleanup_backups.sh` (3 zile / min 3) nu acoperea a doua locație.
+
+- `scripts/backup_code.sh` iese imediat dacă `MAILGUARD_CODE_BACKUP != on`.
+  ⚠️ Kill-switch-ul e **în script, nu în cron**, intenționat: intrarea de cron trăiește pe server,
+  în afara repo-ului, deci un deploy nu o poate opri. Cât timp scriptul iese devreme, o intrare
+  rămasă (sau reapărută la o reinstalare) e inofensivă. Scoaterea din crontab rămâne de făcut,
+  dar nu mai e o condiție de siguranță.
+- `POST /settings/backups/run-now` și `POST /settings/backups/{name}/restore` → **410 Gone**
+  (aceeași convenție ca login-ul cu parolă). Restaurarea dezarhiva cod peste `/opt/iris-mailguard`
+  *peste* git — ar fi produs divergență tăcută între server și `origin/main`. Rollback-ul de cod
+  se face acum cu `git reset --hard <revizie> && systemctl restart mailguard-api`.
+- `GET /settings/backups` și `/worklog` rămân funcționale (read-only), cu `enabled: false` +
+  `disabled_reason`, ca arhivele rămase să fie vizibile până la ștergere.
+- UI (`BackupsPanel`): butoanele „Generează backup manual" și „Restaurează" dispar, badge-ul de
+  prospețime devine „Dezactivat", apare o explicație în panou.
+
+⛔ **Dump-urile DB NU sunt afectate.** `backups/pre-deploy/*.dump` (`deploy-pull.sh`) rămân —
+GitHub versionează cod, nu date, iar migrațiile pot fi ireversibile. Singura schimbare acolo:
+retenția scade de la 10 la 3 dump-uri (10 ocupau 2,3 GB, iar 6 dintre ele erau din aceeași zi).
+
+### PATCH — rotație pentru logurile gunicorn
+
+`access.log` ajunsese la 800 MB: unitatea systemd îi dă `--access-logfile` / `--error-logfile`, dar
+nimic nu-l rotea. `systemd/mailguard-logrotate` → `/etc/logrotate.d/mailguard` (7 zile, max 100 MB,
+comprimat). `copytruncate` e obligatoriu — gunicorn ține descriptorul deschis și nu reacționează la
+un rename, deci fără el rotația ar muta fișierul iar procesul ar scrie mai departe în inode-ul
+vechi: log aparent gol și spațiu neeliberat până la restart.
+⚠️ Ca și unitățile systemd, nu se propagă prin `git pull` — se copiază manual.
+
+### PATCH — `mg-app.js.gz` scos din git
+
+Artefact generat la deploy din `mg-app.js` (`deploy-pull.sh`, pasul 5), dar ținut și în git. Două
+consecințe, ambele observate pe staging:
+
+- reapărea ca „modificat" pe server după **fiecare** deploy (gzip-ul serverului produce alți
+  octeți) și **bloca deploy-ul următor** cu „modificări locale necommitate";
+- versiunea comitată rămăsese veche cu 4 commituri față de sursă — `origin/main:mg-app.js.gz`
+  decomprimat diferă de `origin/main:mg-app.js` la byte 1323744. Cine ar fi restaurat „versiunea
+  din git" ar fi servit UI vechi.
+
+`git rm --cached` + intrare în `.gitignore`. `app/main.py` servește `.js` necomprimat dacă `.gz`
+lipsește (`_GZIP_FILES`, gardă `gz.exists()`), iar `deploy-pull.sh` îl generează când nu există —
+deci nimic nu se rupe pe un server nou.
+
 ## v3.14.1 - 2026-09-10
 
 ### PATCH — sync-ul IRIS Data Views nu mai ține tot view-ul în RAM (cauza celor 4 OOM-uri)

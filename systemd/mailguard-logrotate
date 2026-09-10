@@ -1,0 +1,21 @@
+# Rotatie pentru logurile scrise de gunicorn (--access-logfile / --error-logfile din
+# mailguard-api.service). Fara ea, access.log creste nelimitat: 800 MB pe staging la 2026-09-10.
+#
+# Instalare (NU se propaga prin git pull, ca si unitatile systemd):
+#   sudo cp /opt/iris-mailguard/systemd/mailguard-logrotate /etc/logrotate.d/mailguard
+#   sudo logrotate -d /etc/logrotate.d/mailguard     # dry-run, verifica
+#
+# `copytruncate` e obligatoriu: gunicorn tine descriptorul deschis si nu reactioneaza la un
+# rename. Fara el, rotatia ar muta fisierul iar procesul ar continua sa scrie in inode-ul vechi —
+# log-ul ar parea gol, iar spatiul nu s-ar elibera pana la restart.
+/opt/iris-mailguard/logs/*.log {
+    daily
+    rotate 7
+    maxsize 100M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

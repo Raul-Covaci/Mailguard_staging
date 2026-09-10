@@ -17,7 +17,7 @@ BRANCH="main"
 DB_CONTAINER="${MAILGUARD_DB_CONTAINER:-mailguard-db}"
 HEALTH_URL="http://127.0.0.1:8500/healthz"     # gunicorn direct; 8501 = nginx (are IP allowlist)
 BACKUP_DIR="$APP_DIR/backups/pre-deploy"
-RETENTION=10
+RETENTION=3                                     # dump-uri DB pastrate (10 ocupau 2,3 GB pe staging)
 SERVICES=("mailguard-api")                      # primul aplica migrarile prin ExecStartPre
 TIMERS=("mailguard-cron.timer" "mailguard-personal-poll.timer")
 VENDOR_JS="$APP_DIR/app/ui/vendor/mg-app.js"

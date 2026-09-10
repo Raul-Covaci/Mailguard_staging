@@ -114,3 +114,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Artefact generat la deploy din mg-app.js (deploy-pull.sh, pasul 5).
+# Tinut in git, reaparea ca "modificat" pe server dupa FIECARE deploy si bloca deploy-ul
+# urmator; in plus versiunea comitata ramasese veche cu 4 commituri fata de sursa.
+# app/main.py serveste .js necomprimat daca .gz lipseste, deci absenta lui nu strica nimic.
+app/ui/vendor/mg-app.js.gz

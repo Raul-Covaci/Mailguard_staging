@@ -1,10 +1,18 @@
 """v0.6.0 — Settings / rule catalog + backups API.
 
 GET  /api/v1/settings/rules                  → admin catalog of phishing detection rules.
-GET  /api/v1/settings/backups                → admin: full list of code backups + freshness.
-POST /api/v1/settings/backups/run-now        → admin: force-create a backup now.
-POST /api/v1/settings/backups/{name}/restore → admin: restore code from an archive.
-GET  /api/v1/settings/backups/{name}/worklog → admin: human worklog for an archive.
+GET  /api/v1/settings/backups                → admin: lista arhivelor RAMASE (read-only).
+POST /api/v1/settings/backups/run-now        → HTTP 410, dezactivat (vezi mai jos).
+POST /api/v1/settings/backups/{name}/restore → HTTP 410, dezactivat (vezi mai jos).
+GET  /api/v1/settings/backups/{name}/worklog → admin: worklog pentru o arhiva ramasa.
+
+⛔ Snapshot-urile de COD sunt dezactivate din 2026-09-10 (decizie Raul Covaci): versionarea se
+face in GitHub, iar arhivele tar.gz ocupau ~17,8 GB pe staging. Crearea si restaurarea intorc
+410 Gone (aceeasi conventie ca la login-ul cu parola). Listarea ramane, ca arhivele ramase sa fie
+vizibile pana la stergere. Rollback-ul de cod se face acum cu `git reset --hard <rev>` — vezi
+DEPLOY.md si mesajul de eroare din deploy-pull.sh.
+
+Dump-urile DB din backups/pre-deploy/ NU sunt afectate: GitHub versioneaza cod, nu date.
 """
 import os
 import re
@@ -30,6 +38,10 @@ APP_DIR = Path("/opt/iris-mailguard")
 SCRIPTS = APP_DIR / "scripts"
 BACKUP_DIR = APP_DIR / "storage" / "backups"
 BACKUP_GLOB = "mailguard_code_*.tar.gz"
+# Snapshot-urile de cod sunt dezactivate — vezi docstring-ul modulului.
+CODE_BACKUPS_ENABLED = False
+_DISABLED_MSG = ("Backup-urile de cod sunt dezactivate — versionarea se face in GitHub. "
+                 "Rollback: git reset --hard <revizie> (vezi DEPLOY.md).")
 ARCHIVE_RE = re.compile(r"^mailguard_code_[0-9]{8}_[0-9]{6}\.tar\.gz$")
 
 # Dirs/files excluded when measuring "latest code change" (mirror backup excludes).
@@ -128,15 +140,19 @@ def list_backups(db: Session = Depends(get_db), _admin=Depends(get_current_admin
         "latest_age_seconds": int(latest_age_s) if latest_age_s is not None else None,
         "fresh": fresh,
         "pending_changes": pending_changes,
-        "schedule": "orar, doar la modificări (via mailguard-cron)",
-        "retention": "3 zile (min 3 păstrate)",
+        "enabled": CODE_BACKUPS_ENABLED,
+        "disabled_reason": None if CODE_BACKUPS_ENABLED else _DISABLED_MSG,
+        "schedule": "dezactivat — versionare în GitHub",
+        "retention": "arhivele rămase se șterg manual; nu se mai creează altele",
         "backups": items,
     }
 
 
 @router.post("/settings/backups/run-now")
 def backup_now(note: str = Query("", max_length=500), admin=Depends(get_current_admin)):
-    """Force-create a backup immediately (bypasses change-detection)."""
+    """DEZACTIVAT — 410 Gone. Versionarea codului se face in GitHub."""
+    if not CODE_BACKUPS_ENABLED:
+        raise HTTPException(410, _DISABLED_MSG)
     try:
         subprocess.Popen(
             [str(SCRIPTS / "backup_code.sh"), "--force", "manual", note, (admin.get("username") or admin.get("email") or "")],
@@ -150,7 +166,14 @@ def backup_now(note: str = Query("", max_length=500), admin=Depends(get_current_
 
 @router.post("/settings/backups/{name}/restore", status_code=202)
 def restore_backup(name: str, reason: str = Query("", max_length=500), db: Session = Depends(get_db), admin=Depends(get_current_admin)):
-    """Restore code from an archive. Creates a pre-restore backup, then restarts the API."""
+    """DEZACTIVAT — 410 Gone.
+
+    Restaurarea dezarhiva cod peste `/opt/iris-mailguard` si repornea serviciul; cu repo-ul in
+    GitHub, calea corecta e `git reset --hard <revizie> && systemctl restart mailguard-api`, care
+    lasa urma in istoric. Lasarea endpoint-ului activ ar fi permis suprascrierea arborelui de
+    lucru cu o arhiva veche, peste git — divergenta tacuta intre server si origin/main."""
+    if not CODE_BACKUPS_ENABLED:
+        raise HTTPException(410, _DISABLED_MSG)
     if not ARCHIVE_RE.match(name):
         raise HTTPException(400, "Nume arhivă invalid")
     arc = BACKUP_DIR / name

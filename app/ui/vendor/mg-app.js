@@ -5077,6 +5077,10 @@ function BackupsPanel() {
     h('pre', { key:'c', style:{ background:'var(--bg2)', padding:10, borderRadius:4, fontSize:12 } }, String(err))
   ]);
   if (!data) return h('div', { className:'card' }, 'Se incarca backup-urile...');
+  // Backup-urile de cod sint dezactivate (versionare in GitHub). Endpoint-urile de creare
+  // si restaurare intorc 410, deci butoanele se ascund; lista ramine, ca arhivele ramase
+  // sa fie vizibile pina la stergerea lor de pe server.
+  const bkEnabled = data.enabled !== false;
   const fresh = data.fresh;
   const badge = h('span', { key:'b', style:{ padding:'2px 10px', borderRadius:10, fontSize:12, fontWeight:600, color:'#fff', background: fresh ? 'var(--gn,#10b981)' : 'var(--yw,#f59e0b)' } }, fresh ? 'La zi' : 'Modificari nesalvate');
 
@@ -5091,16 +5095,21 @@ function BackupsPanel() {
     h('td', { key:'motiv', style:{ padding:'6px 8px', borderBottom:'1px solid var(--bd,#222)', color:'var(--t2)', maxWidth:200, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' } }, bk.restore_reason || h('span',{style:{color:'var(--t3)',fontSize:11}},'—')),
     h('td', { key:5, style:{ padding:'6px 8px', textAlign:'right', borderBottom:'1px solid var(--bd,#222)', whiteSpace:'nowrap' } }, [
       h('button', { key:'w', className:'btn secondary', style:{ padding:'4px 9px', marginRight:6, fontSize:12 }, onClick:()=>openWorklog(bk.name) }, 'Vezi worklog'),
-      h('button', { key:'r', className:'btn', style:{ padding:'4px 9px', fontSize:12, background:'var(--rd)', borderColor:'var(--rd)', color:'#fff' }, disabled:busy, onClick:()=>setConfirmArc(bk.name) }, 'Restaureaza')
+      bkEnabled ? h('button', { key:'r', className:'btn', style:{ padding:'4px 9px', fontSize:12, background:'var(--rd)', borderColor:'var(--rd)', color:'#fff' }, disabled:busy, onClick:()=>setConfirmArc(bk.name) }, 'Restaureaza') : null
     ])
   ]));
 
   return h('div', { className:'card' }, [
     h('div', { key:'hd', style:{ display:'flex', alignItems:'center', gap:10, marginBottom:12, flexWrap:'wrap' } }, [
       h('h2', { key:'h', style:{ margin:0 } }, 'Backup-uri cod aplicatie'),
-      badge,
-      h('button', { key:'bn', className:'btn', style:{ padding:'6px 12px', background:'#2563eb', color:'#fff', border:'1px solid var(--bd)' }, disabled:busy, onClick:doBackupNow }, 'Genereaza backup manual'),
+      bkEnabled ? badge : h('span', { key:'b', style:{ padding:'2px 10px', borderRadius:10, fontSize:12, fontWeight:600, color:'#fff', background:'var(--t3,#6b7280)' } }, 'Dezactivat'),
+      bkEnabled ? h('button', { key:'bn', className:'btn', style:{ padding:'6px 12px', background:'#2563eb', color:'#fff', border:'1px solid var(--bd)' }, disabled:busy, onClick:doBackupNow }, 'Genereaza backup manual') : null,
       h('button', { key:'rl', className:'btn secondary', style:{ marginLeft:'auto', padding:'6px 12px' }, onClick:load }, 'Reincarca')
+    ]),
+    !bkEnabled && h('div', { key:'off', style:{ background:'var(--bg2)', borderLeft:'3px solid var(--t3,#6b7280)', padding:'10px 12px', borderRadius:4, fontSize:13, marginBottom:12, lineHeight:1.5 } }, [
+      h('b', { key:'t' }, 'Backup-urile de cod sunt dezactivate.'), ' ',
+      data.disabled_reason || 'Versionarea se face in GitHub.',
+      h('div', { key:'d', style:{ color:'var(--t2)', marginTop:4 } }, 'Arhivele de mai jos sunt cele ramase — nu se mai creeaza altele. Dump-urile DB de dinainte de deploy raman active si nu sunt afectate.')
     ]),
     msg && h('div', { key:'msg', style:{ background:'var(--bg2)', borderLeft:'3px solid var(--am)', padding:'8px 12px', borderRadius:4, fontSize:13, marginBottom:12 } }, msg),
     h('div', { key:'kpi', style:{ display:'flex', gap:24, flexWrap:'wrap', marginBottom:14, fontSize:13 } }, [

@@ -153,6 +153,30 @@ retroactiv la repornirea filtrului.
 
 ---
 
+## 🗃️ BACKUP-URI — snapshot-urile de COD sunt DEZACTIVATE (2026-09-10)
+
+Versionarea codului = GitHub (`Mailguard_staging`). Arhivele `mailguard_code_*.tar.gz` ocupau
+~17,8 GB pe staging și nu mai au rost.
+
+- `scripts/backup_code.sh` iese imediat dacă `MAILGUARD_CODE_BACKUP != on`. Kill-switch-ul e în
+  **script**, nu în cron — intrarea de cron e pe server, în afara repo-ului, deci un deploy nu o
+  poate opri. Nu-l muta în cron.
+- `POST /settings/backups/run-now` și `.../restore` → **410**. Rollback de cod:
+  `git reset --hard <revizie> && systemctl restart mailguard-api`.
+- Listarea și worklog-ul rămân read-only (`enabled: false`), pentru arhivele rămase.
+
+⛔ **Dump-urile DB rămân active.** `backups/pre-deploy/*.dump` din `deploy-pull.sh` (retenție 3)
+nu au legătură cu decizia asta: GitHub ține cod, nu date, iar migrațiile pot fi ireversibile.
+Nu le dezactiva „pentru simetrie".
+
+⚠️ `app/ui/vendor/mg-app.js.gz` **nu mai e în git** (`.gitignore`). E generat la deploy din
+`mg-app.js`. Nu-l re-adăuga: reapărea ca „modificat" pe server după fiecare deploy și îl bloca pe
+următorul, iar versiunea comitată ajunsese veche cu 4 commituri față de sursă (UI vechi servit din
+`.gz`). Regula din capul fișierului (`gzip -k -6` după `scp`) rămâne validă doar pentru copierile
+manuale de fișier; fluxul normal e `deploy-pull.sh`, care îl regenerează singur.
+
+---
+
 ## 🧠 IRIS DATA VIEWS — sync-ul scrie PE MĂSURĂ ce vin paginile (2026-09-10)
 
 `app/api/v1/iris_dv.py`: `_iter_pages()` (generator, o pagină = 10.000 rânduri) +
@@ -808,7 +832,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.14.1` (staging, 2026-09-10)
+**Versiunea curentă:** `v3.15.0` (staging, 2026-09-10)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:

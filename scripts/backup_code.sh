@@ -13,6 +13,22 @@ LOG="$BACKUP_DIR/backup.log"
 GLOB="mailguard_code_*.tar.gz"
 MIN_INTERVAL_S=3300          # ~55 min: do not re-backup more often than hourly
 
+# ⛔ DEZACTIVAT — 2026-09-10, decizie Raul Covaci.
+# Versionarea codului se face in GitHub (Mailguard_staging); snapshot-urile tar.gz nu mai au rost.
+# Ocupau ~17,8 GB pe staging (6,8 GB in storage/backups + 11 GB in /home/mail-data/backups).
+#
+# De ce kill-switch AICI si nu in cron: intrarea de cron traieste pe SERVER, in afara repo-ului,
+# deci un deploy nu o poate opri. Cat timp scriptul iese devreme, o intrare de cron ramasa (sau
+# reaparuta la o reinstalare) e inofensiva. Scoaterea din crontab ramane de facut, dar nu mai e
+# o conditie de siguranta.
+#
+# NU acopera dump-urile DB din backups/pre-deploy/ — alea raman, GitHub nu tine DATE.
+# Reactivare temporara: MAILGUARD_CODE_BACKUP=on scripts/backup_code.sh --force
+if [ "${MAILGUARD_CODE_BACKUP:-off}" != "on" ]; then
+  echo "$(date -Is) SKIP: backup cod dezactivat (MAILGUARD_CODE_BACKUP != on)" >> "$LOG" 2>/dev/null || true
+  exit 0
+fi
+
 MODE="${1:---auto}"
 REASON="${2:-auto}"
 NOTE="${3:-}"
