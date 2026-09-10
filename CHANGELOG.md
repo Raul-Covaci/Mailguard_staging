@@ -8,6 +8,34 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.3 - 2026-09-10
+
+### MINOR — Apeluri: baza API While1 se descoperă singură (migrare pe host multi-tenant)
+
+While1 mută API-ul de pe hostul dedicat pe unul multi-tenant, dar **nu a comunicat data de cutover**:
+
+    https://cargo.while1.biz/api/   ->   https://voice.while1.biz/tenant/cargo/api/
+
+O tăiere programată nu e posibilă fără dată, iar o tăiere greșită oprește ingestul de apeluri tăcut
+(`sync_run` doar loghează și iese). Ambele baze sunt acum candidate: se încearcă în ordine, câștigă
+cea care răspunde, iar rezultatul se memorează în `settings.while1_api_base`.
+
+- În regim stabil se face **un singur request** — baza memorată e încercată prima, nu se sondează la
+  fiecare apel. La cutover se pierde o singură încercare pe baza veche, apoi se merge direct pe cea
+  nouă.
+- Cu 4 workeri gunicorn, primul eșec invalidează cache-ul local și recitește `settings`, deci
+  workerii convergi fără repornire.
+- Se aplică și la descărcarea audio: `recording_ref` salvat ca URL COMPLET poartă hostul de la
+  momentul ingestului; după cutover ar da 404 pentru totdeauna și rândul ar rămâne blocat pe
+  `audio_status='error'`. Se rescrie acum și pe celelalte baze.
+- Configurabil prin `WHILE1_API_URL` / `WHILE1_API_URL_ALT` (nou). Sufixul `/api` se taie automat,
+  deci se poate lipi URL-ul exact cum vine din emailul While1 — altfel ieșea `/api/api/cdr`.
+- `GET /api/v1/calls/while1-status` (admin) — ce bază e activă, ce candidate există, care se încearcă
+  prima. `active: null` = niciuna confirmată de la ultima repornire. `api_base` apare și în răspunsul
+  de la `sync-now` / `backfill-ring`.
+- Limită de știut: dacă While1 emite și un token nou odată cu hostul, failover-ul nu ajută — ambele
+  baze răspund 401 și `WHILE1_API_TOKEN` trebuie schimbat în `.env` pe server.
+
 ## v3.16.2 - 2026-09-10
 
 ### PATCH — CEMT/COC: numele trimis la CTS conține din nou numărul mașinii

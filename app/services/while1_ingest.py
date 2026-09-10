@@ -7,7 +7,7 @@ cerut separat de la While1/vendor). Până la primirea unui WHILE1_API_TOKEN, is
 e False și sync_run() rămâne no-op sigur.
 
 Contract confirmat:
-  - Listare: POST {WHILE1_API_URL}/api/cdr, body {"page": n, "filters": {...}}, header
+  - Listare: POST {baza}/api/cdr, body {"page": n, "filters": {...}}, header
     Authorization: Bearer <token>. POLLING (NU webhook) — call-analytics interoghează la 300s.
     filters.from_id = cursor incremental (id > from_id); filters.date_between = [start, end]
     ("YYYY-MM-DD HH:MM:SS") pentru backfill istoric (folosit doar la bootstrap, fără cursor).
@@ -31,6 +31,11 @@ Contract confirmat:
     5 min prin cron-ul existent, MAX_PAGES_PER_RUN mic — restul se prinde la următorul tick).
   - Limbă: RO (hardcodat și de call-analytics) — deja setat implicit în iris_transcribe.transcribe().
 
+Baza API: NU e fixă — While1 mută API-ul pe un host multi-tenant fără dată de cutover anunțată
+(`https://cargo.while1.biz/api/` -> `https://voice.while1.biz/tenant/cargo/api/`). Se încearcă
+ambele baze și câștigă cea care răspunde; rezultatul se memorează în settings `while1_api_base`.
+Vezi DEFAULT_API_BASES + `request()`. Verificare din afară: `GET /api/v1/calls/while1-status`.
+
 Cursor: settings key 'while1_last_id' (ultimul While1 `id` numeric procesat, folosit ca
 filters.from_id). La bootstrap (fără cursor încă), backfill ultimele 24h prin filters.date_between.
 
@@ -51,23 +56,146 @@ from app.database import SessionLocal
 logger = logging.getLogger("mailguard.while1")
 
 CURSOR_KEY = "while1_last_id"
+ACTIVE_BASE_KEY = "while1_api_base"   # baza care a raspuns ultima data (settings)
 DEFAULT_TIMEOUT = 30.0   # confirmat Razvan: call-analytics foloseste timeout 30s la CDR
 MAX_PAGES_PER_RUN = 5    # plafon siguranta per ciclu cron (5 min) — restul se prinde la tick-ul urmator
 
+# ── Migrarea While1 pe host multi-tenant (anunt vendor, 2026-09) ─────────────────────────────
+# While1 muta API-ul de pe hostul dedicat pe unul multi-tenant:
+#     https://cargo.while1.biz/api/  ->  https://voice.while1.biz/tenant/cargo/api/
+# DATA cutover-ului nu a fost comunicata, deci nu se poate face o taiere programata. Solutia:
+# ambele baze sunt candidate, se incearca in ordine si castiga cea care RASPUNDE. Baza castigatoare
+# se memoreaza in `settings` (ACTIVE_BASE_KEY), deci in regim stabil se face UN singur request —
+# nu se sondeaza la fiecare apel. Cand cutover-ul chiar se intampla, primul ciclu de sync pierde o
+# incercare pe baza veche, invata noua baza si de acolo merge direct pe ea.
+# Dupa ce vechiul host e stins definitiv, se poate reduce lista la una singura — pana atunci
+# NU scoate niciuna: nu stim care e activa la un moment dat.
+DEFAULT_API_BASES = ("https://cargo.while1.biz", "https://voice.while1.biz/tenant/cargo")
+
 _NO_RECORDING_STATUSES = {"NOANSWER", "BUSY", "FAILED"}
+
+# Cache per proces al bazei active (evita o interogare in `settings` la fiecare request).
+_active_base_cache = None
+_active_base_loaded = False
+
+
+def _norm_base(u: str) -> str:
+    """Normalizeaza o baza de API: fara '/' final si FARA sufixul '/api'.
+
+    Anuntul While1 da URL-ul cu `/api/` la capat (`.../tenant/cargo/api/`), iar codul adauga el
+    ruta (`/api/cdr`, `/tools/play-record`). Fara taierea asta, o valoare copiata din email in
+    `WHILE1_API_URL` ar produce `/api/api/cdr`."""
+    b = (u or "").strip().rstrip("/")
+    if b.lower().endswith("/api"):
+        b = b[:-4]
+    return b.rstrip("/")
 
 
 def _cfg():
+    bases = []
+    for raw in (os.getenv("WHILE1_API_URL", "") or DEFAULT_API_BASES[0],
+                os.getenv("WHILE1_API_URL_ALT", "") or DEFAULT_API_BASES[1]):
+        b = _norm_base(raw)
+        if b and b not in bases:
+            bases.append(b)
     return {
-        "url": os.getenv("WHILE1_API_URL", "https://cargo.while1.biz").strip().rstrip("/"),
+        # `url` = baza probabila ACUM (cea memorata, altfel prima configurata). Ramane pentru
+        # apelantii care compun un URL singular (ex. call_audio._resolve_download_url).
+        "url": (_active_base(bases) or (bases[0] if bases else "")),
+        "bases": bases,
         "token": os.getenv("WHILE1_API_TOKEN", "").strip(),
         "key": os.getenv("WHILE1_API_KEY", "").strip(),
     }
 
 
+def _active_base(bases):
+    """Baza memorata ca functionala, daca mai e printre cele configurate."""
+    global _active_base_cache, _active_base_loaded
+    if not _active_base_loaded:
+        try:
+            _active_base_cache = _norm_base(_setting_get(ACTIVE_BASE_KEY) or "") or None
+        except Exception:
+            _active_base_cache = None
+        _active_base_loaded = True
+    if _active_base_cache and _active_base_cache in bases:
+        return _active_base_cache
+    return None
+
+
+def _remember_base(base: str):
+    """Persista baza care a raspuns. Scrie DOAR la schimbare (nu la fiecare request)."""
+    global _active_base_cache, _active_base_loaded
+    if _active_base_cache == base and _active_base_loaded:
+        return
+    _active_base_cache, _active_base_loaded = base, True
+    try:
+        _setting_set(ACTIVE_BASE_KEY, base)
+        logger.info("while1: baza API activa -> %s", base)
+    except Exception:
+        logger.warning("while1: nu am putut salva baza activa %s", base)
+
+
+def _forget_base():
+    """Invalideaza cache-ul local. Cu 4 workeri gunicorn, altul poate fi invatat deja noua baza si
+    a scris-o in `settings`; recitirea la prima eroare face convergenta fara repornire."""
+    global _active_base_loaded
+    _active_base_loaded = False
+
+
+def api_bases(c=None) -> list:
+    """Bazele candidate, in ordinea de incercare: intai cea care a raspuns ultima data."""
+    c = c or _cfg()
+    bases = list(c.get("bases") or [])
+    act = _active_base(bases)
+    if act:
+        bases.remove(act)
+        bases.insert(0, act)
+    return bases
+
+
+def request(method: str, path: str, c=None, **kw):
+    """Request While1 cu failover pe bazele candidate. `path` incepe cu '/' (ex. '/api/cdr').
+
+    Ridica eroarea PRIMEI incercari daca niciuna nu raspunde — aia e baza asteptata, deci mesajul
+    ei e cel relevant in log."""
+    c = c or _cfg()
+    bases = api_bases(c)
+    if not bases:
+        raise RuntimeError("While1: nicio baza de API configurata")
+    first_err = None
+    for i, base in enumerate(bases):
+        try:
+            r = httpx.request(method, base + path, **kw)
+            r.raise_for_status()
+            _remember_base(base)
+            return r
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+            if i == 0:
+                _forget_base()   # poate alt worker stie deja baza corecta
+            if i + 1 < len(bases):
+                logger.warning("while1: %s%s a esuat (%s) — incerc %s",
+                               base, path, str(e)[:120], bases[i + 1])
+    raise first_err
+
+
 def is_configured() -> bool:
     c = _cfg()
-    return bool(c["url"] and c["token"])
+    return bool(c["bases"] and c["token"])
+
+
+def api_status() -> dict:
+    """Ce baza While1 e activa acum si care sunt candidatele — pentru diagnostic din UI/API, fara
+    SSH pe server. Nu face niciun request; raporteaza doar starea invatata."""
+    c = _cfg()
+    bases = api_bases(c)
+    return {
+        "configured": is_configured(),
+        "active": _active_base(c["bases"]),          # None = inca nu s-a confirmat niciuna
+        "candidates": bases,
+        "next_try": bases[0] if bases else None,
+    }
 
 
 def _setting_get(k) -> Optional[str]:
@@ -129,8 +257,9 @@ def _fetch_cdr_page(c, page: int, since_id=None, date_from=None, date_to=None):
     if c.get("key"):
         body["api_hash"] = hashlib.md5((_php_build_query(body) + c["key"]).encode()).hexdigest()
     headers = {"Authorization": "Bearer " + c["token"]}
-    r = httpx.post(c["url"] + "/api/cdr", json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
+    # `request` incearca bazele candidate (host vechi + host multi-tenant) si o retine pe cea care
+    # raspunde — vezi DEFAULT_API_BASES.
+    r = request("POST", "/api/cdr", c=c, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
     data = r.json()
     if data.get("has_error"):
         raise RuntimeError("While1 CDR error: %s" % data.get("messages"))
@@ -299,6 +428,7 @@ def sync_run(limit: int = 200) -> dict:
         db.close()
 
     out = {"ok": True, "fetched": fetched, "inserted": inserted, "pages": page,
+           "api_base": api_bases(c)[0] if api_bases(c) else None,
            "ms": int((time.time() - t0) * 1000)}
     logger.info("while1 sync: %s", out)
     return out
@@ -355,6 +485,8 @@ def backfill_ring_seconds(date_from: str, date_to: str, max_pages: int = 400) ->
         db.close()
 
     out = {"ok": True, "from": date_from, "to": date_to, "fetched": fetched,
-           "touched": touched, "pages": page, "ms": int((time.time() - t0) * 1000)}
+           "touched": touched, "pages": page,
+           "api_base": api_bases(c)[0] if api_bases(c) else None,
+           "ms": int((time.time() - t0) * 1000)}
     logger.info("while1 backfill ring_seconds: %s", out)
     return out

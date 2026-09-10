@@ -41,22 +41,57 @@ def host_path(storage_path: str):
     return real
 
 
-def _resolve_download_url(c, recording_ref: str) -> str:
-    """recording_ref e fie URL complet (recording_url / monitor_urls), fie un id de fisier
-    care necesita URL-ul de fallback (play-record). Confirmat de Razvan."""
-    if recording_ref.startswith("http"):
-        return recording_ref
-    return "%s/tools/play-record?monitor=%s&download=1&fname=%s" % (
-        c["url"], recording_ref, recording_ref)
+def _download_urls(c, recording_ref: str) -> list:
+    """URL-urile de incercat pentru un recording_ref, in ordinea probabilitatii.
+
+    `recording_ref` e fie URL complet (recording_url / monitor_urls), fie un id de fisier care cere
+    URL-ul de fallback (play-record). Confirmat de Razvan.
+
+    While1 muta API-ul pe host multi-tenant fara data anuntata (vezi `while1_ingest`), deci:
+      * id de fisier -> se compune pe FIECARE baza candidata;
+      * URL complet -> se incearca asa cum a venit, apoi rescris pe celelalte baze. Un `recording_ref`
+        salvat acum cateva zile poarta hostul VECHI; dupa cutover ar da 404 pentru totdeauna, iar
+        randul ar ramane blocat in audio_status='error'."""
+    bases = while1_ingest.api_bases(c)
+    if not recording_ref.startswith("http"):
+        return [(b, "%s/tools/play-record?monitor=%s&download=1&fname=%s"
+                 % (b, recording_ref, recording_ref)) for b in bases]
+    src = next((b for b in bases if recording_ref.startswith(b + "/")), None)
+    urls = [(src, recording_ref)]
+    if src:
+        for b in bases:
+            if b != src:
+                alt = b + recording_ref[len(src):]
+                if alt not in [u for _, u in urls]:
+                    urls.append((b, alt))
+    return urls
 
 
 def _download_one(c, call_id: str, recording_ref: str) -> str:
     """Descarcă mp3-ul de la While1 pentru un apel. Returnează path-ul absolut pe disc.
     Ridică excepție daca raspunsul e sub MIN_VALID_BYTES (fara inregistrare reala)."""
     headers = {"Authorization": "Bearer " + c["token"]}
-    url = _resolve_download_url(c, recording_ref)
-    r = httpx.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, follow_redirects=True)
-    r.raise_for_status()
+    urls = _download_urls(c, recording_ref)
+    if not urls:
+        raise RuntimeError("While1: nicio baza de API configurata")
+    r, first_err = None, None
+    for i, (base, url) in enumerate(urls):
+        try:
+            r = httpx.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, follow_redirects=True)
+            r.raise_for_status()
+            if base:
+                # Un download reusit pe baza `base` e dovada ca ACOLO e API-ul activ.
+                while1_ingest._remember_base(base)
+            break
+        except Exception as e:
+            r = None
+            if first_err is None:
+                first_err = e
+            if i + 1 < len(urls):
+                logger.warning("call_audio: %s a esuat (%s) — incerc baza urmatoare",
+                               url.split("?")[0], str(e)[:120])
+    if r is None:
+        raise first_err
     if len(r.content) < MIN_VALID_BYTES:
         raise RuntimeError("raspuns sub %dB — fara inregistrare reala / auth esuat" % MIN_VALID_BYTES)
     fname = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id) + ".mp3"

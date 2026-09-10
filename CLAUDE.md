@@ -299,6 +299,33 @@ viitoare (`_refresh_open_snapshots` din `employees.py`); pentru lunile închise 
 
 ---
 
+## ☎️ WHILE1 — baza API se DESCOPERĂ, nu se hardcodează (2026-09-10)
+
+While1 mută API-ul de pe hostul dedicat pe unul multi-tenant, **fără dată de cutover comunicată**:
+`https://cargo.while1.biz/api/` → `https://voice.while1.biz/tenant/cargo/api/`.
+
+Ambele baze sunt candidate (`while1_ingest.DEFAULT_API_BASES`, suprascriptibile prin
+`WHILE1_API_URL` / `WHILE1_API_URL_ALT`). `while1_ingest.request()` le încearcă în ordine și o
+memorează în `settings.while1_api_base` pe cea care răspunde — în regim stabil se face UN singur
+request, nu se sondează la fiecare apel. Diagnostic fără SSH: `GET /api/v1/calls/while1-status`.
+
+⛔ **Nu tăia lista la una singură până când vechiul host nu e stins definitiv** — nu știm care e
+activă la un moment dat, iar o tăiere greșită oprește ingestul de apeluri tăcut (`sync_run` doar
+loghează și iese, nu ridică).
+
+⚠️ Baza se normalizează cu `_norm_base`: se taie `/` final **și** sufixul `/api`, fiindcă anunțul
+vendorului dă URL-ul cu `/api/` la capăt iar codul adaugă el ruta (`/api/cdr`,
+`/tools/play-record`). Fără asta, o valoare copiată din email produce `/api/api/cdr`.
+
+⚠️ `recording_ref` salvat la ingest poate fi un URL COMPLET pe hostul VECHI. După cutover ar da 404
+pentru totdeauna, deci `call_audio._download_urls()` îl rescrie și pe celelalte baze. Un download
+reușit pe o bază compusă confirmă baza activă (`_remember_base`).
+
+⚠️ Dacă While1 emite token NOU odată cu hostul nou, failover-ul NU ajută: ambele baze răspund 401 și
+ingestul se oprește. Se schimbă `WHILE1_API_TOKEN` în `.env` pe server (nu e în repo).
+
+---
+
 ## ⏱️ PRODUCTIVITATE — fereastra de timp = PONTAJ (2026-08-19)
 
 Minutele de lucru (SLA mailuri/task-uri/apeluri/operațiuni) se numără pe **acoperirea

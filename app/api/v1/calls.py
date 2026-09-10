@@ -226,6 +226,17 @@ def calls_sync_now(limit: int = Query(200, ge=1, le=1000)):
     return while1_ingest.sync_run(limit=limit)
 
 
+@router.get("/calls/while1-status")
+def calls_while1_status(admin=Depends(get_current_admin)):
+    """Ce baza de API While1 raspunde acum (host vechi vs. host multi-tenant).
+
+    While1 muta API-ul fara data de cutover anuntata, deci codul incearca ambele baze si o retine pe
+    cea care raspunde. Endpointul asta arata rezultatul invatat, ca sa se poata verifica migrarea
+    fara SSH pe server. `active: null` = inca nu a raspuns niciuna de la ultima repornire."""
+    from app.services import while1_ingest
+    return while1_ingest.api_status()
+
+
 @router.post("/calls/backfill-ring")
 def calls_backfill_ring(date_from: str = Query(..., description="'YYYY-MM-DD' sau 'YYYY-MM-DD HH:MM:SS'"),
                         date_to: str = Query(..., description="'YYYY-MM-DD' sau 'YYYY-MM-DD HH:MM:SS'"),
