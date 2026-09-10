@@ -763,6 +763,21 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         LEFT JOIN employee_department_mapping edm
           ON lower(g.cts_assignee_email) = lower(edm.email)
     """
+    # ── RESTANȚĂ: deschis ACUM, dar sosit ÎNAINTE de azi ────────────────────────────────────
+    # Un mail/task din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09 (cerere
+    # business owner, 2026-09-10). NU se amestecă însă în barele „Noi"/„În lucru": acelea rămân pe
+    # ziua curentă, fiindcă exact amestecul lor cu restanța istorică a dus la limitarea din
+    # 2026-08-13 (CTS lasă tichete deschise la nesfârșit — Financiar avea 769 'new', unele din
+    # martie). Restanța e o BARĂ SEPARATĂ, deci nimic nu se pierde și nimic nu se contaminează.
+    # Sosirea NULL intră tot la restanță: nu poate fi de azi, iar un rând deschis nu are voie să
+    # dispară din monitor doar fiindcă îi lipsește data (join LEFT pe `emails`).
+    _EMAIL_BEFORE_TODAY = (f"({_EMAIL_ARRIVED_LOCAL} IS NULL "
+                           f"OR DATE({_EMAIL_ARRIVED_LOCAL}) < CURRENT_DATE)")
+    _EMAIL_OPEN_STATES = "g.cts_status IN ('new','in progress')"
+    _TASK_BEFORE_TODAY = (f"(t.cts_created_at IS NULL "
+                          f"OR DATE(t.cts_created_at AT TIME ZONE '{_TZ}') < CURRENT_DATE)")
+    _TASK_OPEN_STATES = "t.status IN ('new','postponed','in progress')"
+
     # Expresia de departament efectiv, refolosita in GROUP BY / WHERE.
     _EFF_DEPT_EMAIL = "COALESCE(g.cts_department, edm.department)"
     _dep_email_w = f"AND {_EFF_DEPT_EMAIL} = ANY(:depts)"
@@ -796,7 +811,8 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             COUNT(*) FILTER (WHERE g.cts_status = 'in progress'
                              AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS in_lucru,
             COUNT(*) FILTER (WHERE g.cts_status = 'new'
-                             AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS noi
+                             AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS noi,
+            COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND {_EMAIL_BEFORE_TODAY})           AS restanta
         FROM cts_ground_truth g
         {_dep_email}
         {_J_EMAIL_EXCL}
@@ -819,7 +835,8 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             COUNT(*) FILTER (WHERE t.status = 'in progress'
                              AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS in_progress,
             COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
-                             AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS pending
+                             AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)  AS pending,
+            COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY})              AS restanta
         FROM {_SRC_TASK} t
         {_dep_task}
         WHERE {_EFF_DEPT_TASK} = ANY(:depts)
@@ -1241,7 +1258,9 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    COUNT(*) FILTER (WHERE g.cts_status = 'new'
                                     AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE)                AS noi,
                    COUNT(*) FILTER (WHERE {_EMAIL_ARRIVED_LOCAL} IS NOT NULL
-                                    AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE) AS intrate_azi
+                                    AND DATE({_EMAIL_ARRIVED_LOCAL}) = CURRENT_DATE) AS intrate_azi,
+                   COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES}
+                                    AND {_EMAIL_BEFORE_TODAY})                       AS restanta
             FROM cts_ground_truth g
             LEFT JOIN employee_department_mapping edm
               ON lower(g.cts_assignee_email) = lower(edm.email)
@@ -1251,7 +1270,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
               AND COALESCE(g.cts_department, edm.department) = ANY(:depts)
               AND {_EMAIL_EXCLUDE_SQL}
             GROUP BY 1
-        """, 4)
+        """, 5)
 
         d_task = _by_dept(f"""
             SELECT COALESCE(t.department, edm.department) AS dept,
@@ -1261,13 +1280,14 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                                     AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)   AS in_progress,
                    COUNT(*) FILTER (WHERE t.status IN ('new','postponed')
                                     AND DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE)   AS noi,
-                   COUNT(*) FILTER (WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS intrate_azi
+                   COUNT(*) FILTER (WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS intrate_azi,
+                   COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY})     AS restanta
             FROM {_SRC_TASK} t
             LEFT JOIN employee_department_mapping edm
               ON t.assignee_employee_id = edm.id
             WHERE COALESCE(t.department, edm.department) = ANY(:depts)
             GROUP BY 1
-        """, 4)
+        """, 5)
 
         # Apeluri per departament — aceeași sursă (`calls`) și exact aceleași filtre ca `call_row`,
         # deci suma cardurilor = contorul de grup. Atribuirea e a agentului din centrală
@@ -1356,24 +1376,27 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
             GROUP BY 1
         """, 6)
 
-        _z4, _z3, _z2 = (0, 0, 0, 0), (0, 0, 0, 0, 0, 0), (0, 0)
+        # `_z5` = zero-ul pentru mail/task (5 coloane, ultima e `restanta`).
+        _z5, _z3, _z2 = (0, 0, 0, 0, 0), (0, 0, 0, 0, 0, 0), (0, 0)
         per_dept = [
             {
                 "department": d,
                 # chei păstrate pentru compatibilitate cu orice consumator existent
-                "rezolvate_azi": d_mail.get(d, _z4)[0],
-                "in_lucru":      d_mail.get(d, _z4)[1],
+                "rezolvate_azi": d_mail.get(d, _z5)[0],
+                "in_lucru":      d_mail.get(d, _z5)[1],
                 "emailuri": {
-                    "rezolvate_azi": d_mail.get(d, _z4)[0],
-                    "in_lucru":      d_mail.get(d, _z4)[1],
-                    "noi":           d_mail.get(d, _z4)[2],
-                    "intrate_azi":   d_mail.get(d, _z4)[3],
+                    "rezolvate_azi": d_mail.get(d, _z5)[0],
+                    "in_lucru":      d_mail.get(d, _z5)[1],
+                    "noi":           d_mail.get(d, _z5)[2],
+                    "intrate_azi":   d_mail.get(d, _z5)[3],
+                    "restanta":      d_mail.get(d, _z5)[4],
                 },
                 "taskuri": {
-                    "rezolvate_azi": d_task.get(d, _z4)[0],
-                    "in_progress":   d_task.get(d, _z4)[1],
-                    "noi":           d_task.get(d, _z4)[2],
-                    "intrate_azi":   d_task.get(d, _z4)[3],
+                    "rezolvate_azi": d_task.get(d, _z5)[0],
+                    "in_progress":   d_task.get(d, _z5)[1],
+                    "noi":           d_task.get(d, _z5)[2],
+                    "intrate_azi":   d_task.get(d, _z5)[3],
+                    "restanta":      d_task.get(d, _z5)[4],
                 },
                 "apeluri": {
                     "azi":           d_call.get(d, _z2)[0],
@@ -1406,17 +1429,20 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         "group": group,
         # `in_lucru` / `noi` / `in_progress` / `pending` = doar din ce a sosit AZI (vezi nota de
         # la email_row). `rezolvate_azi` a fost mereu pe ziua curentă.
+        # `restanta` = deschis acum, sosit ÎNAINTE de azi — bară separată, fără limită de vechime.
         "emailuri": {
             "rezolvate_azi": int(email_row[0] or 0),
             "in_lucru":      int(email_row[1] or 0),
             "noi":           int(email_row[2] or 0),
             "intrate_azi":   int(mail_in_azi or 0),
+            "restanta":      int(email_row[3] or 0),
         },
         "taskuri": {
             "rezolvate_azi": int(task_row[0] or 0),
             "in_progress":   int(task_row[1] or 0),
             "pending":       int(task_row[2] or 0),
             "intrate_azi":   int(task_in_azi or 0),
+            "restanta":      int(task_row[3] or 0),
         },
         "apeluri": {
             "azi":           int(call_row[0] or 0),

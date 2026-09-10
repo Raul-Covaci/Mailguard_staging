@@ -14024,25 +14024,33 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
 
   // Culoare pe STARE, nu pe categorie: soluționat = verde, în lucru = galben, nou = albastru.
   // Aceeași stare are aceeași culoare peste toate categoriile, deci se citește dintr-o privire.
-  var C_DONE = 'var(--gn)', C_WIP = 'var(--yw)', C_NEW = 'var(--bl)';
+  // Restanța (deschis din zilele trecute) are culoare proprie, gri-albastru: nu e o stare a zilei,
+  // deci nu are voie să concureze vizual cu barele care descriu ziua curentă.
+  var C_DONE = 'var(--gn)', C_WIP = 'var(--yw)', C_NEW = 'var(--bl)', C_OLD = 'var(--t3)';
 
   // `icon` + `accent`: badge per categorie, ca secțiunile să se distingă dintr-o privire pe un
   // monitor de perete. Iconițele vin din MonitorIcon (line-style, stroke=currentColor) — fără
   // emoji, conform regulilor de design. Accentul colorează DOAR badge-ul categoriei; barele
   // rămân colorate pe stare (verde/galben/albastru), ca lectura să nu devină ambiguă.
-  // Toate cifrele sunt pe ZIUA CURENTĂ: „Soluționate" = închise azi, „În lucru" / „Noi" = din
-  // ce a SOSIT azi, cât e încă deschis (backend, 2026-08-13). Înainte, stările deschise se
-  // numărau fără limită de vechime și cardul arăta restanța istorică din CTS, nu ziua.
+  // „Soluționate" = închise azi; „În lucru" / „Noi" = din ce a SOSIT azi, cât e încă deschis
+  // (backend, 2026-08-13 — înainte, stările deschise se numărau fără limită de vechime și cardul
+  // arăta restanța istorică din CTS, nu ziua).
+  // „Restanță" (2026-09-10) = deschis ACUM, sosit înainte de azi, fără limită de vechime: un mail
+  // din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09. Stă pe bară SEPARATĂ tocmai
+  // ca să nu se repete greșeala de dinainte de 2026-08-13 — amestecat în „Noi", un tichet abandonat
+  // din martie ar arăta ca muncă a zilei.
   var groups = [
     { name: 'Mail-uri', icon: 'mail', accent: 'var(--am)', azi: true, bars: [
       { label: 'Soluționate', v: em.rezolvate_azi || 0, c: C_DONE },
       { label: 'În lucru',    v: em.in_lucru || 0,      c: C_WIP },
-      { label: 'Noi',         v: em.noi || 0,           c: C_NEW }
+      { label: 'Noi',         v: em.noi || 0,           c: C_NEW },
+      { label: 'Restanță',    v: em.restanta || 0,      c: C_OLD, old: true }
     ]},
     { name: 'Task-uri', icon: 'task', accent: 'var(--bl)', azi: true, bars: [
       { label: 'Soluționate', v: tk.rezolvate_azi || 0, c: C_DONE },
       { label: 'În lucru',    v: tk.in_progress || 0,   c: C_WIP },
-      { label: 'Noi',         v: tk.noi || tk.pending || 0, c: C_NEW }
+      { label: 'Noi',         v: tk.noi || tk.pending || 0, c: C_NEW },
+      { label: 'Restanță',    v: tk.restanta || 0,      c: C_OLD, old: true }
     ]},
     // Apeluri: sursa e centrala (While1), aceeași cu pagina Apeluri (v2.12.0). „Răspunse" numără
     // conversații reale, nu legs de ring/transfer de 0-1s. „Pierdute" = apeluri la care nimeni
@@ -14071,6 +14079,9 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
   var totalSolutionatAzi = (em.rezolvate_azi || 0) + (tk.rezolvate_azi || 0) + (ap.azi || 0);
   // „Deschis" numără doar ce a intrat azi și n-a fost încă închis — nu restanța istorică.
   var totalDeschis = (em.in_lucru || 0) + (tk.in_progress || 0);
+  // Restanța, pe toate canalele: deschis acum, sosit înainte de azi. Se afișează separat de
+  // „Deschis din azi" — sunt seturi disjuncte, nu se însumează într-o singură cifră.
+  var totalRestanta = (em.restanta || 0) + (tk.restanta || 0);
   // Ritmul se raportează la VOLUMUL INTRAT azi (intrate_azi), nu la câte au rămas în starea
   // 'new'. Barele „Noi" arată restanța neatinsă; numitorul de aici trebuie să fie tot ce a
   // sosit azi, altfel ritmul iese absurd (166 rezolvate / 1 nou = 16600%).
@@ -14086,12 +14097,20 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
 
   var summary = [
     { k: 'Soluționat azi',  v: totalSolutionatAzi.toLocaleString('ro-RO'), c: C_DONE },
-    { k: 'Deschis din azi', v: totalDeschis.toLocaleString('ro-RO'),       c: C_WIP }
+    { k: 'Deschis azi',     v: totalDeschis.toLocaleString('ro-RO'),       c: C_WIP },
+    { k: 'Restanță',        v: totalRestanta.toLocaleString('ro-RO'),      c: C_OLD }
   ];
 
-  // maxim pe card, minim 1 ca să nu împărțim la zero când totul e 0
-  var maxV = 1;
-  groups.forEach(function(g){ g.bars.forEach(function(b){ if (b.v > maxV) maxV = b.v; }); });
+  // Maxim pe card, minim 1 ca să nu împărțim la zero când totul e 0.
+  // DOUĂ scale, nu una: restanța e cumulativă și fără limită de vechime, deci poate fi de două
+  // ordine de mărime peste cifrele zilei (Financiar avea 769 'new' restante față de ~5 pe zi).
+  // Pe o scală comună, toate barele zilei s-ar turti la pragul minim de 3% și cardul ar deveni
+  // ilizibil exact pe informația principală. Barele `old` se scalează între ele.
+  var maxV = 1, maxOld = 1;
+  groups.forEach(function(g){ g.bars.forEach(function(b){
+    if (b.old) { if (b.v > maxOld) maxOld = b.v; }
+    else if (b.v > maxV) maxV = b.v;
+  }); });
 
   var atins = fc ? fc.obiectiv_atins : null;
   var real  = fc ? fc.obiectiv_real  : null;
@@ -14141,13 +14160,14 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
               // Marcaj de fereastră, DOAR pe grupurile care sunt integral pe ziua curentă.
               // Reclamațiile nu îl primesc: acolo „Deschise" rămâne pe tot istoricul, iar un
               // „AZI" pe secțiune ar eticheta greșit exact cifra care nu e a zilei.
-              g.azi ? h('span', { key: 'w', style: { marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: 'var(--t3)', letterSpacing: '0.08em' } }, 'AZI') : null
+              g.azi ? h('span', { key: 'w', style: { marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: 'var(--t3)', letterSpacing: '0.08em' } },
+                g.bars.some(function(b){ return b.old; }) ? 'AZI + REST.' : 'AZI') : null
             ]),
             h('div', { key: 'r', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
               g.bars.map(function(b){
                 // La 0 lăsăm bara complet golă (fără ciot colorat), dar cifra "0" rămâne mereu
                 // afișată — un card fără apeluri azi trebuie să arate 0, nu spațiu gol.
-                var pct = b.v > 0 ? Math.max(3, 100 * b.v / maxV) : 0;
+                var pct = b.v > 0 ? Math.max(3, 100 * b.v / (b.old ? maxOld : maxV)) : 0;
                 return h('div', { key: b.label, style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
                   h('span', { key: 'l', style: { fontSize: 13.5, fontWeight: 600, color: 'var(--t2)', width: 92, flexShrink: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, b.label),
                   h('div', { key: 'tr', style: { flex: 1, height: 14, background: 'var(--bg3)', borderRadius: 4, overflow: 'hidden', minWidth: 0 } },
@@ -14171,7 +14191,9 @@ function MonitorDeptCard({ fc, live, cardStyle, cardHdr }) {
       // Toate se derivă din datele deja aduse, deci nu costă nicio cerere în plus.
       h('div', { key: 'sum', style: {
         flexShrink: 0, marginTop: 10, paddingTop: 9, borderTop: '1px solid var(--bd)',
-        display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 6
+        // 3 coloane de cand exista si „Restanta" (2026-09-10). Cu `repeat(2, ...)` a treia cifra
+        // ar cadea pe un rand nou, singura si decentrata.
+        display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 6
       } }, summary.map(function(s){
         return h('div', { key: s.k, style: { textAlign: 'center', minWidth: 0 } }, [
           h('div', { key: 'v', style: { fontSize: 20, fontWeight: 800, color: s.c, fontVariantNumeric: 'tabular-nums', lineHeight: 1.1 } }, s.v),

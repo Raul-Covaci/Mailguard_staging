@@ -8,6 +8,36 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.4 - 2026-09-10
+
+### MINOR — Monitor operațional: bară nouă „Restanță" (deschis din zilele trecute)
+
+Un mail sau task din 02.09 rămas în `new` / `in progress` nu apărea nicăieri pe monitorul din 03.09:
+stările deschise erau filtrate strict pe ce a sosit AZI (limită pusă pe 2026-08-13). Munca
+nefinalizată devenea invizibilă peste noapte.
+
+Reportarea NU se face însă în barele existente, ci pe o **bară separată**, fiindcă exact amestecul
+lor a fost problema pentru care s-a pus limita: CTS lasă tichete deschise la nesfârșit, iar la
+momentul deciziei Financiar avea 769 'new' + 351 'postponed', unele din martie — cifre care nu spun
+nimic despre ziua curentă.
+
+- `noi` / `în lucru` rămân pe ziua curentă; `Restanță` = deschis acum, sosit înainte de azi, **fără
+  limită de vechime**. Orice rând deschis e numărat exact o dată: `noi + în lucru + restanță` = total
+  deschise. Verificat pe scenariul din cerere (02.09 → 03.09) plus rulaj peste noapte.
+- Se aplică la mail-uri (`new`, `in progress`) și task-uri (`new`, `postponed`, `in progress`), atât
+  în contorul de grup cât și în cardurile per departament, cu aceleași predicate — deci suma
+  cardurilor rămâne egală cu totalul.
+- Chei noi în răspuns: `emailuri.restanta`, `taskuri.restanta` (și în `per_dept`). Aditive.
+- Un rând deschis cu dată de sosire NULL intră la restanță în loc să dispară (join LEFT pe `emails`).
+- Rezumatul cardului are acum 3 cifre: „Soluționat azi", „Deschis azi", „Restanță" — seturi
+  disjuncte, afișate separat, nu însumate.
+- UI: barele au două scale. Restanța e cumulativă și poate fi cu două ordine de mărime peste cifrele
+  zilei; pe o scală comună toate barele zilei s-ar fi turtit la pragul minim de 3%, exact pe
+  informația principală. Marcajul de secțiune devine „AZI + REST." acolo unde există bara nouă —
+  un „AZI" deasupra restanței ar fi fost greșit.
+- Neschimbate, deliberat: graficul pe ore (o restanță din zilele trecute nu are oră de azi) și
+  numitorul „Ritm" (`intrate_azi` e un debit al zilei, nu un stoc).
+
 ## v3.16.3 - 2026-09-10
 
 ### MINOR — Apeluri: baza API While1 se descoperă singură (migrare pe host multi-tenant)

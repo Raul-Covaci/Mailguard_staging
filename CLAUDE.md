@@ -326,6 +326,37 @@ ingestul se oprește. Se schimbă `WHILE1_API_TOKEN` în `.env` pe server (nu e 
 
 ---
 
+## 📺 MONITOR OPERAȚIONAL — ziua curentă și RESTANȚA sunt bare separate (2026-09-10)
+
+`GET /productivity/monitor/live` are DOUĂ ferestre pe stările deschise, deliberat:
+
+- `noi` / `in_lucru` / `in_progress` / `pending` = **doar ce a sosit AZI** și e încă deschis
+  (decizie 2026-08-13). Fără limita asta, CTS lasă tichete deschise la nesfârșit (notificări
+  automate, tichete abandonate) și monitorul de perete arăta o restanță istorică pe care nimeni
+  n-o mai lucrează: Suport 1 avea 26 'new', din care doar 3 din ultimele 7 zile.
+- `restanta` = **deschis ACUM, sosit înainte de azi, fără limită de vechime** (cerere 2026-09-10:
+  un mail din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09).
+
+⛔ **Nu le uni într-un singur contor.** Cele două cerințe se contrazic doar dacă se amestecă:
+separate, orice rând deschis e numărat exact o dată (`noi` + `in_lucru` + `restanta` = total
+deschise) și un tichet din martie nu se mai deghizează în muncă a zilei. Predicatele sunt fragmente
+locale în `get_monitor_live` — `_EMAIL_BEFORE_TODAY` / `_EMAIL_OPEN_STATES` /
+`_TASK_BEFORE_TODAY` / `_TASK_OPEN_STATES` — refolosite de contorul de grup ȘI de cel per
+departament, ca suma cardurilor să rămână egală cu totalul.
+
+⚠️ Sosirea NULL intră la `restanta`, nu se aruncă: join-ul pe `emails` e LEFT, iar un rând deschis
+nu are voie să dispară din monitor doar fiindcă îi lipsește data.
+
+⚠️ **Barele au DOUĂ scale în UI** (`MonitorDeptCard`, `maxV` / `maxOld`). Restanța e cumulativă și
+poate fi cu două ordine de mărime peste cifrele zilei (Financiar: 769 restante vs. ~5/zi); pe scală
+comună toate barele zilei s-ar turti la pragul minim de 3%. Nu reunifica scalele.
+
+⚠️ Graficul pe ore rămâne pe ce a SOSIT azi (`h_mail_open` / `h_task_open`) — o restanță din zilele
+trecute nu are oră de azi, deci nu poate fi pusă pe axă. Idem numitorul „Ritm" (`intrate_azi`):
+e un debit al zilei, nu un stoc.
+
+---
+
 ## ⏱️ PRODUCTIVITATE — fereastra de timp = PONTAJ (2026-08-19)
 
 Minutele de lucru (SLA mailuri/task-uri/apeluri/operațiuni) se numără pe **acoperirea
