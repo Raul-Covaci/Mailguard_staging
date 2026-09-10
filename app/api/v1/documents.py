@@ -513,6 +513,119 @@ _RO_COUNTY = {
 }
 
 
+# Cheile sub care poate ajunge placa/tara in `data` (numele campurilor sunt configurate per tip
+# din UI, deci variaza: „Licence Plate (A.)", „Nr. inmatriculare", „Vehicle registration number",
+# „Licence Plates List"). Sursa UNICA — folosita si la mostenirea de la documentele-frate.
+# `registration` NU se accepta singur: taloanele au „Date of first registration (B.)" — o data ar
+# ajunge in numele fisierului. Se cere un cuvant care indica numarul, nu evenimentul.
+_PLATE_FIELD_PATTERNS = (r"licence plate", r"license plate", r"inmatricul", r"\bplate\b",
+                         r"registration\s*(?:no\b|nr\b|number|mark)", r"\blpn\b",
+                         r"\bplac[a\u0103]\b", r"kennzeichen", r"\(a\.\)")
+_COUNTRY_FIELD_PATTERNS = (r"\bcountry\b", r"\b[t\u021b][a\u0103\u00e2]r[a\u0103]\b",
+                           r"\bstat\b")
+
+
+def _single_plate(val):
+    """O SINGURA placa dintr-o valoare de camp. Campurile de tip „Licence Plates List" contin o
+    lista („B 123 ABC, TM 45 DEF") — cu mai multe placi distincte nu se poate alege, deci None."""
+    if val is None:
+        return None
+    parts = [x.strip() for x in _re.split(r"[,;/]| si | and ", str(val)) if x.strip()]
+    if not parts:
+        return None
+    norm = {_re.sub(r"[^A-Z0-9]", "", x.upper()) for x in parts}
+    norm.discard("")
+    if len(norm) != 1:
+        return None
+    only = next(iter(norm))
+    # Garda anti-data / anti-numar simplu: o placa are si litere, si cifre. Fara ea, un camp cu
+    # nume ambiguu (data, serie) ar ajunge in numele trimis la CTS.
+    if not (_re.search(r"[A-Z]", only) and _re.search(r"\d", only)):
+        return None
+    return parts[0]
+
+
+# Etichete care preced numarul de inmatriculare in documentele de vehicul (RO/EN/DE/FR).
+_PLATE_LABEL_RE = _re.compile(
+    r"(nr\.?\s*(?:de\s*)?inmatricular|num[aă]r\s*(?:de\s*)?inmatricular|inmatricular"
+    r"|licence\s*plate|license\s*plate|plate\s*n|registration\s*(?:no|number|mark|plate)"
+    r"|kennzeichen|amtliches\s*kennzeichen|immatriculation)", _re.IGNORECASE)
+
+# Placa RO: 1-2 litere judet + 2-3 cifre + 3 litere. Judetul se valideaza pe `_RO_COUNTY`, altfel
+# OCR-ul produce potriviri false (coduri de norma, serii de formular).
+_RO_PLATE_RE = _re.compile(r"\b([A-Z]{1,2})[\s\-\.]?(\d{2,3})[\s\-\.]?([A-Z]{3})\b")
+
+
+def _plates_in_text(txt):
+    """[(placa, pozitie)] — toate placile RO plauzibile din text, in ordinea aparitiei."""
+    out = []
+    for m in _RO_PLATE_RE.finditer((txt or "").upper()):
+        if m.group(1) in _RO_COUNTY:
+            out.append((m.group(1) + m.group(2) + m.group(3), m.start()))
+    return out
+
+
+def _plate_from_text(raw_text):
+    """Numarul de inmatriculare dedus din textul OCR al documentului, sau None.
+
+    Necesar pentru CEMT/COC: familia `EC` nu are (mereu) un camp de placa in `extract_fields`, deci
+    `data` vine fara placa si numele ajungea fara numarul masinii (`RO__EC_01` / numele tipului).
+    Reguli, in ordine:
+      1) placa care urmeaza cel mai aproape dupa o eticheta („Nr. inmatriculare", „Licence plate"…);
+      2) daca nu exista eticheta, placa UNICA din document;
+      3) mai multe placi distincte fara eticheta -> None (ambiguu: remorca/lista de vehicule).
+    Doar formatul RO — o placa straina nu poate fi validata si un nume gresit e mai rau decat
+    fallback-ul pe AI."""
+    cands = _plates_in_text(raw_text)
+    if not cands:
+        return None
+    up = (raw_text or "").upper()
+    best, best_gap = None, None
+    for m in _PLATE_LABEL_RE.finditer(up):
+        for plate, pos in cands:
+            gap = pos - m.end()
+            if 0 <= gap <= 60 and (best_gap is None or gap < best_gap):
+                best, best_gap = plate, gap
+    if best:
+        return best
+    distinct = {p for p, _ in cands}
+    return distinct.pop() if len(distinct) == 1 else None
+
+
+def _sibling_unique_plate(db, email_id, att_id):
+    """Placa+tara mostenite de la celelalte documente ale ACELUIASI email, doar cand emailul
+    contine o SINGURA masina. Ultima plasa de siguranta pentru CEMT-urile fara placa in text
+    (autorizatia e pe operator); la un email cu mai multe vehicule se renunta, ca sa nu lipim
+    placa altei masini."""
+    try:
+        rows = db.execute(text(
+            "SELECT data FROM document_extractions "
+            "WHERE email_id=:e AND attachment_id<>:a AND data IS NOT NULL"
+        ), {"e": email_id, "a": att_id}).fetchall()
+    except Exception:
+        logger.exception("sibling_unique_plate att=%s", att_id)
+        return None, None
+    found = {}
+    for (sd,) in rows:
+        if isinstance(sd, str):
+            try:
+                sd = json.loads(sd)
+            except Exception:
+                continue
+        if not isinstance(sd, dict):
+            continue
+        pl = _field_val(sd, *_PLATE_FIELD_PATTERNS)
+        pl = _single_plate(pl)
+        if not pl:
+            continue
+        key = _re.sub(r"[^A-Z0-9]", "", str(pl).upper())
+        if key:
+            found.setdefault(key, _field_val(sd, *_COUNTRY_FIELD_PATTERNS))
+    if len(found) != 1:
+        return None, None
+    return next(iter(found.items()))
+
+
 def _vehicle_doc_code(detected_type):
     """(TIP, NRDOC) standard pt un document de inmatriculare vehicul, altfel None.
     CIV/Carte -> (VP,01); Talon/cert. inmatriculare -> (VP,02); CEMT -> (EC,01); COC -> (EC,02)."""
@@ -528,23 +641,30 @@ def _vehicle_doc_code(detected_type):
     return None
 
 
-def _vehicle_std_name(db, email_id, att_id, part_no, detected_type, data):
+def _vehicle_std_name(db, email_id, att_id, part_no, detected_type, data, raw_text=None):
     """Numele standardizat al unui document de VEHICUL construit DETERMINIST din datele DEJA
     extrase (placa/tara/VIN) — fara apel AI. Format: TARA_PLACA_TIP_NRDOC.
-    - CIV fara placa proprie -> mosteneste placa+tara de la fratele cu acelasi VIN din email.
     - non-RO familia VP (un singur doc de inmatriculare) -> fara NRDOC: TARA_PLACA_VP.
     - familia EC (CEMT/COC) pastreaza NRDOC si la tarile non-RO.
-    Returneaza str sau None (=> nu e doc de vehicul / lipsesc datele -> fallback la AI)."""
+    Returneaza str sau None (=> nu e doc de vehicul / lipsesc datele -> fallback la AI).
+
+    Placa se cauta pe patru trepte, in ordinea increderii — CEMT/COC nu au (mereu) un camp de placa
+    in `extract_fields`, deci treapta 1 nu le acopera si numele pleca spre CTS fara numarul masinii:
+      1) campurile extrase ale documentului (`data`);
+      2) fratele cu ACELASI VIN din email (CIV fara placa proprie);
+      3) textul OCR al documentului (`_plate_from_text`, ancorat pe eticheta);
+      4) placa UNICA a celorlalte documente din email (doar cand emailul are o singura masina).
+    """
     import re as _re
     code = _vehicle_doc_code(detected_type)
     if not code:
         return None
     tip, nrdoc = code
     data = data if isinstance(data, dict) else {}
-    plate = _field_val(data, r"licence plate", r"inmatricul", r"\bplate\b", r"\(a\.\)")
-    tara = _field_val(data, r"\bcountry\b", r"\btara\b", r"\bstat\b")
+    plate = _single_plate(_field_val(data, *_PLATE_FIELD_PATTERNS))
+    tara = _field_val(data, *_COUNTRY_FIELD_PATTERNS)
     vin = _field_val(data, r"\bvin\b", r"sasiu", r"chassis", r"\(e\.\)")
-    # CIV (si orice doc de vehicul fara placa proprie): mosteneste de la fratele cu acelasi VIN.
+    # (2) CIV (si orice doc de vehicul fara placa proprie): fratele cu acelasi VIN.
     if (not plate) and vin and email_id is not None:
         try:
             sib = db.execute(text(
@@ -558,10 +678,20 @@ def _vehicle_std_name(db, email_id, att_id, part_no, detected_type, data):
                 if isinstance(sd, str):
                     sd = json.loads(sd)
                 if isinstance(sd, dict):
-                    plate = _field_val(sd, r"licence plate", r"inmatricul", r"\(a\.\)") or plate
-                    tara = tara or _field_val(sd, r"\bcountry\b", r"\btara\b")
+                    plate = _single_plate(_field_val(sd, *_PLATE_FIELD_PATTERNS)) or plate
+                    tara = tara or _field_val(sd, *_COUNTRY_FIELD_PATTERNS)
         except Exception:
             logger.exception("vehicle sibling-plate att=%s", att_id)
+    # (3) textul documentului — calea principala pentru CEMT/COC.
+    if not plate:
+        plate = _plate_from_text(raw_text)
+        if plate:
+            tara = tara or "RO"     # `_plate_from_text` valideaza judetul, deci placa e romaneasca
+    # (4) placa unica a emailului (autorizatie emisa pe operator, fara placa in text).
+    if (not plate) and email_id is not None:
+        sib_plate, sib_tara = _sibling_unique_plate(db, email_id, att_id)
+        if sib_plate:
+            plate, tara = sib_plate, (tara or sib_tara)
     if not plate:
         return None
     placa = _re.sub(r"[^A-Z0-9]", "", str(plate).upper())  # BH-08-TBM -> BH08TBM
@@ -623,7 +753,8 @@ def _rename_doc(db, att_id: int, part_no: int, tip_document: str, raw_text: str,
     # 1) Cale DETERMINISTA pentru documentele de vehicul (placa e deja in `data`).
     renamed = None
     try:
-        renamed = _vehicle_std_name(db, email_id, att_id, part_no, tip_document, data)
+        renamed = _vehicle_std_name(db, email_id, att_id, part_no, tip_document, data,
+                                    raw_text=raw_text)
     except Exception:
         logger.exception("vehicle_std_name att=%s part_no=%s", att_id, part_no)
 
@@ -2869,7 +3000,9 @@ def _derive_part_name(t, data):
     cat = (t.get("category") or "").lower()
     nm = (t.get("name") or "").strip()
     nml = nm.lower()
-    plate = _normalize_ro_plate(_field_val(data, r"licence plate", r"inmatricul", r"\bplate\b", r"\(a\.\)"))
+    # Aceleasi chei ca la numele standardizat (`_PLATE_FIELD_PATTERNS`) — eticheta de parte si
+    # numele final trebuie sa vada aceeasi placa, altfel diverg cand redenumirea AI esueaza.
+    plate = _normalize_ro_plate(_single_plate(_field_val(data, *_PLATE_FIELD_PATTERNS)))
     vin = _field_val(data, r"\bvin\b", r"sasiu", r"chassis", r"\(e\.\)")
     nume = _field_val(data, r"\bnume\b", r"surname", r"last ?name", r"family ?name")
     prenume = _field_val(data, r"prenume", r"first ?name", r"given ?name")
@@ -3347,8 +3480,16 @@ def _reclassify_part(db, att, part_row, catalog):
     db.commit()
     # Nume 'gata procesat' si pe calea de reclasificare (altfel partile reclasificate ar pastra
     # eticheta interna TIP_<id> in loc de numele standard). Vehicul -> determinist din `data`.
+    # `raw_text` NU se recalculeaza aici (OCR-ul e scump), dar cel salvat la extragerea initiala e
+    # tot ce are `_vehicle_std_name` ca sa deduca placa la CEMT/COC. Gol = numele ar pleca spre CTS
+    # fara numarul masinii.
     try:
-        _rename_doc(db, att["id"], part_row.get("part_no", 0), tmap[tid]["name"], "",
+        _rt = db.execute(text("SELECT raw_text FROM document_extractions WHERE id=:id"),
+                         {"id": part_row["id"]}).scalar()
+    except Exception:
+        _rt = None
+    try:
+        _rename_doc(db, att["id"], part_row.get("part_no", 0), tmap[tid]["name"], _rt or "",
                     att.get("name"), data=data, email_id=att.get("email_id"))
     except Exception:
         logger.exception("rename_doc(reclassify) att=%s part=%s", att.get("id"), part_row.get("id"))
@@ -3756,6 +3897,19 @@ def _extract_group(db, primary_id) -> str:
          "m": (method_used or "group")[:30], "mo": (emodel or "")[:80] or None,
          "err": (eerr or "")[:1000] or None, "cs": cs})
     db.commit()
+    # Numele standardizat NU se refacea dupa extragerea pe grup: primarul ramanea cu `renamed_file`
+    # de dinainte de grupare (sau gol) si exact acel camp pleaca la CTS. Textul COMBINAT e sursa
+    # corecta — la un talon fata/verso placa poate fi pe oricare pagina.
+    if status in ("extracted", "classified") and t:
+        try:
+            _meta = db.execute(text(
+                "SELECT d.part_no, a.email_id, a.name FROM document_extractions d "
+                "JOIN attachments a ON a.id=d.attachment_id WHERE d.id=:id"), {"id": primary_id}).fetchone()
+            if _meta:
+                _rename_doc(db, prim["attachment_id"], int(_meta[0] or 0), t.get("name"),
+                            combined, _meta[2], data=data, email_id=_meta[1])
+        except Exception:
+            logger.exception("rename_doc(group) primary=%s", primary_id)
     return status
 
 
@@ -4641,6 +4795,14 @@ def reidentify_extraction(ex_id: int, type_id: int = None, db: Session = Depends
              "econf": econf, "emeth": emeth,
              "w": (admin.get("username") or admin.get("email"))})
         db.commit()
+        # Tipul ales manual schimba numele standardizat (ex. „Autorizatie CEMT" -> RO_..._EC_01),
+        # dar redenumirea nu se refacea aici: `renamed_file` ramanea cel de la tipul GRESIT si exact
+        # el pleaca la CTS. Calea automata (`_save_extraction`) o facea deja.
+        try:
+            _rename_doc(db, att["id"], int(att.get("_pno") or 0), t["name"], doc_text,
+                        att.get("name"), data=data, email_id=att.get("email_id"))
+        except Exception:
+            logger.exception("rename_doc(reidentify manual) ex_id=%s", ex_id)
     else:
         status = _process_attachment(db, att, force=True)
     out = db.execute(text(

@@ -8,6 +8,45 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.2 - 2026-09-10
+
+### PATCH — CEMT/COC: numele trimis la CTS conține din nou numărul mașinii
+
+Documentele din familia `EC` (CEMT, COC) plecau spre CTS fără număr de înmatriculare
+(`Autorizatia_CEMT.pdf` în loc de `RO_BH01BIA_EC_01.pdf`). Cauza: numele determinist
+(`_vehicle_std_name`) citea placa DOAR din câmpurile extrase, iar tipurile CEMT/COC nu au un câmp de
+placă în `extract_fields` — autorizația e emisă pe operator, numărul mașinii apare doar în corpul
+documentului. Fără placă, funcția returna `None` și numele cădea pe promptul AI, care nu avea de unde
+să-l scoată.
+
+Placa se caută acum pe patru trepte, în ordinea încrederii:
+1. câmpurile extrase ale documentului (`data`) — neschimbat;
+2. documentul-frate cu ACELAȘI VIN din email — neschimbat (CIV fără placă proprie);
+3. **nou** — textul OCR al documentului (`_plate_from_text`): placa care urmează cel mai aproape
+   după o etichetă („Nr. înmatriculare", „Licence plate", „Kennzeichen"…); fără etichetă, doar dacă
+   documentul conține o SINGURĂ placă;
+4. **nou** — placa unică a celorlalte documente din email, doar când emailul are o singură mașină.
+
+- Se acceptă doar formatul RO validat pe codul de județ (`_RO_COUNTY`). O placă străină nu poate fi
+  verificată, iar un nume greșit trimis la CTS e mai rău decât fallback-ul pe AI.
+- Ambiguitatea oprește deducția: două plăci distincte fără etichetă (cap tractor + remorcă, listă de
+  vehicule) sau un email cu mai multe mașini → se cade pe AI, nu se ghicește.
+Trei căi care ocoleau complet redenumirea (numele vechi sau gol pleca la CTS):
+- **tip ales manual** (`POST /documents/extractions/{id}/reidentify?type_id=`) — schimba tipul și
+  re-extrăgea, dar `renamed_file` rămânea cel al tipului GREȘIT. Cel mai vizibil exact pe CEMT:
+  operatorul corecta tipul din UI și numele nu se schimba.
+- **extragere pe grup** (`_extract_group`, talon față/verso și autogrupare) — primarul păstra numele
+  de dinaintea grupării. Redenumirea folosește acum textul COMBINAT al grupului: la un talon
+  față/verso placa poate fi pe oricare pagină.
+- **reclasificare automată** (`_reclassify_part`) trimitea `raw_text=""` la redenumire, deci treapta
+  3 ar fi fost moartă acolo; acum citește textul salvat la extragerea inițială.
+- Cheile de placă/țară erau scrise inline în trei locuri, cu variante diferite; sunt acum în
+  `_PLATE_FIELD_PATTERNS` / `_COUNTRY_FIELD_PATTERNS` (o singură sursă) și acoperă în plus
+  „Registration number", „LPN", „Kennzeichen", „Țara".
+- Gardă nouă la valorile de listă („Licence Plates List" = `B 123 ABC, TM 45 DEF`): cu mai multe
+  plăci distincte nu se alege niciuna. Și o gardă anti-dată — o placă are și litere, și cifre —
+  ca un câmp de tip „Date of first registration" să nu ajungă în numele fișierului.
+
 ## v3.16.1 - 2026-09-11
 
 ### PATCH — concediile celor cu „start productivitate" în viitor scad orele disponibile
