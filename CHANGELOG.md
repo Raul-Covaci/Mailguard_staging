@@ -8,6 +8,25 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.15.1 - 2026-09-10
+
+### PATCH — 500 la adăugarea de concedii manuale (`:param::tip` nu e bind param în SQLAlchemy)
+
+`POST/PUT /settings/employees/{id}/schedule` întorceau 500: SQL-ul folosea `:s::date` / `:e::date`.
+Regexul SQLAlchemy pentru bind params — `(?<![:\w\\]):(\w+)(?!:)` — refuză un nume urmat de `:`,
+deci `:s` NU era înlocuit, iar textul `:s::date` ajungea literal la Postgres → syntax error.
+Nu se putea adăuga/edita niciun concediu manual din Utilizatori.
+
+- Fix: peste tot `CAST(:param AS tip)` în loc de `:param::tip` (forma deja folosită în
+  `iris_employee_sync.py`, motiv pentru care sync-ul CTS scria corect).
+- Aceeași greșeală, reparată și în: `feedback_config.update_defaults` (`:v::json`),
+  `feedback_campaigns` create/update (`:kpi_ids::jsonb`), `productivity_notifier`
+  (`:v::jsonb` la `productivity.last_monthly_sent`, `:d::jsonb` la audit-ul
+  `productivity_report_sent` — explică audit_log gol din incidentul 2026-08-03).
+- În plus, `IntegrityError` → **409** (nu 500) la adăugare/editare: `employee_schedule_uidx` e pe
+  (employee_id, kind, leave_type, start_date, end_date), **fără** `entry_source`, deci un rând CTS
+  cu același interval coliziona cu intrarea manuală.
+
 ## v3.15.0 - 2026-09-10
 
 ### MINOR — snapshot-urile de COD sunt dezactivate (versionarea trece pe GitHub)

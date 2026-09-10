@@ -150,8 +150,8 @@ def get_defaults(db: Session = Depends(get_db), admin=Depends(get_current_admin)
 def update_defaults(body: dict, db: Session = Depends(get_db), admin=Depends(get_current_admin)):
     db.execute(text("""
         INSERT INTO settings (key, value, updated_at)
-        VALUES ('feedback.defaults', to_jsonb(:v::json), now())
-        ON CONFLICT (key) DO UPDATE SET value = to_jsonb(:v::json), updated_at = now()
+        VALUES ('feedback.defaults', to_jsonb(CAST(:v AS json)), now())
+        ON CONFLICT (key) DO UPDATE SET value = to_jsonb(CAST(:v AS json)), updated_at = now()
     """), {"v": json.dumps(body)})
     db.commit()
     return body

@@ -142,7 +142,7 @@ def _mark_sent(db: Session) -> None:
     val = f"{today.year}-{today.month:02d}"
     db.execute(
         text("INSERT INTO settings(key, value, updated_by, updated_at) "
-             "VALUES('productivity.last_monthly_sent', :v::jsonb, 'cron', now()) "
+             "VALUES('productivity.last_monthly_sent', CAST(:v AS jsonb), 'cron', now()) "
              "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_by='cron', updated_at=now()"),
         {"v": json.dumps(val)},
     )
@@ -677,7 +677,7 @@ def send_monthly_reports(db: Session) -> dict:
             try:
                 db.execute(
                     text("INSERT INTO audit_log(action, actor, details, created_at) "
-                         "VALUES('productivity_report_sent', 'cron', :d::jsonb, now())"),
+                         "VALUES('productivity_report_sent', 'cron', CAST(:d AS jsonb), now())"),
                     {"d": json.dumps({"group": group, "recipients": recipients,
                                       "month": f"{prev_year}-{prev_month:02d}",
                                       "depts": depts, "sent": len(recipients)})},

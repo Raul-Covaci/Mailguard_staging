@@ -268,7 +268,7 @@ def create_campaign(body: CampaignCreate, db: Session = Depends(get_db), admin=D
     row = db.execute(text(f"""
         INSERT INTO feedback_campaigns
             (name, segment_id, kpi_ids, sample_size, frequency, day_of_month, active)
-        VALUES (:name, :segment_id, :kpi_ids::jsonb, :sample_size, :frequency, :day_of_month, :active)
+        VALUES (:name, :segment_id, CAST(:kpi_ids AS jsonb), :sample_size, :frequency, :day_of_month, :active)
         RETURNING {_CAMPAIGN_COLUMNS}
     """), params).fetchone()
     db.commit()
@@ -291,7 +291,7 @@ def update_campaign(campaign_id: int, body: CampaignUpdate, db: Session = Depend
     merged["kpi_ids"] = json.dumps(merged["kpi_ids"])
     db.execute(text("""
         UPDATE feedback_campaigns
-        SET name=:name, segment_id=:segment_id, kpi_ids=:kpi_ids::jsonb, sample_size=:sample_size,
+        SET name=:name, segment_id=:segment_id, kpi_ids=CAST(:kpi_ids AS jsonb), sample_size=:sample_size,
             frequency=:frequency, day_of_month=:day_of_month, active=:active, updated_at=now()
         WHERE id=:id
     """), {**merged, "id": campaign_id})

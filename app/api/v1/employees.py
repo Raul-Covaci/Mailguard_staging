@@ -11,6 +11,7 @@ Căile rămân neschimbate (/api/v1/settings/employees...) ca să nu rupem UI-ul
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -130,11 +131,18 @@ def add_employee_leave(emp_id: int, body: dict, db: Session = Depends(get_db), _
     ), {"eid": emp_id, "k": kind, "s": start, "e": end}).fetchone()
     if existing:
         raise HTTPException(409, "Există deja un concediu manual pentru același interval")
-    row = db.execute(text(
-        "INSERT INTO employee_schedule (employee_id, kind, start_date, end_date, status, days, raw, entry_source) "
-        "VALUES (:eid, :k, :s::date, :e::date, :st, :d, '{}', 'manual') RETURNING id"
-    ), {"eid": emp_id, "k": kind, "s": start, "e": end, "st": status, "d": days}).fetchone()
-    db.commit()
+    # employee_schedule_uidx e pe (employee_id, kind, leave_type, start_date, end_date) — FARA
+    # entry_source. Deci un rand CTS cu acelasi kind+interval coliziona aici cu 500; verificarea
+    # de mai sus vede doar intrarile manuale.
+    try:
+        row = db.execute(text(
+            "INSERT INTO employee_schedule (employee_id, kind, start_date, end_date, status, days, raw, entry_source) "
+            "VALUES (:eid, :k, CAST(:s AS date), CAST(:e AS date), :st, :d, '{}', 'manual') RETURNING id"
+        ), {"eid": emp_id, "k": kind, "s": start, "e": end, "st": status, "d": days}).fetchone()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Există deja o intrare pentru același interval (posibil importată din CTS)")
     return {"id": row[0], "employee_id": emp_id, "kind": kind, "start_date": start, "end_date": end,
             "status": status, "days": days, "entry_source": "manual"}
 
@@ -156,11 +164,15 @@ def update_employee_leave(emp_id: int, sid: int, body: dict, db: Session = Depen
         raise HTTPException(400, "start_date și end_date sunt obligatorii")
     if start > end:
         raise HTTPException(400, "start_date trebuie să fie <= end_date")
-    db.execute(text(
-        "UPDATE employee_schedule SET kind=:k, start_date=:s::date, end_date=:e::date, "
-        "status=:st, days=:d WHERE id=:sid"
-    ), {"k": kind, "s": start, "e": end, "st": status, "d": days, "sid": sid})
-    db.commit()
+    try:
+        db.execute(text(
+            "UPDATE employee_schedule SET kind=:k, start_date=CAST(:s AS date), end_date=CAST(:e AS date), "
+            "status=:st, days=:d WHERE id=:sid"
+        ), {"k": kind, "s": start, "e": end, "st": status, "d": days, "sid": sid})
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Există deja o intrare pentru același interval (posibil importată din CTS)")
     return {"id": sid, "employee_id": emp_id, "kind": kind, "start_date": start, "end_date": end,
             "status": status, "days": days, "entry_source": "manual"}
 
