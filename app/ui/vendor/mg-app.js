@@ -1451,11 +1451,12 @@ var OA_CRIT = [
 ];
 var OA_SKIP_LABEL = {
   no_pair: 'Fără mailul original (nu s-a putut împerechea)',
-  no_reply_text: 'Fără textul răspunsului',
+  no_reply_text: 'Fără textul răspunsului (se reîncearcă la rularea următoare)',
   too_short: 'Răspuns prea scurt',
   auto_reply: 'Răspuns automat la „solved"',
   client_excluded: 'Client exclus din rapoarte',
-  ai_error: 'Eroare la apelul AI'
+  no_operator: 'Operator neidentificat (fără tichet primit / adresă nemapată)',
+  ai_error: 'Eroare la apelul AI (se reîncearcă la rularea următoare)'
 };
 function oaScoreColor(v) {
   if (v == null) return 'var(--t3)';
@@ -1517,9 +1518,13 @@ function CtsOperatorAnalysis() {
   // Progresul jobului: se interoghează cât timp rulează, apoi se reîncarcă raportul.
   useEffect(function() {
     if (!job || !running) return;
+    // O eroare izolată de rețea nu oprește urmărirea — jobul rulează pe server, nu în pagină.
+    // Renunțăm abia după 5 eșecuri consecutive (~20s), ca să nu rămână butonul blocat la infinit.
+    var fails = 0;
     var t = setInterval(function() {
       api('/cts-training/operator-analysis/run/status?job_id=' + job)
         .then(function(st) {
+          fails = 0;
           setJobStat(st);
           if (st.status !== 'running') {
             clearInterval(t); setRunning(false);
@@ -1529,7 +1534,13 @@ function CtsOperatorAnalysis() {
                 : ('Analiza s-a oprit: ' + (st.reason || st.status)), 6000);
             load();
           }
-        }).catch(function() { clearInterval(t); setRunning(false); });
+        }).catch(function() {
+          fails += 1;
+          if (fails >= 5) {
+            clearInterval(t); setRunning(false);
+            mgToast('error', 'Nu mai pot citi progresul analizei. Reîncarcă pagina.', 6000);
+          }
+        });
     }, 4000);
     return function() { clearInterval(t); };
   }, [job, running]);

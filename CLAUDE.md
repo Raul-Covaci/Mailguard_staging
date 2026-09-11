@@ -85,7 +85,9 @@ răspuns trimis de operator) e notată 1-5 pe 5 criterii: corectitudine lingvist
 
 - Prompt: **`app/services/prompts/emails/operator_eval.txt`** — SINGURA sursă, citită direct din
   repo (tiparul `satisfaction_trajectory_v6.txt`). NU există cache în DB și nici script de sync;
-  modificarea se face în fișier + deploy.
+  modificarea se face în fișier + deploy. Fișierul se taie la marcajul `Email client:`
+  (`build_messages`): partea de sus = `system`, partea de jos cu variabilele înlocuite = `content`
+  — ca la scorarea apelurilor, și fiindcă `iris_ai` plafonează/trunchiază doar `content`.
 - Motor: `app/services/operator_email_eval.py` (`coverage()`, `start_job()`, `run_job()`,
   `pair_received()`). Rezultate: `email_operator_evaluations`
   (`migrations/20260912_operator_email_eval.sql`).
@@ -118,7 +120,18 @@ folosită și de `GET /cts-training/sent-body`. Întâi `raw->'extra'->>'msid'` 
 `emails.email_headers->>'message_id'` (exact), apoi euristica destinatar + subiect normalizat.
 `match_by` se persistă pe fiecare evaluare; euristica se poate stinge din config. Răspunsurile fără
 pereche NU se evaluează (promptul are nevoie de ambele texte pentru „acoperirea sesizării") — se
-scriu cu `skipped_reason`, ca să nu fie reîncercate la fiecare rulare.
+scriu cu `skipped_reason`.
+
+⚠️ **Doar motivele PERMANENTE opresc reîncercarea** (`no_pair`, `too_short`, `auto_reply`,
+`client_excluded`, `no_operator`). `no_reply_text` și `ai_error` sunt tranzitorii — o pană de câteva
+minute a gateway-ului nu are voie să scoată mailurile alea din raport pentru totdeauna, deci rămân
+candidate la rulările următoare.
+
+⚠️ **Operatorul vine de pe tichetul PRIMIT, găsit prin `msid`, nu prin `message_id`.**
+`message_id`-ul unui rând `sent` e Message-ID-ul mailului NOSTRU (host `@cts.cargotrack.ro` — chiar
+asta îl face `_is_sent` să-l clasifice ca trimis), deci nu se potrivește cu niciun tichet primit. O
+căutare pe `message_id` întoarce zero rânduri și golește TOT raportul, tăcut. Rezervă: tichetul
+primit al mailului împerecheat, pe `email_id` (populat doar pe rândurile primite).
 
 ⚠️ Textele se curăță cu `category_classifier._email_body` (HTML + tăierea istoricului citat).
 Fără tăiere, modelul ar evalua mailul clientului — citat sub răspuns — ca și cum l-ar fi scris

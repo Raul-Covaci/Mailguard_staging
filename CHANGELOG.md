@@ -8,6 +8,43 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.21.1 - 2026-09-12
+
+### PATCH — Analiza Operatori: patru defecte găsite la verificarea modulului
+
+Niciunul nu apărea la compilare; primul ar fi golit complet raportul.
+
+**1. Operatorul nu s-ar fi identificat niciodată.** Tichetul PRIMIT (singurul care poartă
+`cts_assignee_email`) era căutat după `message_id`-ul rândului TRIMIS. Dar `message_id`-ul unui
+rând `sent` e Message-ID-ul mailului NOSTRU, cu host `@cts.cargotrack.ro` — chiar semnalul după
+care `_is_sent` îl clasifică drept trimis. Nu se potrivește cu niciun tichet primit, deci
+căutarea întorcea zero rânduri, fiecare evaluare rămânea fără operator și tabelul per operator ar
+fi fost gol. Legătura corectă e `raw->'extra'->>'msid'`; ca rezervă, tichetul primit al mailului
+împerecheat, pe `email_id` (populat doar pe rândurile primite).
+
+**2. Apeluri AI irosite pe rânduri neatribuibile.** Fără operator identificat, evaluarea nu are
+unde să fie agregată — raportul e per operator. Acum perechea se sare cu `no_operator`, înainte de
+apelul AI, nu după.
+
+**3. Advisory lock-ul se putea pierde.** Lock-ul e legat de conexiune, iar sesiunea de lucru face
+commit după fiecare rând — un commit returnează conexiunea în pool, deci `pg_advisory_unlock` ar fi
+putut pleca pe altă conexiune și lăsa lock-ul agățat până la reciclarea celei vechi (blocând toate
+rulările următoare). Lock-ul stă acum pe o sesiune dedicată, care nu comite niciodată — tiparul din
+`calls_pipeline._run_pipeline`.
+
+**4. Urmărirea progresului se oprea la prima interogare.** Starea jobului se scria abia după
+advisory lock + selecția candidaților, iar UI-ul întreabă de status la 4 secunde — primea 404 și
+renunța definitiv. Starea inițială se scrie acum sincron, înainte de pornirea firului, iar UI-ul
+renunță abia după 5 eșecuri consecutive.
+
+Corectate în același pas: motivele tranzitorii (`no_reply_text`, `ai_error`) se reîncearcă la
+rulările următoare, doar cele permanente rămân definitive — altfel o pană de câteva minute a
+gateway-ului ar fi scos mailurile alea din raport pentru totdeauna; departamentul cade pe cel
+curent când lipsește intervalul istoric (altfel angajatul dispărea din orice filtrare);
+`clients.iris_client_id` (bigint) se compară pe text cu `raw.extra.client_id`, ca un `client_id`
+ne-numeric din feed să nu arunce eroare de cast; iar promptul se taie la marcajul `Email client:`
+în `system` (instrucțiuni) + `content` (cele două texte), ca la scorarea apelurilor.
+
 ## v3.21.0 - 2026-09-12
 
 ### MINOR — „Analiza Operatori": evaluarea AI a răspunsurilor pe email
@@ -36,7 +73,8 @@ fost sărite tăcut.
 
 Se evaluează **doar perechile sigure** (Message-ID exact sau subiect normalizat + expeditor).
 Restul se scriu cu motiv (`no_pair`, `no_reply_text`, `too_short`, `auto_reply`, `client_excluded`,
-`ai_error`) și se raportează separat — un rând scris o dată nu se reîncearcă la fiecare rulare.
+`no_operator`, `ai_error`) și se raportează separat. Motivele permanente opresc reîncercarea;
+`no_reply_text` și `ai_error` sunt tranzitorii și rămân candidate la rulările următoare.
 Împerecherea are acum **o singură implementare** (`operator_email_eval.pair_received`), folosită și
 de `GET /cts-training/sent-body`, care avea o copie locală.
 

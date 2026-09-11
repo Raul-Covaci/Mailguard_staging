@@ -168,7 +168,17 @@ WITH sent AS (
               g.id ASC
 )
 SELECT s.* FROM sent s
- WHERE NOT EXISTS (SELECT 1 FROM email_operator_evaluations ev WHERE ev.cts_gt_id = s.id {force})
+ WHERE NOT EXISTS (
+         SELECT 1 FROM email_operator_evaluations ev
+          WHERE ev.cts_gt_id = s.id
+            -- Se sare doar ce e DEFINITIV: evaluat, sau sarit dintr-un motiv permanent. Motivele
+            -- TRANZITORII (gateway CTS picat la aducerea corpului, eroare la apelul AI) raman
+            -- candidate la rulari viitoare — altfel o pana de cateva minute ar scoate mailurile
+            -- alea din raport pentru totdeauna.
+            AND (ev.score_general IS NOT NULL
+                 OR ev.skipped_reason IN ('no_pair', 'too_short', 'auto_reply',
+                                          'client_excluded', 'no_operator'))
+            {force})
  ORDER BY s.ref_at DESC
  LIMIT :lim
 """
@@ -179,8 +189,12 @@ def _candidates(db, date_from, date_to, limit, force=False):
     return db.execute(text(sql), {"df": date_from, "dt": date_to, "lim": limit}).mappings().all()
 
 
-# Tichetul PRIMIT (acelasi `message_id`) — de acolo vin operatorul, clientul si marcajul de
-# auto-reply. Randul trimis nu are assignee; `raw->'extra'->>'msid'` leaga cele doua tichete.
+# Tichetul PRIMIT — de acolo vin operatorul, clientul si marcajul de auto-reply.
+#
+# ⛔ Se cauta pe `msid`, NU pe `message_id` al randului trimis. `message_id` al unui rand `sent` e
+# Message-ID-ul mailului NOSTRU (host `@cts.cargotrack.ro` — chiar asta il face `_is_sent` sa-l
+# clasifice ca trimis), deci nu se potriveste cu niciun tichet primit. Legatura dintre cele doua
+# tichete e `raw->'extra'->>'msid'` = Message-ID-ul mailului la care s-a raspuns.
 _RECEIVED_TICKET_SQL = """
 SELECT g.id, g.cts_assignee_email, g.cts_assignee_name, g.cts_solved_auto_reply,
        g.raw->'extra'->>'client_id' AS cts_client_id
@@ -190,17 +204,33 @@ SELECT g.id, g.cts_assignee_email, g.cts_assignee_name, g.cts_solved_auto_reply,
  ORDER BY g.id ASC LIMIT 1
 """
 
+# Rezerva, cand randul trimis nu are `msid`: tichetul primit al mailului deja imperecheat.
+# `email_id` e populat pe randurile PRIMITE (spre deosebire de cele trimise), deci e o legatura
+# sigura — doar ca o avem abia dupa ce `pair_received` a gasit mailul.
+_RECEIVED_BY_EMAIL_SQL = """
+SELECT g.id, g.cts_assignee_email, g.cts_assignee_name, g.cts_solved_auto_reply,
+       g.raw->'extra'->>'client_id' AS cts_client_id
+  FROM cts_ground_truth g
+ WHERE COALESCE(g.cts_direction, 'received') = 'received'
+   AND g.email_id = :eid
+ ORDER BY g.id ASC LIMIT 1
+"""
+
 # Operator: adresa CTS -> angajat. NICIODATA pe nume. Departamentul e cel ISTORIC, la data
 # raspunsului (`employee_department_history`), nu cel de azi — un om mutat intre timp trebuie sa-si
 # pastreze evaluarile in departamentul in care lucra atunci. `enabled` nu se filtreaza: e o
-# proprietate a lui azi, iar cine a plecat isi pastreaza lunile trecute.
+# proprietate a lui azi, iar cine a plecat isi pastreaza lunile trecute. COALESCE pe
+# `e.department` doar ca plasa: un angajat fara interval istoric (import manual, trigger
+# nedeclansat) ar ramane cu departament NULL si ar disparea din orice filtrare pe departament.
 _EMPLOYEE_SQL = """
 SELECT e.id, e.name, e.email,
-       (SELECT h.department FROM employee_department_history h
-         WHERE h.employee_id = e.id
-           AND h.valid_from <= CAST(:day AS date)
-           AND (h.valid_to IS NULL OR h.valid_to > CAST(:day AS date))
-         ORDER BY h.valid_from DESC LIMIT 1) AS dept_at
+       COALESCE(
+         (SELECT h.department FROM employee_department_history h
+           WHERE h.employee_id = e.id
+             AND h.valid_from <= CAST(:day AS date)
+             AND (h.valid_to IS NULL OR h.valid_to > CAST(:day AS date))
+           ORDER BY h.valid_from DESC LIMIT 1),
+         e.department) AS dept_at
   FROM employee_department_mapping e
  WHERE lower(e.email) = lower(:addr)
  LIMIT 1
@@ -304,14 +334,35 @@ _CRIT_KEYS = (
 )
 
 
+# Marcajul de la care promptul trece de la INSTRUCTIUNI la DATE. Tot ce e inainte devine
+# `system`, tot ce e dupa (cu variabilele inlocuite) devine `content` — exact ca la scorarea
+# apelurilor (system = promptul, content = transcriptul). Motivele: `iris_ai` plafoneaza si
+# trunchiaza doar `content` (TRANSCRIPT_CAP), iar instructiunile raman stabile intre apeluri.
+_DATA_MARKER = "Email client:"
+
+
+def build_messages(email_client: str, raspuns_angajat: str):
+    """(system, content) din fisierul de prompt. Daca marcajul lipseste (cineva a rescris
+    fisierul), cade pe varianta „tot promptul in system" — nu ramane fara evaluare."""
+    raw = load_prompt()
+    idx = raw.find(_DATA_MARKER)
+    if idx < 0:
+        filled = raw.replace("{email_client}", email_client or "") \
+                    .replace("{raspuns_angajat}", raspuns_angajat or "")
+        return filled, "Evalueaza perechea de mai sus si raspunde strict in formatul JSON cerut."
+    system = raw[:idx].rstrip()
+    content = raw[idx:].replace("{email_client}", email_client or "") \
+                       .replace("{raspuns_angajat}", raspuns_angajat or "")
+    return system, content
+
+
 def evaluate_pair(email_client: str, raspuns_angajat: str, cfg: dict) -> dict:
     """Un apel AI. Returneaza {"ok": bool, "data": {...}} — NU ridica niciodata exceptii."""
     try:
-        system = load_prompt().replace("{email_client}", email_client or "") \
-                              .replace("{raspuns_angajat}", raspuns_angajat or "")
+        system, content = build_messages(email_client, raspuns_angajat)
         res = iris_ai.run_prompt(
             system=system,
-            content="Evalueaza perechea de mai sus si raspunde strict in formatul JSON cerut.",
+            content=content,
             response_format="json",
             model_hint=cfg.get("model_hint") or None,
             temperature=0.0,
@@ -386,23 +437,32 @@ def build_context(db, row, cfg) -> dict:
 
     # Tichetul primit: operatorul + marcajul de auto-reply.
     rec = None
-    if row["message_id"]:
-        rec = db.execute(text(_RECEIVED_TICKET_SQL), {"mid": row["message_id"]}).mappings().first()
+    if row["msid"]:
+        rec = db.execute(text(_RECEIVED_TICKET_SQL), {"mid": row["msid"]}).mappings().first()
+    if rec is None:
+        rec = db.execute(text(_RECEIVED_BY_EMAIL_SQL), {"eid": paired["id"]}).mappings().first()
     if rec and rec["cts_solved_auto_reply"]:
         # Raspuns generat automat la marcarea „solved" — nu e textul unui om, nu se evalueaza.
         ctx["skip"] = "auto_reply"
         return ctx
 
     asg = (rec["cts_assignee_email"] if rec else None) or None
-    if asg:
-        day = (row["ref_at"] or datetime.now(timezone.utc)).date().isoformat()
-        emp = db.execute(text(_EMPLOYEE_SQL), {"addr": asg, "day": day}).mappings().first()
-        ctx["employee_email"] = asg
-        ctx["employee_name"] = (rec["cts_assignee_name"] if rec else None)
-        if emp:
-            ctx["employee_id"] = emp["id"]
-            ctx["employee_name"] = emp["name"] or ctx["employee_name"]
-            ctx["department"] = emp["dept_at"]
+    if not asg:
+        # Fara operator, evaluarea nu are unde sa fie agregata — raportul e PER OPERATOR. Un apel
+        # AI aici ar fi bani cheltuiti pe un rand invizibil.
+        ctx["skip"] = "no_operator"
+        return ctx
+    day = (row["ref_at"] or datetime.now(timezone.utc)).date().isoformat()
+    emp = db.execute(text(_EMPLOYEE_SQL), {"addr": asg, "day": day}).mappings().first()
+    ctx["employee_email"] = asg
+    ctx["employee_name"] = (rec["cts_assignee_name"] if rec else None)
+    if emp is None:
+        # Adresa CTS nu corespunde niciunui angajat din `employee_department_mapping`.
+        ctx["skip"] = "no_operator"
+        return ctx
+    ctx["employee_id"] = emp["id"]
+    ctx["employee_name"] = emp["name"] or ctx["employee_name"]
+    ctx["department"] = emp["dept_at"]
 
     cid = (row["cts_client_id"] or (rec["cts_client_id"] if rec else None))
     cl = None
@@ -585,14 +645,20 @@ def run_job(date_from, date_to, limit=None, force=False, job_id=None):
     """
     from app.database import SessionLocal
     db = SessionLocal()
+    # Sesiune DEDICATA pentru advisory lock (tiparul `calls_pipeline._run_pipeline`). Lock-ul e
+    # legat de CONEXIUNEA care l-a luat, iar sesiunea de lucru face commit dupa fiecare rand — un
+    # commit returneaza conexiunea in pool, deci urmatoarea interogare poate pleca pe ALTA
+    # conexiune si `pg_advisory_unlock` ar cadea in gol, lasand lock-ul agatat. Sesiunea asta nu
+    # comite niciodata: pastreaza aceeasi conexiune de la lock pana la unlock.
+    lock_db = SessionLocal()
     job_id = job_id or uuid.uuid4().hex[:12]
     stats = {"job_id": job_id, "status": "running", "scored": 0, "skipped": 0, "errors": 0,
              "total": 0, "started_at": datetime.now(timezone.utc).isoformat(),
              "date_from": str(date_from), "date_to": str(date_to)}
     got_lock = False
     try:
-        got_lock = bool(db.execute(text("SELECT pg_try_advisory_lock(:k)"),
-                                   {"k": LOCK_KEY}).scalar())
+        got_lock = bool(lock_db.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                                        {"k": LOCK_KEY}).scalar())
         if not got_lock:
             stats.update(status="skipped", reason="already_running")
             _write_job(db, job_id, stats)
@@ -615,6 +681,7 @@ def run_job(date_from, date_to, limit=None, force=False, job_id=None):
 
         stats["bodies"] = fetch_missing_bodies(db, rows)
         rows = _candidates(db, date_from, date_to, lim, force=force)  # reciteste textele aduse
+        stats["total"] = len(rows)   # altfel bara de progres ramane pe numarul de dinainte
         _write_job(db, job_id, stats)
 
         def _work(row):
@@ -677,10 +744,14 @@ def run_job(date_from, date_to, limit=None, force=False, job_id=None):
     finally:
         if got_lock:
             try:
-                db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": LOCK_KEY})
-                db.commit()
+                lock_db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": LOCK_KEY})
             except Exception:
-                pass
+                logger.warning("unlock advisory esuat (se elibereaza la inchiderea conexiunii)",
+                               exc_info=True)
+        try:
+            lock_db.close()
+        except Exception:
+            pass
         db.close()
 
 
@@ -689,8 +760,21 @@ def start_job(date_from, date_to, limit=None, force=False) -> str:
 
     Rularea dureaza minute intregi (un apel AI per pereche) — nu are ce cauta intr-un request HTTP;
     UI-ul urmareste progresul prin `GET .../run/status`.
+
+    Starea initiala se scrie SINCRON, inainte de pornirea firului: altfel prima interogare de
+    status (la 4 secunde) ar putea sosi inaintea primului `_write_job` din job — care vine abia
+    dupa advisory lock + selectia candidatilor — si ar primi 404, oprind urmarirea progresului.
     """
+    from app.database import SessionLocal
     job_id = uuid.uuid4().hex[:12]
+    db = SessionLocal()
+    try:
+        _write_job(db, job_id, {"job_id": job_id, "status": "running", "scored": 0, "skipped": 0,
+                                "errors": 0, "total": 0, "queued": True,
+                                "started_at": datetime.now(timezone.utc).isoformat(),
+                                "date_from": str(date_from), "date_to": str(date_to)})
+    finally:
+        db.close()
     threading.Thread(target=run_job, daemon=True,
                      kwargs={"date_from": date_from, "date_to": date_to, "limit": limit,
                              "force": force, "job_id": job_id}).start()
