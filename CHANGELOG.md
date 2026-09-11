@@ -8,6 +8,45 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.17.0 - 2026-09-11
+
+### MINOR — Expeditorii de pe blocklist nu mai pot ajunge în CTS (cazul Akcenta)
+
+Mailurile de la `info@email.akcenta.eu` continuau să intre în CTS deși expeditorul era pe
+blocklist. Trei cauze independente, toate reparate:
+
+**1. Potrivirea pe domeniu era pe egalitate exactă.** `spam_sender_reputation` cu
+`scope_type='domain'` și `scope_value='akcenta.eu'` NU prindea `info@email.akcenta.eu` —
+expeditorul trimite de pe un subdomeniu. Simetric, o intrare `sender_exact` acoperă o singură
+cutie poștală, deci orice altă adresă de pe același domeniu trecea. Acum
+`spam_detector.sender_scopes()` construiește lanțul adresă → domeniu → domenii-părinte
+(`info@email.akcenta.eu` → `email.akcenta.eu` → `akcenta.eu`), cu precedența adresă exactă >
+domeniu specific > domeniu-părinte. Ultima etichetă singură (`eu`, `ro`, `com`) e exclusă
+deliberat: o intrare pe un TLD ar bloca (sau exempta) tot traficul. Comparația e acum
+case-insensitive pe ambele părți — o intrare salvată cu majuscule nu se mai potrivea niciodată.
+Aceeași regulă se aplică și listelor manuale din `phishing_manual_learning`.
+
+**2. Gate-ul „Automat" ocolea complet poarta de spam.** În `process_one`, un mail fără atașament
+care se potrivește unui `report_pattern` confirmat ieșea devreme cu `status='auto_report'` /
+`queue_status='auto_closed'` — stare ELIGIBILĂ pentru feed-ul CTS (`cts._ELIGIBLE_AUTO`) — înainte
+ca reputația expeditorului să fie consultată. De aici „unele tot trec": exact mailurile-șablon
+(cele care produc pattern-uri) treceau, restul erau oprite. Verdictul pe expeditor
+(`spam_detector.sender_gate_verdict()`, fără scoring de conținut) se calculează acum înaintea
+gate-ului, iar un expeditor blocat cade pe poarta de spam → `stopped_spam` (terminal).
+Reputația se rezolvă o singură dată per email, refolosită de ambele porți.
+
+**3. Whitelist-ul manual bate blocklist-ul** (regulă de precedență, nemodificată — whitelist ⇒
+niciodată spam). Un „Legit" dat cândva pe un mail Akcenta lăsase expeditorul în
+`settings.phishing_manual_learning.whitelist`, de unde excepta tot domeniul indiferent de
+blocklist. `add_entry` refuză mutarea automată între liste (`conflict`), deci intrarea nu se
+curăța nici la „Marchează ca SPAM".
+
+**Akcenta, efectiv** (`migrations/20260911d_akcenta_block_spam.sql`): blocklist pe domeniul
+`akcenta.eu` (prinde subdomeniile), ștergerea oricărei intrări Akcenta din allowlist și din
+whitelist-ul manual, plus retroactiv `override=TRUE` + `queue_status='stopped_spam'` pe mailurile
+Akcenta NEtrimise încă la CTS. Ce a plecat deja la CTS rămâne acolo — nu se poate retrage.
+Alt domeniu se blochează la fel, cu o intrare `domain` în `spam_sender_reputation`.
+
 ## v3.16.6 - 2026-09-11
 
 ### PATCH — Raportul zilnic Undeliverable pleacă la 09:00, nu la 10:00

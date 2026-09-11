@@ -197,44 +197,75 @@ def detect_spam(email: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
     return float(score), reasons
 
 
+def sender_scopes(from_address: str):
+    """(adresa_normalizata, [domenii candidate]) pentru cautarea in liste.
+
+    Domeniile includ domeniul expeditorului SI toate domeniile-parinte cu cel putin doua
+    etichete: `info@email.akcenta.eu` -> ['email.akcenta.eu', 'akcenta.eu']. Motiv: o regula
+    pe `akcenta.eu` trebuie sa prinda si subdomeniile de trimitere (`email.`, `mailing.` etc.),
+    exact ca la potrivirea de domenii din redirectul VATHUB. Ultima eticheta singura ('eu',
+    'ro', 'com') e EXCLUSA deliberat — o intrare pe un TLD ar bloca/exempta tot traficul.
+
+    Ordinea listei e de la cel mai specific la cel mai general (folosita ca precedenta).
+    """
+    addr = (from_address or '').lower().strip()
+    domain = addr.split('@', 1)[-1] if '@' in addr else ''
+    doms = []
+    if domain:
+        parts = [p for p in domain.split('.') if p]
+        for i in range(0, max(len(parts) - 1, 0)):
+            doms.append('.'.join(parts[i:]))
+    return addr, doms
+
+
+def _list_hit(addr: str, doms, keys) -> bool:
+    """Adresa sau unul dintre domeniile ei (cu parinti) e in setul de chei normalizate."""
+    if not keys:
+        return False
+    if addr and addr in keys:
+        return True
+    return any(d in keys for d in doms)
+
+
 def get_sender_reputation(from_address: str, db) -> Optional[str]:
     """Returnează 'allowlist' | 'blocklist' | None.
 
-    Caută mai întâi pe adresa exactă, apoi pe domeniu.
-    Adresa exactă are prioritate (un expeditor specific poate fi allowlist
-    chiar dacă domeniul e pe blocklist și invers).
+    Precedență: adresa exactă > domeniul cel mai specific > domenii-părinte (vezi
+    `sender_scopes`). Un expeditor specific poate fi allowlist chiar dacă domeniul e pe
+    blocklist și invers. Comparația e case-insensitive pe AMBELE părți — intrările salvate
+    cu majuscule trebuie să se potrivească la fel.
     """
     from sqlalchemy import text
-    addr = (from_address or '').lower().strip()
+    addr, doms = sender_scopes(from_address)
     if not addr:
         return None
-    domain = addr.split('@', 1)[-1] if '@' in addr else ''
     row = db.execute(text("""
         SELECT reputation FROM spam_sender_reputation
-        WHERE (scope_type='sender_exact' AND scope_value=:addr)
-           OR (scope_type='domain' AND scope_value=:dom AND :dom != '')
-        ORDER BY CASE scope_type WHEN 'sender_exact' THEN 0 ELSE 1 END
+        WHERE (scope_type='sender_exact' AND lower(scope_value)=:addr)
+           OR (scope_type='domain' AND lower(scope_value) = ANY(CAST(:doms AS text[])))
+        ORDER BY CASE scope_type WHEN 'sender_exact' THEN 0 ELSE 1 END,
+                 length(scope_value) DESC
         LIMIT 1
-    """), {"addr": addr, "dom": domain}).fetchone()
+    """), {"addr": addr, "doms": doms or ['']}).fetchone()
     return row[0] if row else None
 
 
 def get_sender_reputation_pg(from_address: str, cur) -> Optional[str]:
     """Varianta psycopg2 a get_sender_reputation pentru pipeline-ul de procesare.
 
-    Aceeasi semantica: cauta adresa exacta intai, apoi domeniul (exact > domain).
-    Functioneaza cu cursor normal SAU RealDictCursor.
+    Aceeasi semantica: adresa exacta > domeniu specific > domenii-parinte (`sender_scopes`),
+    case-insensitive pe ambele parti. Functioneaza cu cursor normal SAU RealDictCursor.
     """
-    addr = (from_address or '').lower().strip()
+    addr, doms = sender_scopes(from_address)
     if not addr:
         return None
-    domain = addr.split('@', 1)[-1] if '@' in addr else ''
     cur.execute(
         "SELECT reputation FROM spam_sender_reputation "
-        "WHERE (scope_type='sender_exact' AND scope_value=%s) "
-        "   OR (scope_type='domain' AND scope_value=%s AND %s <> '') "
-        "ORDER BY CASE scope_type WHEN 'sender_exact' THEN 0 ELSE 1 END LIMIT 1",
-        (addr, domain, domain))
+        "WHERE (scope_type='sender_exact' AND lower(scope_value)=%s) "
+        "   OR (scope_type='domain' AND lower(scope_value) = ANY(CAST(%s AS text[]))) "
+        "ORDER BY CASE scope_type WHEN 'sender_exact' THEN 0 ELSE 1 END, "
+        "         length(scope_value) DESC LIMIT 1",
+        (addr, doms or ['']))
     row = cur.fetchone()
     if not row:
         return None
@@ -258,6 +289,23 @@ def detect_spam_with_reputation(
         score = min(score + 40, 100)
         reasons.append({'code': 'blocklist_boost', 'weight': 40, 'match_text': ''})
     return score, reasons
+
+
+def sender_gate_verdict(email: Dict[str, Any], reputation: Optional[str] = None,
+                        manual_whitelist: Optional[set] = None,
+                        manual_spamlist: Optional[set] = None) -> Optional[bool]:
+    """Verdictul pe EXPEDITOR, fara scoring de continut: False=exceptat, True=blocat, None=neutru.
+
+    Aceeasi precedenta ca `classify_spam_gate` (whitelist/allowlist bate blocklist/spamlist),
+    dar nu ruleaza `detect_spam`. Folosita de gate-urile care ies DEVREME din `process_one`
+    (ex. „Automat"), ca un expeditor blocat sa nu poata ocoli oprirea ca spam.
+    """
+    saddr, sdoms = sender_scopes(email.get('from_address'))
+    if reputation == 'allowlist' or _list_hit(saddr, sdoms, manual_whitelist or set()):
+        return False
+    if reputation == 'blocklist' or _list_hit(saddr, sdoms, manual_spamlist or set()):
+        return True
+    return None
 
 
 def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
@@ -285,11 +333,11 @@ def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
     """
     manual_whitelist = manual_whitelist or set()
     manual_spamlist = manual_spamlist or set()
-    saddr = (email.get('from_address') or '').lower().strip()
-    sdom = saddr.split('@', 1)[-1] if '@' in saddr else ''
+    saddr, sdoms = sender_scopes(email.get('from_address'))
+    sdom = sdoms[0] if sdoms else ''
 
-    # 1) Whitelist (bate tot) — DOAR pe expeditorul real (adresă sau domeniu).
-    in_whitelist = bool((saddr and saddr in manual_whitelist) or (sdom and sdom in manual_whitelist))
+    # 1) Whitelist (bate tot) — DOAR pe expeditorul real (adresă sau domeniu, cu subdomenii).
+    in_whitelist = _list_hit(saddr, sdoms, manual_whitelist)
     if reputation == 'allowlist' or in_whitelist:
         wl_code = 'manual_whitelist_bypass' if in_whitelist else 'allowlist_bypass'
         return 0.0, [{'code': wl_code, 'weight': 0, 'match_text': saddr or sdom or ''}], False
@@ -298,7 +346,7 @@ def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
     score, reasons = detect_spam(email)
 
     # 3) Blocklist reputație SAU blacklist manuală tip=spam → forțează spam.
-    in_spamlist = bool((saddr and saddr in manual_spamlist) or (sdom and sdom in manual_spamlist))
+    in_spamlist = _list_hit(saddr, sdoms, manual_spamlist)
     if reputation == 'blocklist' or in_spamlist:
         bcode = 'blocklist_sender' if reputation == 'blocklist' else 'manual_blacklist_spam'
         return float(score), list(reasons) + [

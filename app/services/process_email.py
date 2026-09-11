@@ -795,6 +795,63 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # (ex. toll alert alert@ct.its-pro.hu -> taxe_drum) să nu depindă de calea clean.
         _apply_dept_rules(cur, conn, email_id, em)
 
+        # Expeditor + liste (reputatie, suprimari, liste manuale) — incarcate AICI, INAINTEA
+        # gate-ului „Automat", nu mai jos la detectia de phishing: verdictul pe expeditor
+        # trebuie sa poata opri un mail INAINTE sa iasa devreme pe o cale livrata la CTS.
+        # (Auto-learning suppressions pentru phishing, Treapta 1, se incarca in acelasi loc.)
+        _from = (em.get('from_address') or '').lower().strip()
+        _dom = _from.split('@', 1)[-1] if '@' in _from else ''
+        suppress_codes = set()
+        if _from or _dom:
+            cur.execute("""
+                SELECT suppressed_codes FROM suppression_rules
+                WHERE active = TRUE
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                  AND ((scope_type='sender_exact' AND scope_value=%s)
+                    OR (scope_type='domain' AND scope_value=%s))
+            """, (_from, _dom))
+            for _r in cur.fetchall():
+                for _c in (_r['suppressed_codes'] or []):
+                    suppress_codes.add(_c)
+        # Liste manuale (settings['phishing_manual_learning']): blacklist tipizat + whitelist.
+        #  - blacklist tip=carantina → semnal Layer-4 la detecția de carantină (detect_phishing);
+        #  - blacklist tip=spam → forțează override spam (NU carantină) — vezi blocul de spam;
+        #  - whitelist → suprimare soft a semnalelor slabe.
+        # Intrările `muted` (ignorate) sunt excluse din toate seturile.
+        from app.services.sender_lists import entry_tip as _entry_tip
+        manual_blacklist = set()      # doar tip=carantina
+        manual_spamlist = set()       # doar tip=spam
+        manual_whitelist = set()
+        try:
+            cur.execute("SELECT value FROM settings WHERE key='phishing_manual_learning'")
+            _ml = cur.fetchone()
+            if _ml and _ml['value']:
+                for _k, _v in (_ml['value'].get('blacklist') or {}).items():
+                    if not _k or (isinstance(_v, dict) and _v.get('muted')):
+                        continue
+                    if _entry_tip(_v if isinstance(_v, dict) else {}) == 'spam':
+                        manual_spamlist.add(_k.lower())
+                    else:
+                        manual_blacklist.add(_k.lower())
+                for _k, _v in (_ml['value'].get('whitelist') or {}).items():
+                    if _k and not (isinstance(_v, dict) and _v.get('muted')):
+                        manual_whitelist.add(_k.lower())
+        except Exception:
+            logger.exception("manual lists load failed email_id=%s", email_id)
+
+        # Verdict pe EXPEDITOR (fara scoring de continut): allowlist/whitelist => exceptat,
+        # blocklist/blacklist-spam => blocat. Aceeasi precedenta ca poarta de spam de mai jos,
+        # din aceeasi sursa unica (`spam_detector`), ca sa nu poata diverge.
+        from app.services import spam_detector as _spam_det
+        try:
+            _rep = _spam_det.get_sender_reputation_pg(em.get('from_address'), cur)
+        except Exception:
+            logger.exception("sender reputation lookup failed email_id=%s", email_id)
+            _rep = None
+        _sender_blocked = _spam_det.sender_gate_verdict(
+            em, reputation=_rep, manual_whitelist=manual_whitelist,
+            manual_spamlist=manual_spamlist) is True
+
         # ── Gate „Automat" (pattern confirmat din pagina Rapoarte) — ÎNAINTE de orice clasificare.
         # Dacă emailul se potrivește unui pattern „automat" (acelaşi criteriu ca regenerarea:
         # expeditor ∈ pattern ŞI amprenta SimHash a conţinutului), e EXCLUS din spam/carantină/
@@ -807,7 +864,12 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # auto_closed → livrat la CTS) pentru un email NDR. Lasă-l să cadă pe poarta NDR
         # de mai jos (terminal, stopped_ndr). Altfel un report_pattern învățat din greșeală
         # pe mailer-daemon ar scurtcircuita bounce-ul spre backoffice.
-        if not attachments and not is_ndr(em):
+        # La fel si expeditorii BLOCATI (blocklist / blacklist tip=spam): calea „Automat" iese
+        # devreme, INAINTE de poarta de spam, si e livrata la CTS (`cts._ELIGIBLE_AUTO`) — deci
+        # fara aceasta conditie un expeditor pus pe blocklist continua sa ajunga in CTS ori de
+        # cate ori mailul lui se potriveste unui pattern „automat" invatat. Mailul cade mai jos,
+        # pe poarta de spam -> stopped_spam (terminal).
+        if not attachments and not is_ndr(em) and not _sender_blocked:
             try:
                 from app.api.v1 import reports as _reports
                 _ph = _reports.try_auto_handle_pg(cur, em)
@@ -848,46 +910,6 @@ def process_one(email_id: int) -> Dict[str, Any]:
             conn.commit()
             return {"status": "ndr", "failed_address": failed_addr}
 
-        # Phishing detection (with auto-learning suppressions for this sender, Treapta 1)
-        _from = (em.get('from_address') or '').lower().strip()
-        _dom = _from.split('@', 1)[-1] if '@' in _from else ''
-        suppress_codes = set()
-        if _from or _dom:
-            cur.execute("""
-                SELECT suppressed_codes FROM suppression_rules
-                WHERE active = TRUE
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                  AND ((scope_type='sender_exact' AND scope_value=%s)
-                    OR (scope_type='domain' AND scope_value=%s))
-            """, (_from, _dom))
-            for _r in cur.fetchall():
-                for _c in (_r['suppressed_codes'] or []):
-                    suppress_codes.add(_c)
-        # Liste manuale (settings['phishing_manual_learning']): blacklist tipizat + whitelist.
-        #  - blacklist tip=carantina → semnal Layer-4 la detecția de carantină (detect_phishing);
-        #  - blacklist tip=spam → forțează override spam (NU carantină) — vezi blocul de spam;
-        #  - whitelist → suprimare soft a semnalelor slabe.
-        # Intrările `muted` (ignorate) sunt excluse din toate seturile.
-        from app.services.sender_lists import entry_tip as _entry_tip
-        manual_blacklist = set()      # doar tip=carantina
-        manual_spamlist = set()       # doar tip=spam
-        manual_whitelist = set()
-        try:
-            cur.execute("SELECT value FROM settings WHERE key='phishing_manual_learning'")
-            _ml = cur.fetchone()
-            if _ml and _ml['value']:
-                for _k, _v in (_ml['value'].get('blacklist') or {}).items():
-                    if not _k or (isinstance(_v, dict) and _v.get('muted')):
-                        continue
-                    if _entry_tip(_v if isinstance(_v, dict) else {}) == 'spam':
-                        manual_spamlist.add(_k.lower())
-                    else:
-                        manual_blacklist.add(_k.lower())
-                for _k, _v in (_ml['value'].get('whitelist') or {}).items():
-                    if _k and not (isinstance(_v, dict) and _v.get('muted')):
-                        manual_whitelist.add(_k.lower())
-        except Exception:
-            logger.exception("manual lists load failed email_id=%s", email_id)
         score, ph_status, reasons = phishing_detector.detect_phishing(
             em, attachments, suppress_codes=suppress_codes, blacklist=manual_blacklist,
             whitelist=manual_whitelist)
@@ -1066,7 +1088,7 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # Whitelist BATE blocklist/spamlist (cf. cerinta: whitelist ⇒ niciodata spam).
         try:
             from app.services import spam_detector
-            _rep = spam_detector.get_sender_reputation_pg(em.get('from_address'), cur)
+            # _rep e rezolvat o singura data, inainte de gate-ul „Automat" (vezi mai sus).
             # SURSĂ UNICĂ: poarta de spam (allowlist/whitelist ⇒ NU spam; blocklist/blacklist-spam ⇒
             # spam; altfel scorul decide). Identică cu /spam/backfill — vezi spam_detector.classify_spam_gate.
             _sp_score, _sp_reasons, _override = spam_detector.classify_spam_gate(
