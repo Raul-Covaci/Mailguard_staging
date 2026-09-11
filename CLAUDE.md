@@ -204,7 +204,13 @@ redirectul nu mai depinde de credențialele IMAP/SMTP personale ale nimănui.
   `domains`, `addresses`) — ACEEAȘI cheie folosită și de calea veche, ca să nu existe două liste.
 - API: `GET/PUT /emails/vathub/rules`, `POST/PUT/DELETE /emails/vathub/entries`,
   `GET /emails/vathub/log`, `POST /emails/vathub/run|backfill|retry`.
-- UI: tab **„Redirect VATHUB"** în pagina Email-uri (`VathubRedirect` în `mg-app.js`).
+- UI: tab **„Redirect VATHUB"** în pagina **Setări** (`VathubPanel` în `mg-app.js`).
+
+⚠️ **Pagina Setări e developer-only** (`access_control.SETTINGS_MODULES`; adminii nu o văd),
+deci tabul e vizibil doar rolului `developer`. Endpoint-urile au rămas pe routerul `emails`
+(`/emails/vathub/*`), care cere doar admin: dacă lista trebuie administrată și de un admin, se
+mută TABUL într-o pagină negatată — NU rutele sub `/settings/*`, fiindcă gate-ul „settings" e
+developer-only și le-ar închide și API-ul.
 
 ⚠️ **`source` decide cine face redirectul** — `"inbox"` (implicit acum), `"personal"` sau
 `"both"`. Calea veche (`vathub_forward.process_account`, `personal_mails.vathub_*`) rămâne

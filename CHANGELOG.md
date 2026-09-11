@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.2 - 2026-09-12
+
+### PATCH — „Redirect VATHUB" mutat în Setări, refăcut în stilul aplicației
+
+Tabul a plecat din pagina Email-uri (unde stătea lângă listele de mailuri, deși e configurare, nu
+operare) în **Setări → Redirect VATHUB**, lângă „Mail-uri no-reply" — cu care de altfel împarte
+contul SMTP.
+
+Interfața a fost refăcută pe tiparul celorlalte panouri de setări: card de stare cu titlu, descriere
+și buton verde/gri „● Activ — Oprește" ca la auto-reply; patru contoare `stat` (Trimise / În
+așteptare / Eșuate / Reguli active) în grila standard; tabele cu stilul implicit al aplicației în loc
+de stiluri inline; badge-uri din paleta existentă (`b-clean`, `b-quarantined`, `b-strict`, `b-ndr`) în
+loc de culori fixe; dialoguri prin `mgConfirm`/`Swal`, ca peste tot. Adăugat și un câmp de căutare în
+listă — 52 de intrări nu se mai parcurg cu ochiul.
+
+Endpoint-urile rămân pe routerul `emails` (`/emails/vathub/*`). ⚠️ Pagina Setări e **developer-only**
+(`access_control.SETTINGS_MODULES`), deci tabul se vede doar cu rolul `developer`; rutele cer doar
+admin. Nu au fost mutate sub `/settings/*` tocmai fiindcă gate-ul „settings" ar fi închis și API-ul.
+
+---
+
 ## v3.24.1 - 2026-09-12
 
 ### PATCH — Redirectul VATHUB trimite DOAR din producție

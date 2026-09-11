@@ -4306,269 +4306,6 @@ function EmailsList({ setTopbarRight, lockStatus }) {
 
 // Emails page with 4 sub-tabs: Toate / Email / Carantinate / Spam.
 // Each child owns the topbar (sets it on mount), so switching tabs swaps it cleanly.
-// ── Redirect VATHUB (căsuța principală) ───────────────────────────────────────
-// Mailurile oficiale de recuperare TVA (ANAF/MF, NAV, NAP, BZSt, DGFiP, ...) sosesc
-// in casuta principala. Cele de la o adresa/domeniu din lista se forwardeaza spre
-// vathub@cargotrack.ro, de unde le citeste aplicatia VATHUB. Lista se editeaza aici.
-// Motor: app/services/vathub_inbox.py. API: /emails/vathub/*.
-function VathubRedirect({ setTopbarRight }) {
-  var VH = '/emails/vathub';
-  // Tab-urile vecine (Toate/Email/Carantinate/Spam) pun filtre in bara de sus si NU
-  // le curata la demontare. Fara linia asta, filtrele lor ar ramane vizibile aici.
-  useEffect(function() { if (setTopbarRight) setTopbarRight(null); }, [setTopbarRight]);
-  const [cfg, setCfg] = useState(null);
-  const [log, setLog] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [tick, setTick] = useState(0);
-  const [draft, setDraft] = useState({ list: 'domains', value: '', note: '' });
-  const [form, setForm] = useState(null);   // config editabil local
-
-  useEffect(function() {
-    api(VH + '/rules').then(function(r) {
-      setCfg(r);
-      setForm({ target: r.target, enabled: !!r.enabled, max_age_hours: r.max_age_hours });
-    }).catch(function(e) { mgToast('error', 'Nu pot incarca configul VATHUB: ' + String(e && e.message || e)); });
-    api(VH + '/log?limit=60').then(setLog).catch(function() { setLog({ items: [], stats: {} }); });
-  }, [tick]);
-
-  function reload() { setTick(function(t) { return t + 1; }); }
-
-  function saveCfg() {
-    setBusy(true);
-    api(VH + '/rules', { method: 'PUT', body: JSON.stringify(form) })
-      .then(function(r) {
-        setBusy(false);
-        if (r && r.ok) { mgToast('success', r.enabled ? 'Salvat — redirect ACTIV' : 'Salvat — redirect oprit'); reload(); }
-        else mgToast('error', (r && r.detail) || 'Eroare la salvare');
-      })
-      .catch(function(e) { setBusy(false); mgToast('error', String(e && e.message || e)); });
-  }
-
-  function addEntry() {
-    var v = (draft.value || '').trim();
-    if (!v) { mgToast('warning', 'Completeaza adresa sau domeniul'); return; }
-    setBusy(true);
-    api(VH + '/entries', { method: 'POST', body: JSON.stringify({ list: draft.list, value: v, note: draft.note, muted: false }) })
-      .then(function(r) {
-        setBusy(false);
-        if (r && r.ok) { setDraft({ list: draft.list, value: '', note: '' }); mgToast('success', 'Adaugat: ' + r.value); reload(); }
-        else mgToast('error', (r && r.detail) || 'Eroare la adaugare');
-      })
-      .catch(function(e) { setBusy(false); mgToast('error', String(e && e.message || e)); });
-  }
-
-  function toggleEntry(list, value, muted) {
-    api(VH + '/entries', { method: 'PUT', body: JSON.stringify({ list: list, value: value, muted: !muted }) })
-      .then(function(r) { if (r && r.ok) reload(); else mgToast('error', (r && r.detail) || 'Eroare'); });
-  }
-
-  function delEntry(list, value) {
-    mgConfirm({ title: 'Stergi „' + value + '"?', text: 'Mailurile de la acest expeditor nu vor mai fi forwardate spre VATHUB.', icon: 'warning', confirmButtonText: 'Sterge' })
-      .then(function(res) {
-        if (!res.isConfirmed) return;
-        api(VH + '/entries?list=' + list + '&value=' + encodeURIComponent(value), { method: 'DELETE' })
-          .then(function(r) { if (r && r.ok) { mgToast('success', 'Sters'); reload(); } else mgToast('error', (r && r.detail) || 'Eroare'); });
-      });
-  }
-
-  function runNow() {
-    setBusy(true);
-    api(VH + '/run', { method: 'POST' })
-      .then(function(r) {
-        setBusy(false);
-        if (r && typeof r.sent === 'number') {
-          if (r.skipped) mgToast('info', r.matched + ' potrivite, 0 trimise — ' + r.skipped, 7000);
-          else mgToast(r.failed || r.blocked ? 'warning' : 'success',
-            r.matched + ' potrivite, ' + r.sent + ' trimise' + (r.failed ? ', ' + r.failed + ' esuate' : '') + (r.blocked ? ', ' + r.blocked + ' blocate' : ''));
-          reload();
-        } else mgToast('error', (r && r.detail) || 'Eroare la rulare');
-      })
-      .catch(function(e) { setBusy(false); mgToast('error', String(e && e.message || e)); });
-  }
-
-  function backfill() {
-    mgConfirm({
-      title: 'Cauta retroactiv',
-      html: 'Scanarea normala merge doar inainte. Cauta mailurile deja intrate, din ultimele zile, si le pune la coada spre VATHUB.',
-      input: 'number', inputValue: 7, inputAttributes: { min: 1, max: 90 },
-      icon: 'question', confirmButtonText: 'Cauta si trimite'
-    }).then(function(res) {
-      if (!res.isConfirmed) return;
-      var days = parseInt(res.value) || 7;
-      setBusy(true);
-      api(VH + '/backfill?days=' + days + '&limit=1000', { method: 'POST' })
-        .then(function(r) {
-          setBusy(false);
-          if (r && typeof r.matched === 'number') {
-            mgToast('success', r.matched + ' potrivite din ' + r.scanned + ' mailuri, ' + (r.sent || 0) + ' trimise');
-            reload();
-          } else mgToast('error', (r && r.detail) || 'Eroare la cautare');
-        })
-        .catch(function(e) { setBusy(false); mgToast('error', String(e && e.message || e)); });
-    });
-  }
-
-  function retry(id) {
-    api(VH + '/retry?id=' + id, { method: 'POST' })
-      .then(function(r) { if (r && r.ok) { mgToast('success', 'Repus pe coada'); reload(); } else mgToast('error', (r && r.detail) || 'Eroare'); });
-  }
-
-  if (!cfg || !form) return h('div', { style: { padding: 16, color: 'var(--t2)' } }, 'Se incarca...');
-
-  var st = cfg.stats || {};
-  var lbl = { fontSize: 12, color: 'var(--t2)', display: 'block', marginBottom: 3 };
-  var td = { padding: '5px 8px', fontSize: 12, borderBottom: '1px solid var(--bd)' };
-  var thS = { padding: '5px 8px', fontSize: 11, color: 'var(--t3)', textTransform: 'uppercase', textAlign: 'left', borderBottom: '1px solid var(--bd)' };
-
-  function badge(txt, bg) {
-    return h('span', { className: 'badge', style: { background: bg, color: '#fff', textTransform: 'none' } }, txt);
-  }
-  function statusBadge(s) {
-    return s === 'sent' ? badge('trimis', 'var(--gn)')
-      : s === 'failed' ? badge('esuat', 'var(--rd)')
-      : s === 'blocked' ? badge('blocat', 'var(--rd)')
-      : badge('in asteptare', 'var(--yw)');
-  }
-  function dt(v) { if (!v) return '—'; try { return new Date(v).toLocaleString('ro-RO'); } catch (e) { return String(v); } }
-
-  var entries = [];
-  ['domains', 'addresses'].forEach(function(k) {
-    (cfg[k] || []).forEach(function(it) { entries.push({ list: k, it: it }); });
-  });
-
-  return h('div', { style: { padding: 12, overflow: 'auto' } }, [
-
-    // ── Config ────────────────────────────────────────────────────────────
-    h('div', { key: 'cfg', className: 'card', style: { marginBottom: 12 } }, [
-      h('div', { key: 'r', style: { display: 'flex', gap: 14, alignItems: 'flex-end', flexWrap: 'wrap' } }, [
-        h('div', { key: 'tg' }, [
-          h('label', { key: 'l', style: lbl }, 'Adresa VATHUB'),
-          h('select', {
-            key: 's', value: form.target, style: { minWidth: 230 },
-            onChange: function(e) { setForm(Object.assign({}, form, { target: e.target.value })); }
-          }, (cfg.allowed_targets || []).map(function(t) { return h('option', { key: t, value: t }, t); }))
-        ]),
-        h('div', { key: 'ag' }, [
-          h('label', { key: 'l', style: lbl }, 'Vechime maxima (ore)'),
-          h('input', {
-            key: 'i', type: 'number', min: 1, max: 720, value: form.max_age_hours, style: { width: 110 },
-            onChange: function(e) { setForm(Object.assign({}, form, { max_age_hours: parseInt(e.target.value) || 24 })); }
-          })
-        ]),
-        h('label', { key: 'en', style: { display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, cursor: 'pointer', paddingBottom: 6 } }, [
-          h('input', {
-            key: 'c', type: 'checkbox', checked: form.enabled, style: { width: 16, height: 16, cursor: 'pointer' },
-            onChange: function(e) { setForm(Object.assign({}, form, { enabled: e.target.checked })); }
-          }),
-          'Redirect activ'
-        ]),
-        h('button', { key: 'sv', className: 'btn', disabled: busy, onClick: saveCfg, style: { marginBottom: 2 } }, 'Salveaza'),
-        h('button', { key: 'rn', className: 'btn secondary', disabled: busy || !cfg.active, onClick: runNow, style: { marginBottom: 2 }, title: 'Scaneaza mailurile noi si trimite ce s-a potrivit' }, 'Ruleaza acum'),
-        h('button', { key: 'bf', className: 'btn secondary', disabled: busy || !cfg.active, onClick: backfill, style: { marginBottom: 2 }, title: 'Cauta si in mailurile deja intrate' }, 'Cauta retroactiv'),
-      ]),
-      h('div', { key: 'st', style: { marginTop: 10, display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--t2)' } }, [
-        h('span', { key: 1 }, ['Trimise: ', h('b', { key: 'b', style: { color: 'var(--gn)' } }, st.sent || 0)]),
-        h('span', { key: 2, title: cfg.can_send ? '' : 'Pe staging raman in asteptare: potrivirea merge, trimiterea nu' },
-          [cfg.can_send ? 'In asteptare: ' : 'Ar fi plecat: ', h('b', { key: 'b', style: { color: 'var(--yw)' } }, st.pending || 0)]),
-        h('span', { key: 3 }, ['Esuate: ', h('b', { key: 'b', style: { color: (st.failed || st.blocked) ? 'var(--rd)' : 'inherit' } }, (st.failed || 0) + (st.blocked || 0))]),
-        h('span', { key: 4 }, ['Reguli active: ', h('b', { key: 'b' }, ((cfg.counts && cfg.counts.domains.active) || 0) + ' domenii, ' + ((cfg.counts && cfg.counts.addresses.active) || 0) + ' adrese')]),
-      ]),
-      // Staging si productia citesc ACEEASI casuta. Daca ar trimite amandoua, VATHUB
-      // ar primi cate doua copii din fiecare decizie — de aceea trimiterea e oprita in
-      // cod pe staging. Potrivirea merge, ca lista sa poata fi verificata inainte.
-      cfg.can_send ? null : h('div', {
-        key: 'env', style: { marginTop: 10, padding: '8px 11px', borderRadius: 5, background: 'var(--yw)', color: '#000', fontSize: 12, lineHeight: 1.5 }
-      }, [
-        h('b', { key: 'b' }, cfg.production ? 'Trimiterea e blocata. ' : 'Mediu de STAGING — nu se trimite niciun mail. '),
-        cfg.block_reason || 'Redirectul trimite doar din productie.'
-      ]),
-      (cfg.can_send && !cfg.smtp_ready) ? h('div', {
-        key: 'w', style: { marginTop: 10, padding: '7px 10px', borderRadius: 5, background: 'var(--rd)', color: '#fff', fontSize: 12 }
-      }, 'Contul SMTP no-reply nu e configurat (Setari → Auto-reply no-reply). Fara el potrivirile se aduna in coada, dar nu pleaca niciun mail.') : null,
-      h('div', { key: 'h', style: { marginTop: 9, fontSize: 11, color: 'var(--t3)', lineHeight: 1.55 } },
-        'Mailul original pleaca INTACT, atasat ca .eml — atasamentele si subiectul (numarul de referinta RO2026…, dupa care VATHUB potriveste dosarul) raman neatinse. ' +
-        'Expeditorul real ajunge in Reply-To. Domeniile prind si subdomeniile (nav.gov.hu prinde elekafa.nav.gov.hu), iar adresa exacta bate domeniul. ' +
-        'O regula adaugata azi se aplica mailurilor urmatoare; pentru cele deja intrate foloseste „Cauta retroactiv".')
-    ]),
-
-    // ── Lista expeditori ──────────────────────────────────────────────────
-    h('div', { key: 'list', className: 'card', style: { marginBottom: 12 } }, [
-      h('div', { key: 't', style: { fontWeight: 600, marginBottom: 8 } }, 'Expeditori urmariti'),
-      h('div', { key: 'add', style: { display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' } }, [
-        h('select', {
-          key: 'l', value: draft.list, style: { width: 120 },
-          onChange: function(e) { setDraft(Object.assign({}, draft, { list: e.target.value })); }
-        }, [h('option', { key: 'd', value: 'domains' }, 'domeniu'), h('option', { key: 'a', value: 'addresses' }, 'adresa')]),
-        h('input', {
-          key: 'v', value: draft.value, placeholder: 'ex: bzst.bund.de sau nume@autoritate.ro', style: { flex: 1, minWidth: 220 },
-          onChange: function(e) { setDraft(Object.assign({}, draft, { value: e.target.value })); },
-          onKeyDown: function(e) { if (e.key === 'Enter') addEntry(); }
-        }),
-        h('input', {
-          key: 'n', value: draft.note, placeholder: 'nota (ex: DE — BZSt)', style: { flex: 1, minWidth: 160 },
-          onChange: function(e) { setDraft(Object.assign({}, draft, { note: e.target.value })); },
-          onKeyDown: function(e) { if (e.key === 'Enter') addEntry(); }
-        }),
-        h('button', { key: 'b', className: 'btn', disabled: busy, onClick: addEntry }, '+ Adauga')
-      ]),
-      h('div', { key: 'tbl', style: { maxHeight: 320, overflow: 'auto' } },
-        h('table', { style: { width: '100%', borderCollapse: 'collapse' } }, [
-          h('thead', { key: 'h' }, h('tr', null, ['Valoare', 'Tip', 'Nota', 'Stare', ''].map(function(c, i) {
-            return h('th', { key: i, style: thS }, c);
-          }))),
-          h('tbody', { key: 'b' }, entries.length ? entries.map(function(row) {
-            var it = row.it;
-            return h('tr', { key: row.list + ':' + it.value, style: it.muted ? { opacity: 0.55 } : null }, [
-              h('td', { key: 1, style: Object.assign({}, td, { fontFamily: 'Consolas,monospace' }) }, it.value),
-              h('td', { key: 2, style: td }, row.list === 'domains' ? 'domeniu' : 'adresa'),
-              h('td', { key: 3, style: Object.assign({}, td, { color: 'var(--t3)' }) }, it.note || '—'),
-              h('td', { key: 4, style: td }, it.muted ? badge('suspendat', 'var(--yw)') : badge('activ', 'var(--gn)')),
-              h('td', { key: 5, style: Object.assign({}, td, { textAlign: 'right', whiteSpace: 'nowrap' }) }, [
-                h('button', {
-                  key: 'm', className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11 },
-                  onClick: function() { toggleEntry(row.list, it.value, it.muted); }
-                }, it.muted ? 'Activeaza' : 'Suspenda'),
-                ' ',
-                h('button', {
-                  key: 'd', className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11, color: 'var(--rd)' },
-                  onClick: function() { delEntry(row.list, it.value); }
-                }, 'Sterge')
-              ])
-            ]);
-          }) : [h('tr', { key: 'e' }, h('td', { colSpan: 5, style: Object.assign({}, td, { color: 'var(--t3)' }) }, 'Nicio intrare in lista.'))])
-        ]))
-    ]),
-
-    // ── Jurnal ────────────────────────────────────────────────────────────
-    h('div', { key: 'log', className: 'card' }, [
-      h('div', { key: 't', style: { fontWeight: 600, marginBottom: 8 } }, 'Mailuri potrivite'),
-      h('div', { key: 'tbl', style: { maxHeight: 360, overflow: 'auto' } },
-        h('table', { style: { width: '100%', borderCollapse: 'collapse' } }, [
-          h('thead', { key: 'h' }, h('tr', null, ['Expeditor', 'Subiect', 'Regula', 'Primit', 'Trimis', 'Stare', ''].map(function(c, i) {
-            return h('th', { key: i, style: thS }, c);
-          }))),
-          h('tbody', { key: 'b' }, ((log && log.items) || []).length ? log.items.map(function(m) {
-            return h('tr', { key: m.id }, [
-              h('td', { key: 1, style: Object.assign({}, td, { fontFamily: 'Consolas,monospace', fontSize: 11 }) }, m.from_address || '—'),
-              h('td', { key: 2, style: Object.assign({}, td, { maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }), title: m.subject || '' }, m.subject || '—'),
-              h('td', { key: 3, style: Object.assign({}, td, { color: 'var(--t3)', fontSize: 11 }) }, m.matched_rule || '—'),
-              h('td', { key: 4, style: Object.assign({}, td, { whiteSpace: 'nowrap', fontSize: 11 }) }, dt(m.received_at)),
-              h('td', { key: 5, style: Object.assign({}, td, { whiteSpace: 'nowrap', fontSize: 11 }) }, dt(m.forwarded_at)),
-              h('td', { key: 6, style: td }, [
-                statusBadge(m.status),
-                m.error ? h('div', { key: 'e', style: { fontSize: 10, color: 'var(--rd)', maxWidth: 220 } }, String(m.error).slice(0, 110)) : null
-              ]),
-              h('td', { key: 7, style: Object.assign({}, td, { textAlign: 'right' }) },
-                (m.status === 'failed' || m.status === 'blocked')
-                  ? h('button', { className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11 }, onClick: function() { retry(m.id); } }, 'Reincearca')
-                  : null)
-            ]);
-          }) : [h('tr', { key: 'e' }, h('td', { colSpan: 7, style: Object.assign({}, td, { color: 'var(--t3)' }) }, 'Niciun mail potrivit inca.'))])
-        ]))
-    ])
-  ]);
-}
-
 function EmailsPage({ setTopbarRight }) {
   const [sub, setSub] = useState('toate');
   const SUBS = [
@@ -4576,10 +4313,8 @@ function EmailsPage({ setTopbarRight }) {
     { k: 'email', l: 'Email' },
     { k: 'carantinate', l: 'Carantinate' },
     { k: 'spam', l: 'Spam' },
-    { k: 'vathub', l: 'Redirect VATHUB' },
   ];
   const body =
-    sub === 'vathub' ? h(VathubRedirect, { key: 'vathub', setTopbarRight }) :
     sub === 'spam' ? h(Spam, { key: 'spam', setTopbarRight }) :
     sub === 'carantinate' ? h(EmailsList, { key: 'carantinate', setTopbarRight, lockStatus: 'quarantined,quarantined_strict' }) :
     sub === 'email' ? h(EmailsList, { key: 'email', setTopbarRight, lockStatus: 'clean' }) :
@@ -10604,9 +10339,304 @@ function DbExportPanel() {
   ]);
 }
 
+// ── Redirect VATHUB ───────────────────────────────────────────────────────────
+// Mailurile oficiale de recuperare TVA (ANAF/MF, NAV, NAP, BZSt, DGFiP, ...) sosesc
+// in casuta principala. Cele de la o adresa/domeniu din lista se forwardeaza spre
+// vathub@cargotrack.ro, de unde le citeste aplicatia VATHUB. Lista se editeaza aici.
+// Motor: app/services/vathub_inbox.py. API: /emails/vathub/*.
+function VathubPanel() {
+  var VH = '/emails/vathub';
+  const [cfg, setCfg] = useState(null);
+  const [log, setLog] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [tick, setTick] = useState(0);
+  const [draft, setDraft] = useState({ list: 'domains', value: '', note: '' });
+  const [form, setForm] = useState(null);
+  const [q, setQ] = useState('');
+
+  useEffect(function() {
+    api(VH + '/rules').then(function(r) {
+      setCfg(r);
+      setForm({ target: r.target, enabled: !!r.enabled, max_age_hours: r.max_age_hours });
+    }).catch(function(e) { mgToast('error', 'Nu pot încărca configul VATHUB: ' + String(e && e.message || e)); });
+    api(VH + '/log?limit=60').then(setLog).catch(function() { setLog({ items: [], stats: {} }); });
+  }, [tick]);
+
+  function reload() { setTick(function(t) { return t + 1; }); }
+  function fail(e) { setBusy(false); mgToast('error', String(e && e.message || e)); }
+
+  function saveCfg(patch) {
+    var body = Object.assign({}, form, patch || {});
+    setBusy(true);
+    api(VH + '/rules', { method: 'PUT', body: JSON.stringify(body) })
+      .then(function(r) {
+        setBusy(false);
+        if (r && r.ok) { mgToast('success', r.enabled ? 'Salvat — redirect activ' : 'Salvat — redirect oprit'); reload(); }
+        else mgToast('error', (r && r.detail) || 'Eroare la salvare');
+      }).catch(fail);
+  }
+
+  function addEntry() {
+    var v = (draft.value || '').trim();
+    if (!v) { mgToast('error', 'Completează adresa sau domeniul.'); return; }
+    setBusy(true);
+    api(VH + '/entries', { method: 'POST', body: JSON.stringify({ list: draft.list, value: v, note: draft.note, muted: false }) })
+      .then(function(r) {
+        setBusy(false);
+        if (r && r.ok) { setDraft({ list: draft.list, value: '', note: '' }); mgToast('success', 'Adăugat: ' + r.value); reload(); }
+        else mgToast('error', (r && r.detail) || 'Eroare la adăugare');
+      }).catch(fail);
+  }
+
+  function toggleEntry(list, value, muted) {
+    api(VH + '/entries', { method: 'PUT', body: JSON.stringify({ list: list, value: value, muted: !muted }) })
+      .then(function(r) { if (r && r.ok) { mgToast('success', muted ? 'Activat' : 'Suspendat'); reload(); } else mgToast('error', (r && r.detail) || 'Eroare'); })
+      .catch(fail);
+  }
+
+  function delEntry(list, value) {
+    mgConfirm({
+      title: 'Ștergi „' + value + '"?',
+      html: 'Mailurile de la acest expeditor <b>nu vor mai fi redirecționate</b> spre VATHUB.',
+      icon: 'warning', confirmText: 'Da, șterge', confirmColor: '#ef4444'
+    }).then(function(ok) {
+      if (!ok) return;
+      api(VH + '/entries?list=' + list + '&value=' + encodeURIComponent(value), { method: 'DELETE' })
+        .then(function(r) { if (r && r.ok) { mgToast('success', 'Șters'); reload(); } else mgToast('error', (r && r.detail) || 'Eroare'); })
+        .catch(fail);
+    });
+  }
+
+  function runNow() {
+    setBusy(true);
+    api(VH + '/run', { method: 'POST' })
+      .then(function(r) {
+        setBusy(false);
+        if (!r || typeof r.sent !== 'number') { mgToast('error', (r && r.detail) || 'Eroare la rulare'); return; }
+        if (r.skipped) Swal.fire({ icon: 'info', title: r.matched + ' potrivite, 0 trimise', text: r.skipped, background: 'var(--bg2)', color: 'var(--tx)' });
+        else mgToast(r.failed || r.blocked ? 'warning' : 'success',
+          r.matched + ' potrivite, ' + r.sent + ' trimise' + (r.failed ? ', ' + r.failed + ' eșuate' : '') + (r.blocked ? ', ' + r.blocked + ' blocate' : ''));
+        reload();
+      }).catch(fail);
+  }
+
+  function backfill() {
+    Swal.fire({
+      title: 'Caută retroactiv',
+      html: 'Scanarea automată merge doar înainte. Caută în mailurile deja intrate și pune la coadă ce se potrivește.',
+      input: 'number', inputValue: 7, inputLabel: 'Câte zile în urmă',
+      inputAttributes: { min: 1, max: 90 },
+      showCancelButton: true, confirmButtonText: 'Caută',
+      background: 'var(--bg2)', color: 'var(--tx)'
+    }).then(function(res) {
+      if (!res.isConfirmed) return;
+      var days = parseInt(res.value) || 7;
+      setBusy(true);
+      api(VH + '/backfill?days=' + days + '&limit=1000', { method: 'POST' })
+        .then(function(r) {
+          setBusy(false);
+          if (r && typeof r.matched === 'number') {
+            mgToast('success', r.matched + ' potrivite din ' + r.scanned + ' mailuri, ' + (r.sent || 0) + ' trimise');
+            reload();
+          } else mgToast('error', (r && r.detail) || 'Eroare la căutare');
+        }).catch(fail);
+    });
+  }
+
+  function retry(id) {
+    api(VH + '/retry?id=' + id, { method: 'POST' })
+      .then(function(r) { if (r && r.ok) { mgToast('success', 'Repus pe coadă'); reload(); } else mgToast('error', (r && r.detail) || 'Eroare'); })
+      .catch(fail);
+  }
+
+  if (!cfg || !form) return h('div', { style: { color: 'var(--t2)', fontSize: 13 } }, 'Se încarcă...');
+
+  var inp = { width: '100%', padding: '6px 10px', borderRadius: 6, border: '1px solid var(--bd)', background: 'var(--bg)', color: 'var(--tx)', fontSize: 13, boxSizing: 'border-box' };
+  var lbl = { fontSize: 12, color: 'var(--t2)', marginBottom: 4, display: 'block' };
+  var st = cfg.stats || {};
+
+  function dt(v) { if (!v) return '—'; try { return new Date(v).toLocaleString('ro-RO', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) { return String(v); } }
+  function stBadge(x) {
+    var m = { sent: ['b-clean', 'trimis'], failed: ['b-strict', 'eșuat'], blocked: ['b-strict', 'blocat'] };
+    var v = m[x] || ['b-quarantined', cfg.can_send ? 'în așteptare' : 'ar fi plecat'];
+    return h('span', { className: 'badge ' + v[0] }, v[1]);
+  }
+
+  var needle = q.trim().toLowerCase();
+  var entries = [];
+  ['domains', 'addresses'].forEach(function(k) {
+    (cfg[k] || []).forEach(function(it) {
+      if (needle && (it.value || '').indexOf(needle) < 0 && (it.note || '').toLowerCase().indexOf(needle) < 0) return;
+      entries.push({ list: k, it: it });
+    });
+  });
+  var items = (log && log.items) || [];
+
+  return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, [
+
+    // ── Stare + acțiuni ───────────────────────────────────────────────────
+    h('div', { key: 'sw', className: 'card', style: { padding: 14 } }, [
+      h('div', { key: 'top', style: { display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap' } }, [
+        h('div', { key: 't', style: { flex: 1, minWidth: 260 } }, [
+          h('div', { key: 'h', style: { fontSize: 14, fontWeight: 700 } }, 'Redirect VATHUB (recuperare TVA)'),
+          h('div', { key: 's', style: { fontSize: 12, color: 'var(--t2)', marginTop: 3, maxWidth: 720 } },
+            cfg.enabled
+              ? 'PORNIT: mailurile primite de la autoritățile fiscale din listă se retrimit automat către ' + (cfg.target || '—') + ', de unde le citește aplicația VATHUB.'
+              : 'OPRIT: mailurile autorităților fiscale rămân doar în căsuță, nu se retrimit nicăieri.')
+        ]),
+        h('div', { key: 'btns', style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } }, [
+          h('button', { key: 'run', className: 'btn secondary', disabled: busy || !cfg.active, onClick: runNow,
+            title: 'Scanează mailurile noi și trimite ce s-a potrivit', style: { whiteSpace: 'nowrap' } }, 'Rulează acum'),
+          h('button', { key: 'bf', className: 'btn secondary', disabled: busy || !cfg.active, onClick: backfill,
+            title: 'Caută și în mailurile deja intrate', style: { whiteSpace: 'nowrap' } }, 'Caută retroactiv'),
+          h('button', { key: 'tog', className: 'btn', disabled: busy, onClick: function() { saveCfg({ enabled: !form.enabled }); },
+            style: { background: form.enabled ? 'var(--gn)' : 'var(--t3)', color: '#fff', whiteSpace: 'nowrap' } },
+            busy ? '...' : (form.enabled ? '● Activ — Oprește' : '○ Oprit — Pornește'))
+        ])
+      ]),
+
+      // Staging si productia citesc ACEEASI casuta. Daca ar trimite amandoua, VATHUB ar
+      // primi cate doua copii din fiecare decizie — de aceea trimiterea e oprita in cod
+      // pe staging. Potrivirea merge, ca lista sa poata fi verificata inainte.
+      cfg.can_send ? null : h('div', { key: 'env', className: 'badge b-quarantined',
+        style: { display: 'block', marginTop: 12, padding: '8px 11px', fontSize: 12, lineHeight: 1.5 } }, [
+        h('b', { key: 'b' }, cfg.production ? 'Trimiterea e blocată. ' : 'Mediu de STAGING — nu pleacă niciun mail. '),
+        cfg.block_reason || 'Redirectul trimite doar din producție.'
+      ]),
+      (cfg.can_send && !cfg.smtp_ready) ? h('div', { key: 'smtp', className: 'badge b-strict',
+        style: { display: 'block', marginTop: 12, padding: '8px 11px', fontSize: 12, lineHeight: 1.5 } },
+        'Contul SMTP no-reply nu e configurat (tabul „Mail-uri no-reply"). Fără el potrivirile se adună în coadă, dar nu pleacă niciun mail.') : null,
+
+      h('div', { key: 'form', style: { display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--bd)' } }, [
+        h('div', { key: 'tg', style: { minWidth: 240 } }, [
+          h('label', { key: 'l', style: lbl }, 'Adresa destinație'),
+          h('select', {
+            key: 's', value: form.target, style: inp,
+            onChange: function(e) { setForm(Object.assign({}, form, { target: e.target.value })); }
+          }, (cfg.allowed_targets || []).map(function(t) { return h('option', { key: t, value: t }, t); }))
+        ]),
+        h('div', { key: 'ag', style: { width: 150 } }, [
+          h('label', { key: 'l', style: lbl }, 'Vechime maximă (ore)'),
+          h('input', {
+            key: 'i', type: 'number', min: 1, max: 720, value: form.max_age_hours, style: inp,
+            onChange: function(e) { setForm(Object.assign({}, form, { max_age_hours: parseInt(e.target.value) || 24 })); }
+          })
+        ]),
+        h('div', { key: 'sv', style: { display: 'flex', alignItems: 'flex-end' } },
+          h('button', { className: 'btn', disabled: busy, onClick: function() { saveCfg(); } }, 'Salvează'))
+      ]),
+
+      h('div', { key: 'help', style: { marginTop: 12, fontSize: 12, color: 'var(--t3)', lineHeight: 1.6 } },
+        'Mailul original pleacă intact, atașat ca .eml — atașamentele și subiectul (numărul de referință RO2026…, după care VATHUB potrivește dosarul) rămân neatinse, iar expeditorul real ajunge în Reply-To. ' +
+        'Domeniile prind și subdomeniile (nav.gov.hu prinde elekafa.nav.gov.hu), iar adresa exactă bate domeniul. ' +
+        'O regulă adăugată azi se aplică mailurilor următoare; pentru cele deja intrate folosește „Caută retroactiv".')
+    ]),
+
+    // ── Contoare ──────────────────────────────────────────────────────────
+    h('div', { key: 'kpi', className: 'grid grid-cols-4' }, [
+      h('div', { key: 1, className: 'card stat gn' }, [
+        h('div', { key: 'l', className: 'lbl' }, 'Trimise'),
+        h('div', { key: 'v', className: 'val' }, st.sent || 0)
+      ]),
+      h('div', { key: 2, className: 'card stat yw' }, [
+        h('div', { key: 'l', className: 'lbl' }, cfg.can_send ? 'În așteptare' : 'Ar fi plecat'),
+        h('div', { key: 'v', className: 'val' }, st.pending || 0)
+      ]),
+      h('div', { key: 3, className: 'card stat rd' }, [
+        h('div', { key: 'l', className: 'lbl' }, 'Eșuate'),
+        h('div', { key: 'v', className: 'val' }, (st.failed || 0) + (st.blocked || 0))
+      ]),
+      h('div', { key: 4, className: 'card stat bl' }, [
+        h('div', { key: 'l', className: 'lbl' }, 'Reguli active'),
+        h('div', { key: 'v', className: 'val' }, ((cfg.counts && cfg.counts.domains.active) || 0) + ((cfg.counts && cfg.counts.addresses.active) || 0))
+      ])
+    ]),
+
+    // ── Lista expeditori ──────────────────────────────────────────────────
+    h('div', { key: 'list', className: 'card', style: { padding: 14 } }, [
+      h('div', { key: 'h', style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 } }, [
+        h('div', { key: 't', style: { fontSize: 14, fontWeight: 700, flex: 1, minWidth: 200 } },
+          'Expeditori urmăriți (' + ((cfg.counts && cfg.counts.domains.total) || 0) + ' domenii, ' + ((cfg.counts && cfg.counts.addresses.total) || 0) + ' adrese)'),
+        h('input', { key: 'q', value: q, placeholder: 'Caută în listă...', style: Object.assign({}, inp, { width: 200 }),
+          onChange: function(e) { setQ(e.target.value); } })
+      ]),
+      h('div', { key: 'add', style: { display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' } }, [
+        h('select', {
+          key: 'l', value: draft.list, style: Object.assign({}, inp, { width: 120 }),
+          onChange: function(e) { setDraft(Object.assign({}, draft, { list: e.target.value })); }
+        }, [h('option', { key: 'd', value: 'domains' }, 'domeniu'), h('option', { key: 'a', value: 'addresses' }, 'adresă')]),
+        h('input', {
+          key: 'v', value: draft.value, placeholder: 'ex: bzst.bund.de sau nume@autoritate.ro',
+          style: Object.assign({}, inp, { flex: 1, minWidth: 220 }),
+          onChange: function(e) { setDraft(Object.assign({}, draft, { value: e.target.value })); },
+          onKeyDown: function(e) { if (e.key === 'Enter') addEntry(); }
+        }),
+        h('input', {
+          key: 'n', value: draft.note, placeholder: 'notă (ex: DE — BZSt)',
+          style: Object.assign({}, inp, { flex: 1, minWidth: 160 }),
+          onChange: function(e) { setDraft(Object.assign({}, draft, { note: e.target.value })); },
+          onKeyDown: function(e) { if (e.key === 'Enter') addEntry(); }
+        }),
+        h('button', { key: 'b', className: 'btn', disabled: busy, onClick: addEntry, style: { whiteSpace: 'nowrap' } }, 'Adaugă')
+      ]),
+      h('div', { key: 'tbl', style: { maxHeight: 340, overflow: 'auto' } },
+        h('table', null, [
+          h('thead', { key: 'h' }, h('tr', null, ['Valoare', 'Tip', 'Notă', 'Stare', ''].map(function(c, i) {
+            return h('th', { key: i, style: i === 4 ? { textAlign: 'right' } : null }, c);
+          }))),
+          h('tbody', { key: 'b' }, entries.length ? entries.map(function(row) {
+            var it = row.it;
+            return h('tr', { key: row.list + ':' + it.value, style: it.muted ? { opacity: 0.55 } : null }, [
+              h('td', { key: 1, style: { fontFamily: 'monospace' } }, it.value),
+              h('td', { key: 2, style: { color: 'var(--t2)', fontSize: 12 } }, row.list === 'domains' ? 'domeniu' : 'adresă'),
+              h('td', { key: 3, style: { color: 'var(--t3)', fontSize: 12 } }, it.note || '—'),
+              h('td', { key: 4 }, h('span', { className: 'badge ' + (it.muted ? 'b-ndr' : 'b-clean') }, it.muted ? 'suspendat' : 'activ')),
+              h('td', { key: 5, style: { textAlign: 'right', whiteSpace: 'nowrap' } }, [
+                h('button', { key: 'm', className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11 },
+                  onClick: function() { toggleEntry(row.list, it.value, it.muted); } }, it.muted ? 'Activează' : 'Suspendă'),
+                ' ',
+                h('button', { key: 'd', className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11, marginLeft: 4 },
+                  onClick: function() { delEntry(row.list, it.value); } }, 'Șterge')
+              ])
+            ]);
+          }) : [h('tr', { key: 'e' }, h('td', { colSpan: 5, style: { padding: 20, textAlign: 'center', color: 'var(--t2)' } },
+            needle ? 'Nicio intrare care să conțină „' + q + '".' : 'Nicio intrare în listă.'))])
+        ]))
+    ]),
+
+    // ── Jurnal ────────────────────────────────────────────────────────────
+    h('div', { key: 'log', className: 'card', style: { padding: 14 } }, [
+      h('div', { key: 't', style: { fontSize: 14, fontWeight: 700, marginBottom: 10 } }, 'Mailuri potrivite (' + items.length + ')'),
+      h('div', { key: 'tbl', style: { maxHeight: 380, overflow: 'auto' } },
+        h('table', null, [
+          h('thead', { key: 'h' }, h('tr', null, ['Expeditor', 'Subiect', 'Regulă', 'Primit', 'Trimis', 'Stare', ''].map(function(c, i) {
+            return h('th', { key: i, style: i === 6 ? { textAlign: 'right' } : null }, c);
+          }))),
+          h('tbody', { key: 'b' }, items.length ? items.map(function(m) {
+            return h('tr', { key: m.id }, [
+              h('td', { key: 1, style: { fontFamily: 'monospace', fontSize: 12 } }, m.from_address || '—'),
+              h('td', { key: 2, style: { maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: m.subject || '' }, m.subject || '—'),
+              h('td', { key: 3, style: { color: 'var(--t3)', fontSize: 12 } }, m.matched_rule || '—'),
+              h('td', { key: 4, style: { whiteSpace: 'nowrap', fontSize: 12, color: 'var(--t2)' } }, dt(m.received_at)),
+              h('td', { key: 5, style: { whiteSpace: 'nowrap', fontSize: 12, color: 'var(--t2)' } }, dt(m.forwarded_at)),
+              h('td', { key: 6 }, [
+                stBadge(m.status),
+                m.error ? h('div', { key: 'e', style: { fontSize: 11, color: 'var(--rd)', maxWidth: 240, marginTop: 3 } }, String(m.error).slice(0, 110)) : null
+              ]),
+              h('td', { key: 7, style: { textAlign: 'right' } },
+                (m.status === 'failed' || m.status === 'blocked')
+                  ? h('button', { className: 'btn secondary', style: { padding: '2px 8px', fontSize: 11 }, onClick: function() { retry(m.id); } }, 'Reîncearcă')
+                  : null)
+            ]);
+          }) : [h('tr', { key: 'e' }, h('td', { colSpan: 7, style: { padding: 20, textAlign: 'center', color: 'var(--t2)' } }, 'Niciun mail potrivit încă.'))])
+        ]))
+    ])
+  ]);
+}
+
 function Settings({ user }) {
   const [sub, setSub] = useState('rules');
-  const SUBS = [ { k:'rules', l:'Reguli' }, { k:'security', l:'Securitate' }, { k:'cts', l:'Conexiune API' }, { k:'backups', l:'Backup-uri' }, { k:'noreply', l:'Mail-uri no-reply' } ];
+  const SUBS = [ { k:'rules', l:'Reguli' }, { k:'security', l:'Securitate' }, { k:'cts', l:'Conexiune API' }, { k:'backups', l:'Backup-uri' }, { k:'noreply', l:'Mail-uri no-reply' }, { k:'vathub', l:'Redirect VATHUB' } ];
   // Exportul bazei contine date reale de client — doar developer.
   if (user && user.access_role === 'developer') SUBS.push({ k:'db-export', l:'Export bază' });
   return h('div', null, [
@@ -10617,6 +10647,7 @@ function Settings({ user }) {
       sub==='security' ? h(SecurityPoliciesPanel, { key:'sec' }) :
       sub==='backups' ? h(BackupsPanel, { key:'b' }) :
       sub==='noreply' ? h(NoreplyPanel, { key:'noreply' }) :
+      sub==='vathub' ? h(VathubPanel, { key:'vathub' }) :
       sub==='db-export' ? h(DbExportPanel, { key:'dbx' }) :
       h('div', { style: { display:'grid', gridTemplateColumns:'1fr 1fr', gap:14, alignItems:'start' } }, [
         h(RulesPanel, { key:'r' }),
