@@ -32,6 +32,7 @@ from sqlalchemy import text
 
 from app.services import personal_smtp, vathub_forward
 from app.services.credential_crypto import decrypt_credentials
+from app.services import vathub_send_guard as _guard
 from app.services.vathub_send_guard import assert_forward_target_allowed, VathubForwardBlocked
 
 logger = logging.getLogger("mailguard.vathub_inbox")
@@ -316,6 +317,15 @@ def _noreply_cfg(db):
     return cfg
 
 
+def send_state(db) -> dict:
+    """De ce (nu) pleacă mailurile — pentru UI, fără să trimită nimic."""
+    cfg = load_config(db)
+    target = (cfg.get("target") or "").strip().lower()
+    allowed, why = _guard.forward_allowed(target)
+    return {"production": _guard.is_production(), "can_send": bool(allowed),
+            "block_reason": why, "smtp_ready": smtp_ready(db)}
+
+
 def smtp_ready(db) -> bool:
     """Contul SMTP no-reply e configurat și decriptabil? Fără el nimic nu pleacă."""
     try:
@@ -366,6 +376,22 @@ def forward_pending(db, limit: int = FORWARD_BATCH) -> dict:
         return out
 
     target = (cfg.get("target") or "").strip().lower()
+
+    # ⛔ PRODUCȚIE ONLY. Staging și producția citesc ACEEAȘI căsuță, deci potrivesc
+    # aceleași mailuri; dacă ar trimite amândouă, VATHUB ar primi câte două copii din
+    # fiecare decizie. Ieșim ÎNAINTE de rezervare, deci rândurile rămân `pending` și se
+    # văd în jurnal ca „ar fi plecat astea" — lista se poate verifica pe staging fără
+    # ca vreun mail să plece. Garda per mail (`assert_forward_target_allowed`) rămâne
+    # a doua barieră, în caz că cineva ocolește drumul ăsta.
+    allowed, why = _guard.forward_allowed(target)
+    if not allowed:
+        out["skipped"] = why
+        out["pending"] = db.execute(text(
+            "SELECT count(*) FROM vathub_inbox_forward WHERE status='pending'"
+        )).scalar() or 0
+        if out["pending"]:
+            logger.info("vathub inbox: %d mailuri potrivite, NETRIMISE — %s", out["pending"], why)
+        return out
 
     # Verificarea SMTP stă ÎNAINTE de rezervare: rezervarea consumă o încercare, iar
     # un cont SMTP neconfigurat ar arde astfel toate cele 5 încercări în 25 de minute

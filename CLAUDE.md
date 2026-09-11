@@ -211,11 +211,30 @@ redirectul nu mai depinde de credențialele IMAP/SMTP personale ale nimănui.
 INTACTĂ în cod și în schemă, dar e no-op; se reactivează prin config, fără deploy. Nu o șterge:
 e singurul plan de rezervă dacă mailurile autorităților ajung din nou doar pe adrese personale.
 
+⛔ **Se trimite DOAR din PRODUCȚIE** (Raul Covaci, 2026-09-12 — REVOCĂ aprobarea de trimitere reală
+pe staging din 2026-08-20). Staging și producția citesc ACEEAȘI căsuță, deci potrivesc aceleași
+mailuri; dacă ar trimite amândouă, VATHUB ar primi câte două copii din fiecare decizie 318. Blocajul
+e în COD (`vathub_send_guard.is_production()`), nu în config, și acționează în DOUĂ locuri: ieșirea
+devreme din `vathub_inbox.forward_pending()` (înainte de rezervare, deci nu arde încercări) și garda
+per mail, imediat înainte de SMTP.
+
+`is_production()` cere ca AMBELE frâne să spună „producție": `MAILGUARD_ENV`, dacă e setat explicit,
+are ultimul cuvânt (deci `MAILGUARD_ENV=staging` oprește redirectul chiar și pe o mașină de
+producție); altfel decide `APP_ENV`, care pe staging e explicit `staging`. Dacă nu se poate citi
+configul → NU e producție. ⚠️ Pe producție `APP_ENV` TREBUIE să fie `production`, altfel redirectul
+tace — direcție fail-safe, dar feature mort.
+
+⚠️ **Pe staging potrivirea RĂMÂNE activă**, deliberat: rândurile se scriu în
+`vathub_inbox_forward` și se văd în jurnal ca „ar fi plecat", deci lista se poate verifica înainte
+de promovare, fără ca vreun mail să plece. Contorul `attempts` NU crește — ieșirea e înainte de
+rezervare, deci nimic nu ajunge `failed` din cauza mediului. Pentru un test real de SMTP există
+`MAILGUARD_VATHUB_ALLOW_STAGING=on`, care permite trimiterea pe staging **numai** către cele două
+adrese personale ale lui Raul, niciodată către `vathub@cargotrack.ro`.
+
 ⛔ **Destinația e whitelist-ată în cod, nu în config.** `assert_forward_target_allowed()` se apelează
 **per mail, chiar înainte de conectarea SMTP** — nu la salvarea configului, fiindcă acesta se poate
 schimba din UI între două rulări. Permise: `vathub@cargotrack.ro` + cele două adrese de test ale lui
-Raul. Decizie Raul Covaci, 2026-08-20 (aprobare explicită pentru trimitere reală și pe staging).
-Garda din `feedback_send_guard` e SEPARATĂ și rămâne neatinsă.
+Raul. Decizie Raul Covaci, 2026-08-20. Garda din `feedback_send_guard` e SEPARATĂ și rămâne neatinsă.
 
 ⚠️ **Scanarea merge pe CURSOR de id** (`settings.vathub.inbox_cursor`), nu pe un flag per rând:
 `emails` are milioane de rânduri, deci „neexaminat încă" ar fi adevărat pe toate la instalare —

@@ -8,6 +8,34 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.1 - 2026-09-12
+
+### PATCH — Redirectul VATHUB trimite DOAR din producție
+
+Staging și producția citesc **aceeași căsuță**, deci potrivesc aceleași mailuri. Dacă ar forwarda
+amândouă, VATHUB ar primi câte două copii din fiecare decizie 318. Cerință Raul Covaci: blocaj în
+cod, nu doar lipsa contului SMTP de pe staging.
+
+Blocajul e în `vathub_send_guard.is_production()` și acționează în **două locuri**: ieșirea devreme
+din `vathub_inbox.forward_pending()` — înainte de rezervare, deci nu arde încercări — și garda per
+mail, imediat înainte de conectarea SMTP. `is_production()` cere ca ambele frâne să spună
+„producție": `MAILGUARD_ENV`, dacă e setat explicit, are ultimul cuvânt (un `MAILGUARD_ENV=staging`
+oprește redirectul chiar și pe o mașină de producție); altfel decide `APP_ENV`, care pe staging e
+explicit `staging`. Config necitibil → NU e producție.
+
+**Pe staging potrivirea rămâne activă, deliberat.** Rândurile se scriu în coadă și se văd în jurnal
+ca „ar fi plecat", deci lista de 29 de adrese + 23 de domenii se poate verifica înainte de
+promovare, fără ca vreun mail să plece. `attempts` nu crește, deci nimic nu ajunge `failed` din
+cauza mediului. Tabul afișează un banner galben cu motivul.
+
+**Supapă de test:** `MAILGUARD_VATHUB_ALLOW_STAGING=on` permite trimiterea pe staging **numai**
+către cele două adrese personale ale lui Raul — niciodată către `vathub@cargotrack.ro`. Implicit
+oprită. Asta revocă aprobarea din 2026-08-20 pentru trimitere reală de pe staging.
+
+⚠️ Pe producție `APP_ENV` trebuie să fie `production`, altfel redirectul tace (direcție fail-safe).
+
+---
+
 ## v3.24.0 - 2026-09-12
 
 ### MINOR — Redirectul VATHUB se mută din căsuțele personale în căsuța principală

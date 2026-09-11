@@ -4377,7 +4377,8 @@ function VathubRedirect({ setTopbarRight }) {
       .then(function(r) {
         setBusy(false);
         if (r && typeof r.sent === 'number') {
-          mgToast(r.failed || r.blocked ? 'warning' : 'success',
+          if (r.skipped) mgToast('info', r.matched + ' potrivite, 0 trimise — ' + r.skipped, 7000);
+          else mgToast(r.failed || r.blocked ? 'warning' : 'success',
             r.matched + ' potrivite, ' + r.sent + ' trimise' + (r.failed ? ', ' + r.failed + ' esuate' : '') + (r.blocked ? ', ' + r.blocked + ' blocate' : ''));
           reload();
         } else mgToast('error', (r && r.detail) || 'Eroare la rulare');
@@ -4467,13 +4468,23 @@ function VathubRedirect({ setTopbarRight }) {
       ]),
       h('div', { key: 'st', style: { marginTop: 10, display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--t2)' } }, [
         h('span', { key: 1 }, ['Trimise: ', h('b', { key: 'b', style: { color: 'var(--gn)' } }, st.sent || 0)]),
-        h('span', { key: 2 }, ['In asteptare: ', h('b', { key: 'b', style: { color: 'var(--yw)' } }, st.pending || 0)]),
+        h('span', { key: 2, title: cfg.can_send ? '' : 'Pe staging raman in asteptare: potrivirea merge, trimiterea nu' },
+          [cfg.can_send ? 'In asteptare: ' : 'Ar fi plecat: ', h('b', { key: 'b', style: { color: 'var(--yw)' } }, st.pending || 0)]),
         h('span', { key: 3 }, ['Esuate: ', h('b', { key: 'b', style: { color: (st.failed || st.blocked) ? 'var(--rd)' : 'inherit' } }, (st.failed || 0) + (st.blocked || 0))]),
         h('span', { key: 4 }, ['Reguli active: ', h('b', { key: 'b' }, ((cfg.counts && cfg.counts.domains.active) || 0) + ' domenii, ' + ((cfg.counts && cfg.counts.addresses.active) || 0) + ' adrese')]),
       ]),
-      cfg.smtp_ready ? null : h('div', {
+      // Staging si productia citesc ACEEASI casuta. Daca ar trimite amandoua, VATHUB
+      // ar primi cate doua copii din fiecare decizie — de aceea trimiterea e oprita in
+      // cod pe staging. Potrivirea merge, ca lista sa poata fi verificata inainte.
+      cfg.can_send ? null : h('div', {
+        key: 'env', style: { marginTop: 10, padding: '8px 11px', borderRadius: 5, background: 'var(--yw)', color: '#000', fontSize: 12, lineHeight: 1.5 }
+      }, [
+        h('b', { key: 'b' }, cfg.production ? 'Trimiterea e blocata. ' : 'Mediu de STAGING — nu se trimite niciun mail. '),
+        cfg.block_reason || 'Redirectul trimite doar din productie.'
+      ]),
+      (cfg.can_send && !cfg.smtp_ready) ? h('div', {
         key: 'w', style: { marginTop: 10, padding: '7px 10px', borderRadius: 5, background: 'var(--rd)', color: '#fff', fontSize: 12 }
-      }, 'Contul SMTP no-reply nu e configurat (Setari → Auto-reply no-reply). Fara el potrivirile se aduna in coada, dar nu pleaca niciun mail.'),
+      }, 'Contul SMTP no-reply nu e configurat (Setari → Auto-reply no-reply). Fara el potrivirile se aduna in coada, dar nu pleaca niciun mail.') : null,
       h('div', { key: 'h', style: { marginTop: 9, fontSize: 11, color: 'var(--t3)', lineHeight: 1.55 } },
         'Mailul original pleaca INTACT, atasat ca .eml — atasamentele si subiectul (numarul de referinta RO2026…, dupa care VATHUB potriveste dosarul) raman neatinse. ' +
         'Expeditorul real ajunge in Reply-To. Domeniile prind si subdomeniile (nav.gov.hu prinde elekafa.nav.gov.hu), iar adresa exacta bate domeniul. ' +

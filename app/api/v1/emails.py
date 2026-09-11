@@ -1365,7 +1365,10 @@ def vh_inbox_rules(db: Session = Depends(get_db), _admin=Depends(get_current_adm
         out["stats"] = _vhi.stats(db)
     except Exception:
         out["stats"] = {}
-    out["smtp_ready"] = _vhi.smtp_ready(db)
+    # Trimiterea e permisă DOAR din producție (vezi vathub_send_guard). Pe staging
+    # potrivirea merge, dar nimic nu pleacă — UI-ul trebuie să spună asta explicit,
+    # altfel coada plină de „în așteptare" pare o defecțiune.
+    out.update(_vhi.send_state(db))
     return out
 
 
@@ -1490,6 +1493,7 @@ def vh_inbox_run(db: Session = Depends(get_db), _admin=Depends(get_current_admin
                                  "(verifica bifa Redirect activ si sursa configurata)")
     res = _vhi.scan(db)
     res.update(_vhi.forward_pending(db))
+    res.update(_vhi.send_state(db))
     return res
 
 
