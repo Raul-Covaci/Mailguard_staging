@@ -12,7 +12,7 @@ pentru emailurile normale. (Calea auto_report/auto_closed era livrata de feed,
 dar ingestia CTS o respingea repetat ca 'esec la salvare'.)
 
 Planificare: self-gated pe cron-ul existent de 5 min (via /process/run-now).
-Ruleaza o singura data pe zi, dupa ora 10:00 (Europe/Bucharest), pentru ZIUA DE
+Ruleaza o singura data pe zi, dupa ora 09:00 (Europe/Bucharest), pentru ZIUA DE
 IERI. Idempotent: marker in tabela `settings` (ndr_report.last_report) + email
 sintetic cu graph_message_id unic pe data (ndr-report-YYYY-MM-DD).
 """
@@ -33,7 +33,7 @@ from app.services.manual_review import get_setting, set_setting
 logger = logging.getLogger("mailguard.ndr_report")
 
 DEFAULT_RECIPIENT = "office@cargotrack.ro"
-DEFAULT_SEND_HOUR = 10
+DEFAULT_SEND_HOUR = 9
 SENDER_ADDR = "iris-rapoarte@mailguard.cargotrack.ro"
 SENDER_NAME = "IRIS Cargo360 — Raport Undeliverable"
 
@@ -201,7 +201,15 @@ def render_csv(rows):
     return buf.getvalue().encode("utf-8-sig")
 
 
-def render_html(rows, target_iso, recipient):
+def _send_hour(db):
+    """Ora configurata de trimitere (settings `ndr_report.send_hour`, implicit 9)."""
+    try:
+        return int(get_setting(db, "ndr_report.send_hour", DEFAULT_SEND_HOUR) or DEFAULT_SEND_HOUR)
+    except Exception:
+        return DEFAULT_SEND_HOUR
+
+
+def render_html(rows, target_iso, recipient, send_hour=None):
     th = ("padding:6px 10px;border:1px solid #d0d7de;background:#f6f8fa;"
           "text-align:left;font-size:13px")
     td = "padding:6px 10px;border:1px solid #d0d7de;font-size:13px;vertical-align:top"
@@ -235,8 +243,9 @@ def render_html(rows, target_iso, recipient):
         "(coloana <i>Observații</i> este liberă pentru notițe).</p>" % len(rows) +
         table +
         "<p style='color:#656d76;font-size:12px;margin-top:14px'>Generat automat "
-        "zilnic la ora 10:00 (Europe/București). Destinatar: %s.</p></div>"
-        % _html.escape(recipient))
+        "zilnic la ora %02d:00 (Europe/București). Destinatar: %s.</p></div>"
+        % (int(send_hour if send_hour is not None else DEFAULT_SEND_HOUR),
+           _html.escape(recipient)))
 
 
 def render_text(rows, target_iso):
@@ -286,7 +295,7 @@ def create_report_email(db, target_date, rows, csv_bytes, recipient, force=False
 
     fpath, fname = _write_csv_file(target_iso, csv_bytes)
     subject = "Raport zilnic Undeliverable — %s (%d intrări)" % (_ro_date(target_date), len(rows))
-    body_html = render_html(rows, target_iso, recipient)
+    body_html = render_html(rows, target_iso, recipient, _send_hour(db))
     body_text = render_text(rows, target_iso)
 
     # Calea CLEAN (status='clean' + queue_status='ready_for_cts' + ai_category != 'necunoscut'):
@@ -351,20 +360,22 @@ def preview_for_date(target_date):
         rows = collect_rows(db, target_date)
         return {"date": target_date.isoformat(), "count": len(rows), "rows": rows,
                 "recipient": recipient,
-                "html": render_html(rows, target_date.isoformat(), recipient)}
+                "html": render_html(rows, target_date.isoformat(), recipient,
+                                    _send_hour(db))}
     finally:
         db.close()
 
 
 def run_daily_ndr_report_if_due():
-    """Best-effort: ruleaza raportul pentru IERI o singura data/zi, dupa ora 10
-    (Europe/Bucharest). Nu arunca niciodata catre caller."""
+    """Best-effort: ruleaza raportul pentru IERI o singura data/zi, dupa ora
+    `ndr_report.send_hour` (implicit 9, Europe/Bucharest). Nu arunca niciodata
+    catre caller."""
     db = SessionLocal()
     try:
         if not get_setting(db, "ndr_report.enabled", True):
             return {"skipped": "disabled"}
 
-        send_hour = int(get_setting(db, "ndr_report.send_hour", DEFAULT_SEND_HOUR) or DEFAULT_SEND_HOUR)
+        send_hour = _send_hour(db)
         cur_hour = db.execute(text(
             "SELECT EXTRACT(hour FROM (now() AT TIME ZONE 'Europe/Bucharest'))::int")).scalar()
         if cur_hour is None or int(cur_hour) < send_hour:

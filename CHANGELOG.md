@@ -8,6 +8,23 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.16.6 - 2026-09-11
+
+### PATCH — Raportul zilnic Undeliverable pleacă la 09:00, nu la 10:00
+
+Cerere business: raportul cu emailurile Undeliverable (nelivrate) oprite din ziua precedentă
+ajunge la `office@cargotrack.ro` cu o oră mai devreme.
+
+Ora e un gate „după ora X", evaluat de cron-ul de 5 minute (`run_daily_ndr_report_if_due`), nu un
+moment fix — prima rulare de după 09:00 (Europe/București) trimite raportul, restul zilei sunt
+blocate de marker-ul `ndr_report.last_report` (o singură trimitere/zi, pentru ZIUA DE IERI).
+
+Schimbat în ambele locuri de unde poate veni valoarea: implicitul din cod
+(`ndr_report.DEFAULT_SEND_HOUR`) și cheia `settings.ndr_report.send_hour`, care bate implicitul
+(migrația `20260911c_ndr_report_send_hour_9.sql`, suprascrie doar valoarea veche 10). Textul de
+subsol din emailul raportului nu mai e hardcodat „ora 10:00" — afișează ora configurată efectiv,
+ca să nu poată diverge de gate.
+
 ## v3.16.5 - 2026-09-10
 
 ### PATCH — Monitor operațional: „deschis" se citea din listă albă de stări (muncă invizibilă)
