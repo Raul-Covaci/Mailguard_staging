@@ -91,8 +91,13 @@ răspuns trimis de operator) e notată 1-5 pe 5 criterii: corectitudine lingvist
 - Motor: `app/services/operator_email_eval.py` (`coverage()`, `start_job()`, `run_job()`,
   `pair_received()`). Rezultate: `email_operator_evaluations`
   (`migrations/20260912_operator_email_eval.sql`).
-- API: `GET /cts-training/operator-analysis[/clients|/cases|/case|/coverage]`,
+- API: `GET /cts-training/operator-analysis[/departments|/operator|/clients|/cases|/case|/coverage]`,
   `POST .../operator-analysis/run` + `GET .../run/status`. UI: `CtsOperatorAnalysis` în `mg-app.js`.
+- **Trei niveluri**, în ordinea în care se ia o decizie: `/departments` (unde stă rău echipa) →
+  `/operator-analysis` filtrat pe departament (cine) → `/operator` (fișa omului: scor față de media
+  departamentului, tendință lunară, % sub 3, temele recurente, cele mai slabe 10 răspunsuri).
+  Nivelul e DEDUS din filtre (`department`, `employee_id`), nu ținut ca stare separată — „înapoi"
+  înseamnă golirea unui filtru, deci UI-ul nu poate ajunge într-o stare contradictorie.
 - Config: `settings.emails.operator_eval` — `model_hint` (**`claude-sonnet-4-6`**; Haiku e prea
   grosier pentru „ce puncte au rămas neadresate"), `max_workers` (4, plafon 8), `max_per_run` (300),
   `min_reply_chars`, `allow_subject_match`. Bate implicitele din cod.
@@ -132,6 +137,14 @@ candidate la rulările următoare.
 asta îl face `_is_sent` să-l clasifice ca trimis), deci nu se potrivește cu niciun tichet primit. O
 căutare pe `message_id` întoarce zero rânduri și golește TOT raportul, tăcut. Rezervă: tichetul
 primit al mailului împerecheat, pe `email_id` (populat doar pe rândurile primite).
+
+⚠️ **Agregarea per operator NU grupează și pe departament.** `department` e cel istoric, al
+fiecărui răspuns, deci un om mutat la mijlocul perioadei ar apărea de DOUĂ ori în tabel. Se
+grupează pe `employee_id`, iar departamentul afișat e cel mai recent din fereastră.
+
+⚠️ **Fișa operatorului arată și media departamentului** (`scor_departament`): un 3.4 înseamnă
+altceva dacă echipa e la 3.5 decât dacă e la 4.6. Fără reper, cifra nu susține nicio decizie —
+la fel `pct_sub_3` (tipar vs. două răspunsuri slabe) și tendința lunară.
 
 ⚠️ Textele se curăță cu `category_classifier._email_body` (HTML + tăierea istoricului citat).
 Fără tăiere, modelul ar evalua mailul clientului — citat sub răspuns — ca și cum l-ar fi scris

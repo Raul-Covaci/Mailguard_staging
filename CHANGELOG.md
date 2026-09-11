@@ -8,6 +8,32 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.22.0 - 2026-09-12
+
+### MINOR — Analiza Operatori: trei niveluri de analiză + fișa operatorului
+
+Tabul coboară acum în trepte, în ordinea în care se ia o decizie:
+
+**1. Departamente** (`GET .../operator-analysis/departments`) — scor mediu, cele 5 criterii,
+procentul de răspunsuri sub 3 și cel mai slab operator din fiecare departament (minimum 3
+răspunsuri evaluate, ca să nu iasă în față cineva cu un singur mail).
+
+**2. Operatorii departamentului** — tabelul existent, filtrat. Selectorul de operator din bara de
+filtre permite și săritul direct la un om anume.
+
+**3. Fișa operatorului** (`GET .../operator-analysis/operator`) — construită pentru decizie, nu
+pentru raport: scorul **față de media departamentului** în aceeași perioadă (un 3.4 înseamnă
+altceva când echipa e la 3.5 decât când e la 4.6), tendința lunară, distribuția scorurilor pe
+benzi, procentul de răspunsuri sub 3, temele care se repetă în punctele neadresate și în sugestii,
+plus cele mai slabe 10 răspunsuri, deschise direct cu textele originale alături.
+
+Navigarea are breadcrumb, iar nivelul e **dedus din filtre** (`department`, `employee_id`), nu
+ținut ca stare separată — „înapoi" e golirea unui filtru, deci nu există stare contradictorie.
+Filtrarea pe perioadă rămâne valabilă la toate nivelurile.
+
+Popup-ul „Cum se citește" spune explicit ce NU susține o decizie: corectitudinea factuală nu e
+verificată, iar un scor mic pe puține răspunsuri nu e un tipar — cazurile se citesc înainte.
+
 ## v3.21.1 - 2026-09-12
 
 ### PATCH — Analiza Operatori: patru defecte găsite la verificarea modulului

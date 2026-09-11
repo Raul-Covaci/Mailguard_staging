@@ -177,7 +177,7 @@ SELECT s.* FROM sent s
             -- alea din raport pentru totdeauna.
             AND (ev.score_general IS NOT NULL
                  OR ev.skipped_reason IN ('no_pair', 'too_short', 'auto_reply',
-                                          'client_excluded', 'no_operator'))
+                                          'client_excluded', 'no_operator', 'no_ticket_id'))
             {force})
  ORDER BY s.ref_at DESC
  LIMIT :lim
@@ -424,7 +424,10 @@ def build_context(db, row, cfg) -> dict:
 
     reply = _clean_body(row["cts_reply_text"], row["cts_reply_html"])
     if not reply:
-        ctx["skip"] = "no_reply_text"
+        # Fara `cts_ticket_id` corpul nu se poate cere NICIODATA din gateway (el cheama pe
+        # `cts_email_log_id`). Motiv PERMANENT, altfel randul ar fi reales la fiecare rulare si ar
+        # ocupa degeaba un loc din plafonul `max_per_run`, impingand afara mailuri evaluabile.
+        ctx["skip"] = "no_reply_text" if row["cts_ticket_id"] else "no_ticket_id"
         return ctx
 
     paired, match_by = pair_received(db, row["msid"], row["to_email"], row["title"], row["ref_at"],
@@ -509,6 +512,9 @@ VALUES
      :score_general, :s_lingvistic, :s_ton, :s_claritate, :s_acoperire, :s_empatie,
      CAST(:puncte AS jsonb), CAST(:sugestii AS jsonb), CAST(:criterii AS jsonb),
      :mentiune, :skipped_reason, :model, :prompt_version)
+-- Garda din WHERE: la o rescorare (`force`) in care gateway-ul CTS sau cel AI pica, randul ar
+-- veni ca „sarit" (score_general NULL) si ar STERGE evaluarea buna de dinainte. Se suprascrie doar
+-- cu o evaluare noua reala, sau peste un rand care oricum nu avea scor.
 ON CONFLICT (cts_gt_id) DO UPDATE SET
     reply_at = EXCLUDED.reply_at, employee_id = EXCLUDED.employee_id,
     employee_email = EXCLUDED.employee_email, employee_name = EXCLUDED.employee_name,
@@ -521,6 +527,8 @@ ON CONFLICT (cts_gt_id) DO UPDATE SET
     sugestii = EXCLUDED.sugestii, criterii = EXCLUDED.criterii, mentiune = EXCLUDED.mentiune,
     skipped_reason = EXCLUDED.skipped_reason, model = EXCLUDED.model,
     prompt_version = EXCLUDED.prompt_version, evaluated_at = now()
+WHERE EXCLUDED.score_general IS NOT NULL
+   OR email_operator_evaluations.score_general IS NULL
 """
 
 

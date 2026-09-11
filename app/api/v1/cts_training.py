@@ -1263,7 +1263,13 @@ def operator_analysis(date_from: str = Query(""), date_to: str = Query(""),
     p = _oa_params(date_from, date_to, department, employee_id)
 
     rows = db.execute(text("""
-        SELECT ev.employee_id, ev.employee_name, ev.employee_email, ev.department,
+        SELECT ev.employee_id,
+               min(ev.employee_name)  AS employee_name,
+               min(ev.employee_email) AS employee_email,
+               -- Departamentul CEL MAI RECENT din fereastra, nu unul per grup: `ev.department` e
+               -- cel istoric, la data fiecarui raspuns, deci un om mutat la mijlocul perioadei ar
+               -- fi aparut de DOUA ori in tabel (o data per departament) daca ramanea in GROUP BY.
+               (array_agg(ev.department ORDER BY ev.reply_at DESC NULLS LAST))[1] AS department,
                count(*)                                   AS n,
                round(avg(ev.score_general)::numeric, 2)    AS scor,
                round(avg(ev.s_lingvistic)::numeric, 2)     AS lingvistic,
@@ -1277,7 +1283,7 @@ def operator_analysis(date_from: str = Query(""), date_to: str = Query(""),
           FROM email_operator_evaluations ev
          WHERE """ + _OA_BASE_WHERE + """
            AND ev.score_general IS NOT NULL
-         GROUP BY 1, 2, 3, 4
+         GROUP BY ev.employee_id
          ORDER BY scor ASC NULLS LAST, n DESC
     """), p).mappings().all()
 
@@ -1482,3 +1488,183 @@ def operator_analysis_run_status(job_id: str = Query(...), db: Session = Depends
     if st is None:
         raise HTTPException(404, "Job inexistent")
     return st
+
+@router.get("/cts-training/operator-analysis/departments")
+def operator_analysis_departments(date_from: str = Query(""), date_to: str = Query(""),
+                                  db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """NIVELUL 1 — statistica pe DEPARTAMENTE. Punctul de plecare al analizei: unde stă rău echipa,
+    înainte de a intra pe oameni. Departamentul e cel ISTORIC, al fiecărui răspuns."""
+    p = _oa_params(date_from, date_to, "", 0)
+    rows = db.execute(text("""
+        SELECT ev.department,
+               count(*)                                    AS n,
+               count(DISTINCT ev.employee_id)              AS operatori,
+               count(DISTINCT ev.client_id)                AS clienti,
+               round(avg(ev.score_general)::numeric, 2)     AS scor,
+               round(avg(ev.s_lingvistic)::numeric, 2)      AS lingvistic,
+               round(avg(ev.s_ton)::numeric, 2)             AS ton,
+               round(avg(ev.s_claritate)::numeric, 2)       AS claritate,
+               round(avg(ev.s_acoperire)::numeric, 2)       AS acoperire,
+               round(avg(ev.s_empatie)::numeric, 2)         AS empatie,
+               count(*) FILTER (WHERE jsonb_array_length(COALESCE(ev.puncte_neadresate,'[]'::jsonb)) > 0) AS cu_lipsuri,
+               count(*) FILTER (WHERE ev.score_general < 3) AS sub_3
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY ev.department
+         ORDER BY scor ASC NULLS LAST, n DESC
+    """), p).mappings().all()
+
+    # Cel mai slab operator din fiecare departament — semnalul care decide unde se intră în detaliu.
+    worst = db.execute(text("""
+        SELECT DISTINCT ON (ev.department) ev.department, ev.employee_id,
+               min(ev.employee_name) AS employee_name,
+               round(avg(ev.score_general)::numeric, 2) AS scor, count(*) AS n
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY ev.department, ev.employee_id
+        HAVING count(*) >= 3
+         ORDER BY ev.department, avg(ev.score_general) ASC
+    """), p).mappings().all()
+    wmap = {w["department"]: {"employee_id": w["employee_id"], "name": w["employee_name"],
+                              "scor": float(w["scor"]) if w["scor"] is not None else None,
+                              "n": w["n"]} for w in worst}
+
+    return {"range": {"from": p["df"], "to": p["dt"]}, "items": [{
+        "department": r["department"],
+        "department_label": _lbl(r["department"]) if r["department"] else "(fără departament)",
+        "n": r["n"], "operatori": r["operatori"], "clienti": r["clienti"],
+        "scor": float(r["scor"]) if r["scor"] is not None else None,
+        "criterii": {"lingvistic": float(r["lingvistic"] or 0), "ton": float(r["ton"] or 0),
+                     "claritate": float(r["claritate"] or 0), "acoperire": float(r["acoperire"] or 0),
+                     "empatie": float(r["empatie"] or 0)},
+        "cu_lipsuri": r["cu_lipsuri"], "pct_cu_lipsuri": _pct(r["cu_lipsuri"], r["n"]),
+        "sub_3": r["sub_3"], "pct_sub_3": _pct(r["sub_3"], r["n"]),
+        "cel_mai_slab": wmap.get(r["department"]),
+    } for r in rows]}
+
+
+@router.get("/cts-training/operator-analysis/operator")
+def operator_analysis_operator(employee_id: int = Query(..., ge=1), date_from: str = Query(""),
+                               date_to: str = Query(""),
+                               db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """NIVELUL 3 — fișa unui operator: sumar, evoluție lunară, distribuția scorurilor, temele
+    recurente din punctele neadresate și din sugestii, plus cele mai slabe răspunsuri.
+
+    Gândit pentru o decizie (discuție / sancțiune): arată dacă e o problemă sistematică sau două
+    răspunsuri slabe, pe ce criteriu anume, față de media departamentului și dacă tendința urcă.
+    """
+    p = _oa_params(date_from, date_to, "", employee_id)
+
+    head = db.execute(text("""
+        SELECT min(ev.employee_name) AS employee_name, min(ev.employee_email) AS employee_email,
+               (array_agg(ev.department ORDER BY ev.reply_at DESC NULLS LAST))[1] AS department,
+               count(*) AS n, count(DISTINCT ev.client_id) AS clienti,
+               round(avg(ev.score_general)::numeric, 2) AS scor,
+               min(ev.score_general) AS scor_min, max(ev.score_general) AS scor_max,
+               round(avg(ev.s_lingvistic)::numeric, 2) AS lingvistic,
+               round(avg(ev.s_ton)::numeric, 2)        AS ton,
+               round(avg(ev.s_claritate)::numeric, 2)  AS claritate,
+               round(avg(ev.s_acoperire)::numeric, 2)  AS acoperire,
+               round(avg(ev.s_empatie)::numeric, 2)    AS empatie,
+               count(*) FILTER (WHERE jsonb_array_length(COALESCE(ev.puncte_neadresate,'[]'::jsonb)) > 0) AS cu_lipsuri,
+               count(*) FILTER (WHERE ev.score_general < 3) AS sub_3,
+               count(*) FILTER (WHERE ev.score_general >= 4.5) AS excelente,
+               min(ev.reply_at) AS primul, max(ev.reply_at) AS ultimul
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+    """), p).mappings().first()
+
+    if not head or not head["n"]:
+        raise HTTPException(404, "Niciun răspuns evaluat pentru acest operator în perioada aleasă")
+
+    # Media departamentului în aceeași perioadă — un scor de 3.4 înseamnă altceva dacă toată echipa
+    # e la 3.5 decât dacă e la 4.6. Fără reper, cifra nu susține nicio decizie.
+    dept_avg = None
+    if head["department"]:
+        dept_avg = db.execute(text("""
+            SELECT round(avg(ev.score_general)::numeric, 2)
+              FROM email_operator_evaluations ev
+             WHERE ev.reply_at >= CAST(:df AS timestamptz) AND ev.reply_at < CAST(:dt AS timestamptz)
+               AND ev.department = :d AND ev.score_general IS NOT NULL
+        """), {"df": p["df"], "dt": p["dt"], "d": head["department"]}).scalar()
+
+    months = db.execute(text("""
+        SELECT to_char(date_trunc('month', ev.reply_at), 'YYYY-MM') AS luna, count(*) AS n,
+               round(avg(ev.score_general)::numeric, 2) AS scor
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1 ORDER BY 1
+    """), p).mappings().all()
+
+    buckets = db.execute(text("""
+        SELECT width_bucket(ev.score_general, 1, 5, 4) AS b, count(*) AS n
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1 ORDER BY 1
+    """), p).mappings().all()
+    bmap = {int(b["b"]): b["n"] for b in buckets if b["b"] is not None}
+
+    # Temele recurente: text liber de la model, deci gruparea e aproximativă (normalizată la
+    # minuscule). Utilă ca semnal — „de 7 ori nu a răspuns la termenul de livrare" —, nu ca metrică.
+    gaps = db.execute(text("""
+        SELECT lower(btrim(x)) AS tema, count(*) AS n
+          FROM email_operator_evaluations ev,
+               LATERAL jsonb_array_elements_text(COALESCE(ev.puncte_neadresate, '[]'::jsonb)) x
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10
+    """), p).mappings().all()
+
+    tips = db.execute(text("""
+        SELECT lower(btrim(x)) AS tema, count(*) AS n
+          FROM email_operator_evaluations ev,
+               LATERAL jsonb_array_elements_text(COALESCE(ev.sugestii, '[]'::jsonb)) x
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10
+    """), p).mappings().all()
+
+    worst_cases = db.execute(text("""
+        SELECT ev.id, ev.reply_at, ev.client_name, ev.score_general, ev.puncte_neadresate
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         ORDER BY ev.score_general ASC, ev.reply_at DESC LIMIT 10
+    """), p).mappings().all()
+
+    def _f(v):
+        return float(v) if v is not None else None
+
+    return {
+        "employee_id": employee_id,
+        "employee_name": head["employee_name"] or head["employee_email"],
+        "employee_email": head["employee_email"],
+        "department": head["department"],
+        "department_label": _lbl(head["department"]) if head["department"] else None,
+        "range": {"from": p["df"], "to": p["dt"]},
+        "n": head["n"], "clienti": head["clienti"],
+        "scor": _f(head["scor"]), "scor_min": _f(head["scor_min"]), "scor_max": _f(head["scor_max"]),
+        "scor_departament": _f(dept_avg),
+        "criterii": {"lingvistic": _f(head["lingvistic"]), "ton": _f(head["ton"]),
+                     "claritate": _f(head["claritate"]), "acoperire": _f(head["acoperire"]),
+                     "empatie": _f(head["empatie"])},
+        "cu_lipsuri": head["cu_lipsuri"], "pct_cu_lipsuri": _pct(head["cu_lipsuri"], head["n"]),
+        "sub_3": head["sub_3"], "pct_sub_3": _pct(head["sub_3"], head["n"]),
+        "excelente": head["excelente"],
+        "primul": head["primul"].isoformat() if head["primul"] else None,
+        "ultimul": head["ultimul"].isoformat() if head["ultimul"] else None,
+        "months": [{"luna": m["luna"], "n": m["n"], "scor": _f(m["scor"])} for m in months],
+        "distributie": [{"banda": "1 – 2", "n": bmap.get(1, 0)}, {"banda": "2 – 3", "n": bmap.get(2, 0)},
+                        {"banda": "3 – 4", "n": bmap.get(3, 0)}, {"banda": "4 – 5", "n": bmap.get(4, 0) + bmap.get(5, 0)}],
+        "teme_lipsuri": [{"tema": g["tema"], "n": g["n"]} for g in gaps],
+        "teme_sugestii": [{"tema": t["tema"], "n": t["n"]} for t in tips],
+        "cele_mai_slabe": [{"id": w["id"], "reply_at": w["reply_at"].isoformat() if w["reply_at"] else None,
+                            "client_name": w["client_name"] or "(client neidentificat)",
+                            "scor": _f(w["score_general"]),
+                            "puncte_neadresate": w["puncte_neadresate"] or []} for w in worst_cases],
+    }
