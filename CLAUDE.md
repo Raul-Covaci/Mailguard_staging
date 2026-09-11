@@ -76,6 +76,57 @@ modificările durabile se fac în fișierul din repo.
 
 ---
 
+## 🧑‍💼 ANALIZA OPERATORI — evaluarea AI a răspunsurilor pe email (2026-09-12)
+
+Tab nou în „Mail-uri CTS", după „Raport departamente". Fiecare pereche (mail primit de la client,
+răspuns trimis de operator) e notată 1-5 pe 5 criterii: corectitudine lingvistică, ton, claritate,
+**acoperirea sesizării**, empatie/soluție — plus scor general, punctele rămase fără răspuns și max
+3 sugestii.
+
+- Prompt: **`app/services/prompts/emails/operator_eval.txt`** — SINGURA sursă, citită direct din
+  repo (tiparul `satisfaction_trajectory_v6.txt`). NU există cache în DB și nici script de sync;
+  modificarea se face în fișier + deploy.
+- Motor: `app/services/operator_email_eval.py` (`coverage()`, `start_job()`, `run_job()`,
+  `pair_received()`). Rezultate: `email_operator_evaluations`
+  (`migrations/20260912_operator_email_eval.sql`).
+- API: `GET /cts-training/operator-analysis[/clients|/cases|/case|/coverage]`,
+  `POST .../operator-analysis/run` + `GET .../run/status`. UI: `CtsOperatorAnalysis` în `mg-app.js`.
+- Config: `settings.emails.operator_eval` — `model_hint` (**`claude-sonnet-4-6`**; Haiku e prea
+  grosier pentru „ce puncte au rămas neadresate"), `max_workers` (4, plafon 8), `max_per_run` (300),
+  `min_reply_chars`, `allow_subject_match`. Bate implicitele din cod.
+
+⛔ **Rularea e LA CERERE, niciodată automată.** Un apel AI per pereche, pe gateway-ul partajat cu
+clasificarea mailurilor, scorarea apelurilor și satisfacția. Butonul cere întâi `/coverage` (zero
+apeluri AI) și arată costul estimat în confirmare. Jobul rulează pe fir de fundal cu
+`pg_try_advisory_lock(778262)` — nu sincron în request (vezi `POST /clients/satisfaction-snapshot`,
+care face exact greșeala asta și ține requestul ~10 min).
+
+⚠️ **Corpul răspunsului NU e populat sistematic.** `cts_ground_truth.cts_reply_text` se scrie doar
+când cineva deschide tichetul în UI; feed-ul CTS nu-l trimite. Pasul 0 al jobului îl aduce cu
+`cts_groundtruth_sync.fetch_email_content()` (max 200 id-uri/apel) și îl scrie înapoi. Fără pasul
+ăsta, majoritatea răspunsurilor ar fi marcate tăcut `no_reply_text`.
+
+⚠️ **Trei capcane ale modelului de date** (respectate în motor, de respectat la orice modificare):
+`cts_ground_truth.email_id` e **NULL pe rândurile `sent`** (ingerăm doar Inbox-ul) — un
+`JOIN emails ON e.id = gt.email_id` acolo întoarce ZERO, exact bug-ul tăcut din
+`satisfaction_engine.py`; `cts_assignee_email` se scrie **doar pe `received`**, deci operatorul care
+a răspuns se ia de pe tichetul primit împerecheat; iar `cts_is_replica` (un tichet per destinatar)
+triplează numărătorile dacă selecția nu deduplică pe `message_id`.
+
+**Împerecherea răspuns → mail original are o singură implementare**: `operator_email_eval.pair_received()`,
+folosită și de `GET /cts-training/sent-body`. Întâi `raw->'extra'->>'msid'` pe
+`emails.email_headers->>'message_id'` (exact), apoi euristica destinatar + subiect normalizat.
+`match_by` se persistă pe fiecare evaluare; euristica se poate stinge din config. Răspunsurile fără
+pereche NU se evaluează (promptul are nevoie de ambele texte pentru „acoperirea sesizării") — se
+scriu cu `skipped_reason`, ca să nu fie reîncercate la fiecare rulare.
+
+⚠️ Textele se curăță cu `category_classifier._email_body` (HTML + tăierea istoricului citat).
+Fără tăiere, modelul ar evalua mailul clientului — citat sub răspuns — ca și cum l-ar fi scris
+operatorul. Modalul unui caz afișează EXACT textele trimise modelului, tocmai ca scorul să fie
+verificabil.
+
+---
+
 ## 📤 REDIRECT VATHUB — căsuțe personale → vathub@cargotrack.ro (2026-08-20)
 
 Mailurile oficiale de recuperare TVA (decizii pe declarația 318) sosesc pe adresa PERSONALĂ a

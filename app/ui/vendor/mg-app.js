@@ -1436,16 +1436,410 @@ function CtsDeptReport() {
   ]);
 }
 
+// ── Analiza Operatori ────────────────────────────────────────────────────────────────────────
+// Evaluarea AI a răspunsurilor pe email: fiecare pereche (mail client + răspuns operator) e
+// trecută prin promptul din `app/services/prompts/emails/operator_eval.txt` și primește 5 scoruri
+// 1-5. Rularea e LA CERERE (buton „Analizează perioada") — un apel AI per pereche, pe gateway-ul
+// partajat cu clasificarea mailurilor, scorarea apelurilor și satisfacția. De aceea butonul cere
+// întâi estimarea din /coverage și o pune în confirmare, înainte să cheltuie ceva.
+var OA_CRIT = [
+  { k: 'lingvistic', l: 'Corectitudine' },
+  { k: 'ton', l: 'Ton' },
+  { k: 'claritate', l: 'Claritate' },
+  { k: 'acoperire', l: 'Acoperire sesizare' },
+  { k: 'empatie', l: 'Empatie / soluție' }
+];
+var OA_SKIP_LABEL = {
+  no_pair: 'Fără mailul original (nu s-a putut împerechea)',
+  no_reply_text: 'Fără textul răspunsului',
+  too_short: 'Răspuns prea scurt',
+  auto_reply: 'Răspuns automat la „solved"',
+  client_excluded: 'Client exclus din rapoarte',
+  ai_error: 'Eroare la apelul AI'
+};
+function oaScoreColor(v) {
+  if (v == null) return 'var(--t3)';
+  if (v >= 4.5) return '#22c55e';
+  if (v >= 3.5) return '#84cc16';
+  if (v >= 2.5) return '#f59e0b';
+  return '#ef4444';
+}
+function oaFmt(v, dec) { return v == null ? '—' : Number(v).toFixed(dec == null ? 1 : dec); }
+
+function CtsOperatorAnalysis() {
+  var _s1 = useState(null), data = _s1[0], setData = _s1[1];
+  var _s2 = useState(true), loading = _s2[0], setLoading = _s2[1];
+  var _s3 = useState(''), err = _s3[0], setErr = _s3[1];
+  var _d0 = new Date(Date.now() - 29 * 864e5).toISOString().slice(0, 10);
+  var _d1 = new Date().toISOString().slice(0, 10);
+  var _s4 = useState(_d0), dateFrom = _s4[0], setDateFrom = _s4[1];
+  var _s5 = useState(_d1), dateTo = _s5[0], setDateTo = _s5[1];
+  var _s6 = useState(''), dept = _s6[0], setDept = _s6[1];
+  var _s7 = useState(0), emp = _s7[0], setEmp = _s7[1];
+  var _s8 = useState(null), clients = _s8[0], setClients = _s8[1];
+  var _s9 = useState(null), cases = _s9[0], setCases = _s9[1];
+  var _s10 = useState(1), casePage = _s10[0], setCasePage = _s10[1];
+  var _s11 = useState(0), clientId = _s11[0], setClientId = _s11[1];
+  var _s12 = useState(0), onlyGaps = _s12[0], setOnlyGaps = _s12[1];
+  var _s13 = useState(null), detail = _s13[0], setDetail = _s13[1];
+  var _s14 = useState(null), job = _s14[0], setJob = _s14[1];
+  var _s15 = useState(false), running = _s15[0], setRunning = _s15[1];
+  var _s16 = useState(null), jobStat = _s16[0], setJobStat = _s16[1];
+
+  function baseQs() {
+    return '?date_from=' + dateFrom + '&date_to=' + dateTo +
+           '&department=' + encodeURIComponent(dept) + '&employee_id=' + (emp || 0);
+  }
+
+  function load() {
+    setLoading(true); setErr('');
+    api('/cts-training/operator-analysis' + baseQs())
+      .then(function(r) { setData(r); setLoading(false); })
+      .catch(function(e) { setErr(String((e && e.message) || e)); setLoading(false); });
+  }
+  useEffect(load, [dateFrom, dateTo, dept, emp]);
+
+  // Drill-down: operator → clienți, apoi lista perechilor.
+  useEffect(function() {
+    if (!emp) { setClients(null); return; }
+    api('/cts-training/operator-analysis/clients' + baseQs())
+      .then(function(r) { setClients(r.items || []); })
+      .catch(function() { setClients([]); });
+  }, [emp, dateFrom, dateTo, dept]);
+
+  useEffect(function() {
+    api('/cts-training/operator-analysis/cases' + baseQs() +
+        '&client_id=' + (clientId || 0) + '&only_gaps=' + (onlyGaps || 0) +
+        '&page=' + casePage + '&page_size=25')
+      .then(setCases).catch(function() { setCases(null); });
+  }, [dateFrom, dateTo, dept, emp, clientId, onlyGaps, casePage]);
+
+  // Progresul jobului: se interoghează cât timp rulează, apoi se reîncarcă raportul.
+  useEffect(function() {
+    if (!job || !running) return;
+    var t = setInterval(function() {
+      api('/cts-training/operator-analysis/run/status?job_id=' + job)
+        .then(function(st) {
+          setJobStat(st);
+          if (st.status !== 'running') {
+            clearInterval(t); setRunning(false);
+            mgToast(st.status === 'done' ? 'success' : 'error',
+              st.status === 'done'
+                ? ('Analiză terminată: ' + (st.scored || 0) + ' evaluate, ' + (st.skipped || 0) + ' sărite')
+                : ('Analiza s-a oprit: ' + (st.reason || st.status)), 6000);
+            load();
+          }
+        }).catch(function() { clearInterval(t); setRunning(false); });
+    }, 4000);
+    return function() { clearInterval(t); };
+  }, [job, running]);
+
+  function runAnalysis() {
+    api('/cts-training/operator-analysis/coverage?date_from=' + dateFrom + '&date_to=' + dateTo)
+      .then(function(cov) {
+        var html =
+          '<div style="text-align:left;font-size:13px;line-height:1.7">' +
+          '<div>Răspunsuri în perioadă: <b>' + (cov.total_replies || 0) + '</b></div>' +
+          '<div>Deja evaluate: <b>' + (cov.already_evaluated || 0) + '</b></div>' +
+          '<div>De evaluat acum: <b>' + (cov.pending || 0) + '</b> (plafon ' + cov.limit + ')</div>' +
+          '<div>Fără textul răspunsului (se aduce din CTS): <b>' + (cov.missing_body || 0) + '</b></div>' +
+          '<hr style="opacity:.2;margin:8px 0">' +
+          '<div>Cost estimat: <b>' + (cov.ai_calls_estimate || 0) + ' apeluri AI</b> pe ' +
+          '<code>' + cov.model + '</code>, ' + cov.max_workers + ' în paralel.</div>' +
+          '<div style="color:#f59e0b;margin-top:6px">Gateway-ul e partajat cu clasificarea mailurilor, ' +
+          'scorarea apelurilor și satisfacția.</div></div>';
+        return mgConfirm({ title: 'Pornesc analiza?', html: html, icon: 'question',
+                           confirmText: 'Da, analizează' });
+      })
+      .then(function(ok) {
+        if (!ok) return null;
+        return api('/cts-training/operator-analysis/run', {
+          method: 'POST', body: JSON.stringify({ date_from: dateFrom, date_to: dateTo }) });
+      })
+      .then(function(r) {
+        if (!r) return;
+        setJob(r.job_id); setRunning(true); setJobStat(null);
+        mgToast('info', 'Analiza a pornit — progresul apare aici.', 4000);
+      })
+      .catch(function(e) {
+        Swal.fire({ icon: 'error', title: 'Eroare', text: String((e && e.message) || e),
+                    background: 'var(--bg2,#0e131c)', color: 'var(--tx,#e6edf3)' });
+      });
+  }
+
+  function openCase(id) {
+    api('/cts-training/operator-analysis/case?id=' + id).then(setDetail).catch(function(e) {
+      mgToast('error', String((e && e.message) || e));
+    });
+  }
+
+  // ── Randare ────────────────────────────────────────────────────────────────────────────
+  var fLbl = { fontSize: 11, color: 'var(--t3)', fontWeight: 600 };
+  var fCtl = { padding: '5px 8px', fontSize: 12 };
+
+  function card(title, val, sub, color) {
+    return h('div', { className: 'card', style: { flex: '1 1 160px', minWidth: 150, padding: '12px 15px', borderTop: '3px solid ' + (color || '#30363d') } }, [
+      h('div', { key: 't', style: { fontSize: 10, color: 'var(--t3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' } }, title),
+      h('div', { key: 'v', style: { fontSize: 24, fontWeight: 800, lineHeight: 1.15, marginTop: 5 } }, val),
+      sub ? h('div', { key: 's', style: { fontSize: 11, color: 'var(--t3)', marginTop: 3 } }, sub) : null
+    ]);
+  }
+
+  var t = (data && data.totals) || {};
+  var items = (data && data.items) || [];
+
+  var filters = h('div', { key: 'flt', style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '12px 0' } }, [
+    h('span', { key: 'l1', style: fLbl }, 'De la:'),
+    h('input', { key: 'df', type: 'date', className: 'btn secondary', style: fCtl, value: dateFrom,
+      onChange: function(e) { setDateFrom(e.target.value); } }),
+    h('span', { key: 'l2', style: fLbl }, 'până la:'),
+    h('input', { key: 'dt', type: 'date', className: 'btn secondary', style: fCtl, value: dateTo,
+      onChange: function(e) { setDateTo(e.target.value); } }),
+    h('select', { key: 'dp', className: 'btn secondary', style: Object.assign({ minWidth: 150 }, fCtl),
+      value: dept, onChange: function(e) { setDept(e.target.value); setEmp(0); setClientId(0); } },
+      [h('option', { key: '', value: '' }, '— toate departamentele —')].concat(
+        DEPT_SLUGS.map(function(sl) { return h('option', { key: sl, value: sl }, DEPT_LABELS[sl]); }))),
+    emp ? h('button', { key: 'rst', className: 'btn secondary', style: fCtl,
+      onClick: function() { setEmp(0); setClientId(0); setCasePage(1); } }, '✕ toți operatorii') : null,
+    onlyGaps ? h('button', { key: 'rg', className: 'btn secondary', style: fCtl,
+      onClick: function() { setOnlyGaps(0); setCasePage(1); } }, '✕ doar cu lipsuri') : null,
+    h('span', { key: 'sp', style: { flex: 1 } }),
+    h('button', { key: 'run', className: 'btn', style: fCtl, disabled: running, onClick: runAnalysis },
+      running ? 'Se analizează…' : '▶ Analizează perioada'),
+    h('button', { key: 'help', className: 'btn secondary', style: fCtl, onClick: function() {
+      window.Swal && window.Swal.fire({
+        title: 'Cum se citește',
+        html: '<div style="text-align:left;font-size:13px;line-height:1.7">' +
+          '<p>Fiecare <b>răspuns trimis de un operator</b> e comparat cu <b>mailul clientului</b> la care ' +
+          'răspunde și primit un scor 1-5 pe cinci criterii: corectitudine lingvistică (diacriticele NU se ' +
+          'penalizează), ton și adresare, claritate și structură, acoperirea completă a sesizării, empatie ' +
+          'și orientare spre soluție.</p>' +
+          '<p><b>Scorul general</b> e media celor cinci. Coloana „cu lipsuri" arată în câte răspunsuri au ' +
+          'rămas puncte din sesizarea clientului fără niciun răspuns.</p>' +
+          '<p><b>Se evaluează doar perechile sigure</b> — răspunsurile pentru care s-a găsit mailul original ' +
+          '(Message-ID exact, sau subiect normalizat + expeditor). Restul apar la „sărite", cu motivul.</p>' +
+          '<p style="color:#f59e0b"><b>Corectitudinea factuală NU e verificată</b> — modelul nu are acces la ' +
+          'sistemul intern. Evaluează cum a fost scris răspunsul, nu dacă informația e adevărată.</p>' +
+          '<p>Analiza nu rulează singură: apeși „Analizează perioada", vezi costul estimat și confirmi.</p>' +
+          '</div>',
+        width: 680, confirmButtonText: 'Am înțeles',
+        background: 'var(--bg2,#0e131c)', color: 'var(--tx,#e6edf3)'
+      });
+    } }, '? Cum se citește')
+  ]);
+
+  var progress = (running && jobStat) ? h('div', { key: 'prg', className: 'card', style: { padding: '10px 14px', margin: '0 0 12px', borderLeft: '3px solid var(--am)' } }, [
+    h('div', { key: 'x', style: { fontSize: 12 } },
+      'Analiză în curs: ' + ((jobStat.scored || 0) + (jobStat.skipped || 0) + (jobStat.errors || 0)) +
+      ' / ' + (jobStat.total || 0) + ' — ' + (jobStat.scored || 0) + ' evaluate, ' +
+      (jobStat.skipped || 0) + ' sărite, ' + (jobStat.errors || 0) + ' erori'),
+    h('div', { key: 'b', style: { height: 6, background: 'var(--bg3)', borderRadius: 3, marginTop: 6, overflow: 'hidden' } },
+      h('div', { style: { height: '100%', width: (jobStat.total ? Math.round(100 * ((jobStat.scored || 0) + (jobStat.skipped || 0) + (jobStat.errors || 0)) / jobStat.total) : 0) + '%', background: 'var(--am)' } }))
+  ]) : null;
+
+  var kpis = h('div', { key: 'kpi', style: { display: 'flex', gap: 10, flexWrap: 'wrap' } }, [
+    card('Răspunsuri evaluate', (t.evaluari || 0).toLocaleString('ro-RO'), (t.operatori || 0) + ' operatori', '#3b82f6'),
+    card('Scor mediu', oaFmt(t.scor_mediu), 'din 5', oaScoreColor(t.scor_mediu)),
+    card('Cu puncte neadresate', (t.cu_lipsuri || 0).toLocaleString('ro-RO'),
+         t.evaluari ? (Math.round(1000 * t.cu_lipsuri / t.evaluari) / 10) + '% din evaluări' : '—', '#f59e0b'),
+    card('Sărite', (t.sarite || 0).toLocaleString('ro-RO'), 'neevaluabile — vezi mai jos', '#6b7280')
+  ]);
+
+  var chart = items.length ? h(HBarChart, {
+    key: 'ch', title: 'Scor mediu per operator', height: Math.max(120, items.length * 30 + 24),
+    note: 'Sub 3.5 = de discutat. Click pe un rând din tabel pentru detalii.',
+    items: items.map(function(i) { return { label: i.employee_name || '?', value: i.scor, pct: null }; }),
+    colorFn: function(i) { return oaScoreColor(i.value); }
+  }) : null;
+
+  var thS = { fontSize: 10, fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.04em', padding: '7px 8px', textAlign: 'left', borderBottom: '1px solid var(--bd)', whiteSpace: 'nowrap' };
+  var thR = Object.assign({}, thS, { textAlign: 'right' });
+  var tdS = { padding: '7px 8px', borderBottom: '1px solid ' + hexA('#888888', 0.14), fontSize: 12 };
+  var tdR = Object.assign({}, tdS, { textAlign: 'right', fontVariantNumeric: 'tabular-nums' });
+
+  var opTable = h('div', { key: 'opt', className: 'card', style: { padding: 0, overflow: 'auto', marginTop: 14 } },
+    h('table', { style: { width: '100%', borderCollapse: 'collapse' } }, [
+      h('thead', { key: 'h' }, h('tr', null, [
+        h('th', { key: 'a', style: thS }, 'Operator'),
+        h('th', { key: 'b', style: thS }, 'Departament'),
+        h('th', { key: 'c', style: thR }, 'Evaluări'),
+        h('th', { key: 'd', style: thR }, 'Clienți'),
+        h('th', { key: 'e', style: thR }, 'Scor'),
+      ].concat(OA_CRIT.map(function(c) { return h('th', { key: c.k, style: thR }, c.l); }))
+       .concat([h('th', { key: 'g', style: thR }, 'Cu lipsuri')]))),
+      h('tbody', { key: 'b' }, items.length ? items.map(function(i) {
+        return h('tr', { key: i.employee_id || i.employee_email,
+          onClick: function() { setEmp(i.employee_id || 0); setClientId(0); setCasePage(1); },
+          style: { cursor: 'pointer', background: (emp && emp === i.employee_id) ? hexA('#3b82f6', 0.12) : 'transparent' } }, [
+          h('td', { key: 'a', style: Object.assign({ fontWeight: 600 }, tdS) }, i.employee_name || '?'),
+          h('td', { key: 'b', style: tdS }, i.department ? deptBadge(i.department) : '—'),
+          h('td', { key: 'c', style: tdR }, i.n),
+          h('td', { key: 'd', style: tdR }, i.clienti),
+          h('td', { key: 'e', style: Object.assign({ fontWeight: 800, color: oaScoreColor(i.scor) }, tdR) }, oaFmt(i.scor)),
+        ].concat(OA_CRIT.map(function(c) {
+          return h('td', { key: c.k, style: Object.assign({ color: oaScoreColor(i.criterii[c.k]) }, tdR) },
+            oaFmt(i.criterii[c.k]));
+        })).concat([
+          h('td', { key: 'g', style: tdR }, i.cu_lipsuri + (i.pct_cu_lipsuri != null ? ' (' + i.pct_cu_lipsuri + '%)' : ''))
+        ]));
+      }) : h('tr', { key: 'e' }, h('td', { colSpan: 11, style: { padding: 24, textAlign: 'center', color: 'var(--t3)', fontSize: 12 } },
+        'Nicio evaluare în perioada selectată. Apasă „Analizează perioada".')))
+    ]));
+
+  var skipBox = (data && data.skipped && data.skipped.length) ? h('div', { key: 'skp', className: 'card', style: { marginTop: 12, padding: '10px 14px' } }, [
+    h('div', { key: 't', style: { fontSize: 12, fontWeight: 700, marginBottom: 6 } }, 'Răspunsuri neevaluabile'),
+    h('div', { key: 'l', style: { display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 11.5, color: 'var(--t2)' } },
+      data.skipped.map(function(s) {
+        return h('span', { key: s.reason }, (OA_SKIP_LABEL[s.reason] || s.reason) + ': ' + s.n);
+      }))
+  ]) : null;
+
+  var clientTable = (emp && clients) ? h('div', { key: 'clt', className: 'card', style: { padding: 0, overflow: 'auto', marginTop: 14 } },
+    h('table', { style: { width: '100%', borderCollapse: 'collapse' } }, [
+      h('thead', { key: 'h' }, h('tr', null, [
+        h('th', { key: 'a', style: thS }, 'Client'),
+        h('th', { key: 'b', style: thR }, 'Evaluări'),
+        h('th', { key: 'c', style: thR }, 'Scor'),
+        h('th', { key: 'd', style: thR }, 'Cel mai slab'),
+        h('th', { key: 'e', style: thR }, 'Cu lipsuri')])),
+      h('tbody', { key: 'b' }, clients.length ? clients.map(function(c) {
+        return h('tr', { key: c.client_id || c.client_name,
+          onClick: function() { setClientId(c.client_id || 0); setCasePage(1); },
+          style: { cursor: 'pointer', background: (clientId && clientId === c.client_id) ? hexA('#3b82f6', 0.12) : 'transparent' } }, [
+          h('td', { key: 'a', style: tdS }, c.client_name),
+          h('td', { key: 'b', style: tdR }, c.n),
+          h('td', { key: 'c', style: Object.assign({ fontWeight: 700, color: oaScoreColor(c.scor) }, tdR) }, oaFmt(c.scor)),
+          h('td', { key: 'd', style: tdR }, oaFmt(c.scor_min)),
+          h('td', { key: 'e', style: tdR }, c.cu_lipsuri)
+        ]);
+      }) : h('tr', { key: 'e' }, h('td', { colSpan: 5, style: { padding: 16, textAlign: 'center', color: 'var(--t3)', fontSize: 12 } }, 'Niciun client.')))
+    ])) : null;
+
+  var caseList = (cases && cases.items) ? h('div', { key: 'cs', style: { marginTop: 14 } }, [
+    h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 } }, [
+      h('span', { key: 't', style: { fontSize: 13, fontWeight: 700 } },
+        'Răspunsuri evaluate (' + (cases.total || 0) + ')'),
+      h('label', { key: 'g', style: { fontSize: 11.5, color: 'var(--t2)', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' } }, [
+        h('input', { key: 'c', type: 'checkbox', checked: !!onlyGaps,
+          onChange: function(e) { setOnlyGaps(e.target.checked ? 1 : 0); setCasePage(1); } }),
+        'doar cele cu puncte neadresate'])
+    ]),
+    h('div', { className: 'card', style: { padding: 0, overflow: 'auto' } },
+      h('table', { style: { width: '100%', borderCollapse: 'collapse' } }, [
+        h('thead', { key: 'h' }, h('tr', null, [
+          h('th', { key: 'a', style: thS }, 'Data'),
+          h('th', { key: 'b', style: thS }, 'Operator'),
+          h('th', { key: 'c', style: thS }, 'Client'),
+          h('th', { key: 'd', style: thR }, 'Scor'),
+          h('th', { key: 'e', style: thS }, 'Puncte neadresate'),
+          h('th', { key: 'f', style: thS }, 'Potrivire')])),
+        h('tbody', { key: 'b' }, cases.items.length ? cases.items.map(function(c) {
+          return h('tr', { key: c.id, onClick: function() { openCase(c.id); }, style: { cursor: 'pointer' } }, [
+            h('td', { key: 'a', style: tdS }, (c.reply_at || '').slice(0, 16).replace('T', ' ')),
+            h('td', { key: 'b', style: tdS }, c.employee_name || '—'),
+            h('td', { key: 'c', style: tdS }, c.client_name),
+            h('td', { key: 'd', style: Object.assign({ fontWeight: 800, color: oaScoreColor(c.scor) }, tdR) }, oaFmt(c.scor)),
+            h('td', { key: 'e', style: Object.assign({ color: 'var(--t2)' }, tdS) },
+              (c.puncte_neadresate && c.puncte_neadresate.length)
+                ? (c.puncte_neadresate.length + ': ' + String(c.puncte_neadresate[0]).slice(0, 70)) : '—'),
+            h('td', { key: 'f', style: tdS }, h('span', { className: 'badge', title: c.match_by === 'msid'
+              ? 'Împerechere exactă pe Message-ID' : 'Împerechere euristică pe subiect + expeditor' },
+              c.match_by === 'msid' ? 'exact' : 'subiect'))
+          ]);
+        }) : h('tr', { key: 'e' }, h('td', { colSpan: 6, style: { padding: 16, textAlign: 'center', color: 'var(--t3)', fontSize: 12 } }, 'Nimic de afișat.')))
+      ])),
+    (cases.total > cases.page_size) ? h('div', { key: 'pg', style: { display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'center', marginTop: 8, fontSize: 12 } }, [
+      h('button', { key: 'p', className: 'btn secondary', style: fCtl, disabled: casePage <= 1,
+        onClick: function() { setCasePage(casePage - 1); } }, '‹ înapoi'),
+      h('span', { key: 'i', style: { color: 'var(--t3)' } },
+        'pagina ' + casePage + ' / ' + Math.ceil(cases.total / cases.page_size)),
+      h('button', { key: 'n', className: 'btn secondary', style: fCtl,
+        disabled: casePage >= Math.ceil(cases.total / cases.page_size),
+        onClick: function() { setCasePage(casePage + 1); } }, 'înainte ›')
+    ]) : null
+  ]) : null;
+
+  // Modalul unui caz: evaluarea + EXACT textele văzute de model (de aceea se pot verifica scorurile).
+  var modal = detail ? h('div', { key: 'md', style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', zIndex: 1200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 },
+    onClick: function(e) { if (e.target === e.currentTarget) setDetail(null); } },
+    h('div', { className: 'card', style: { width: 'min(1100px, 96vw)', maxHeight: '92vh', overflow: 'auto', padding: 0 } }, [
+      h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '1px solid var(--bd)', position: 'sticky', top: 0, background: 'var(--bg2)', zIndex: 1 } }, [
+        h('div', { key: 't', style: { fontSize: 14, fontWeight: 700, flex: 1 } },
+          (detail.employee_name || '?') + ' → ' + (detail.client_name || 'client neidentificat')),
+        h('span', { key: 's', style: { fontSize: 22, fontWeight: 800, color: oaScoreColor(detail.scor) } }, oaFmt(detail.scor)),
+        h('button', { key: 'x', className: 'btn secondary', style: fCtl, onClick: function() { setDetail(null); } }, '✕')
+      ]),
+      h('div', { key: 'cr', style: { display: 'flex', gap: 8, flexWrap: 'wrap', padding: '12px 16px' } },
+        OA_CRIT.map(function(c) {
+          var sc = detail.criterii_scoruri[c.k];
+          var just = (detail.criterii || {});
+          var keyMap = { lingvistic: 'corectitudine_lingvistica', ton: 'ton_si_adresare', claritate: 'claritate_si_structura', acoperire: 'acoperire_sesizare', empatie: 'empatie_si_solutie' };
+          var it = just[keyMap[c.k]] || {};
+          return h('div', { key: c.k, className: 'card', style: { flex: '1 1 180px', minWidth: 170, padding: '10px 12px', borderTop: '3px solid ' + oaScoreColor(sc) } }, [
+            h('div', { key: 'l', style: { fontSize: 10, color: 'var(--t3)', fontWeight: 700, textTransform: 'uppercase' } }, c.l),
+            h('div', { key: 'v', style: { fontSize: 20, fontWeight: 800, color: oaScoreColor(sc) } }, sc == null ? '—' : sc + '/5'),
+            h('div', { key: 'j', style: { fontSize: 11, color: 'var(--t2)', marginTop: 4, lineHeight: 1.45 } }, it.justificare || '')
+          ]);
+        })),
+      (detail.puncte_neadresate && detail.puncte_neadresate.length) ? h('div', { key: 'pn', style: { padding: '0 16px 12px' } }, [
+        h('div', { key: 't', style: { fontSize: 12, fontWeight: 700, color: '#f59e0b', marginBottom: 4 } }, 'Puncte fără răspuns'),
+        h('ul', { key: 'u', style: { margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.6 } },
+          detail.puncte_neadresate.map(function(p, i) { return h('li', { key: i }, p); }))
+      ]) : null,
+      (detail.sugestii && detail.sugestii.length) ? h('div', { key: 'sg', style: { padding: '0 16px 12px' } }, [
+        h('div', { key: 't', style: { fontSize: 12, fontWeight: 700, marginBottom: 4 } }, 'Sugestii'),
+        h('ul', { key: 'u', style: { margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.6 } },
+          detail.sugestii.map(function(p, i) { return h('li', { key: i }, p); }))
+      ]) : null,
+      h('div', { key: 'tx', style: { display: 'flex', gap: 12, padding: '0 16px 12px', flexWrap: 'wrap' } }, [
+        h('div', { key: 'c', style: { flex: '1 1 420px', minWidth: 300 } }, [
+          h('div', { key: 't', style: { fontSize: 11, fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', marginBottom: 4 } },
+            'Mailul clientului' + (detail.received && detail.received.subject ? ' — ' + detail.received.subject : '')),
+          h('pre', { key: 'b', style: { whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5, background: 'var(--bg3)', padding: 10, borderRadius: 6, maxHeight: 320, overflow: 'auto', margin: 0 } },
+            (detail.received && detail.received.text) || '(indisponibil)')
+        ]),
+        h('div', { key: 'r', style: { flex: '1 1 420px', minWidth: 300 } }, [
+          h('div', { key: 't', style: { fontSize: 11, fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', marginBottom: 4 } }, 'Răspunsul operatorului'),
+          h('pre', { key: 'b', style: { whiteSpace: 'pre-wrap', fontSize: 12, lineHeight: 1.5, background: 'var(--bg3)', padding: 10, borderRadius: 6, maxHeight: 320, overflow: 'auto', margin: 0 } },
+            detail.reply_text || '(indisponibil)')
+        ])
+      ]),
+      h('div', { key: 'ft', style: { padding: '10px 16px', borderTop: '1px solid var(--bd)', fontSize: 11, color: 'var(--t3)', lineHeight: 1.6 } }, [
+        h('div', { key: 'm' }, detail.mentiune || 'Corectitudinea factuala a informatiilor nu a fost verificata automat - necesita confirmare manuala din sistemul intern.'),
+        h('div', { key: 'x' }, 'Model: ' + (detail.model || '—') + ' · prompt ' + (detail.prompt_version || '—') +
+          ' · împerechere: ' + (detail.match_by === 'msid' ? 'Message-ID exact' : 'subiect + expeditor') +
+          ' · evaluat ' + (detail.evaluated_at || '').slice(0, 16).replace('T', ' '))
+      ])
+    ])) : null;
+
+  return h('div', { className: 'page' }, [
+    h('div', { key: 'intro', style: { fontSize: 12.5, color: 'var(--t2)', lineHeight: 1.6 } },
+      'Calitatea răspunsurilor pe email, per operator și per client. Fiecare răspuns e comparat cu ' +
+      'mailul clientului la care răspunde și notat 1-5 pe cinci criterii. Corectitudinea factuală a ' +
+      'informațiilor NU e verificată automat.'),
+    filters,
+    progress,
+    err ? h('div', { key: 'err', className: 'card', style: { padding: 12, borderLeft: '3px solid #ef4444', fontSize: 12 } }, err) : null,
+    loading ? h('div', { key: 'ld', style: { padding: 30, textAlign: 'center', color: 'var(--t3)' } }, 'Se încarcă…')
+      : h('div', { key: 'body' }, [kpis, chart, opTable, skipBox, clientTable, caseList]),
+    modal
+  ]);
+}
+
 // Shell-ul modulului „Mail-uri CTS": lista de mailuri (comparație MG vs CTS) + raportul
 // de departamente. Tab-urile stau aici, nu în panouri, ca fiecare panou să-și încarce
 // datele DOAR când e afișat.
 function CtsMailsShell() {
-  const SUBS = [{ k: 'mailuri', l: 'Mailuri' }, { k: 'raport-dept', l: 'Raport departamente' }];
+  const SUBS = [{ k: 'mailuri', l: 'Mailuri' }, { k: 'raport-dept', l: 'Raport departamente' },
+                { k: 'analiza-op', l: 'Analiza Operatori' }];
   const [sub, setSub] = useState('mailuri');
   return h('div', null, [
     h('div', { key: 'tabs', className: 'modal-tabs', style: { borderBottom: '1px solid var(--bd)', marginBottom: 12 } },
       SUBS.map(function(s){ return h('button', { key: s.k, className: 'tab' + (sub === s.k ? ' active' : ''), onClick: function(){ setSub(s.k); } }, s.l); })),
-    h('div', { key: 'body' }, sub === 'raport-dept' ? h(CtsDeptReport, { key: 'rd' }) : h(CtsTrainingPanel, { key: 'ml' }))
+    h('div', { key: 'body' },
+      sub === 'raport-dept' ? h(CtsDeptReport, { key: 'rd' })
+      : sub === 'analiza-op' ? h(CtsOperatorAnalysis, { key: 'ao' })
+      : h(CtsTrainingPanel, { key: 'ml' }))
   ]);
 }
 

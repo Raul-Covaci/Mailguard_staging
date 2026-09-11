@@ -22,6 +22,7 @@ from app.api.v1.sorting import sort_dir
 from app.services import cts_groundtruth_sync as SYNC
 from app.services import cts_email_log
 from app.services import cts_dept_log
+from app.services import operator_email_eval as OPEVAL
 from app.services.department_classifier import DEPT_LABELS
 
 logger = logging.getLogger("mailguard.cts_training")
@@ -261,15 +262,6 @@ def cts_training_sent_body(log_id: str = Query(..., description="cts_email_log_i
     if row is None:
         raise HTTPException(404, "Nu există rând CTS trimis pentru acest log_id")
 
-    def _norm_subj(s):
-        """Normalizează subiectul: scoate prefixele Re:/Fwd:/Fw:/R: (oricâte, orice limbă uzuală)."""
-        s = (s or "").strip()
-        prev = None
-        while s and s != prev:
-            prev = s
-            s = re.sub(r'^\s*(re|r|fw|fwd|rspns|răspuns|raspuns)\s*[:\-]\s*', '', s, flags=re.I)
-        return s.lower().strip()
-
     def _shape(e, how):
         if e is None:
             return None
@@ -285,36 +277,11 @@ def cts_training_sent_body(log_id: str = Query(..., description="cts_email_log_i
                                             if e["ai_autoreply_confidence"] is not None else None),
                 "ai_autoreply_status": e["ai_autoreply_status"]}
 
-    _SEL = ("SELECT id, subject, from_address, from_name, received_at, body_text, body_html, "
-            "ai_autoreply, ai_autoreply_confidence, ai_autoreply_status FROM emails ")
-
-    def _paired():
-        """Emailul PRIMIT căruia i s-a răspuns + sugestia AI de pe el.
-        Strategie: (1) exact pe Message-ID (msid), apoi (2) fallback pe expeditor =
-        destinatarul reply-ului + subiect normalizat + primit înainte de reply."""
-        # (1) exact pe Message-ID
-        if row["msid"]:
-            e = db.execute(text(_SEL +
-                "WHERE email_headers->>'message_id' = :m ORDER BY id DESC LIMIT 1"),
-                {"m": row["msid"]}).mappings().first()
-            if e:
-                return _shape(e, "msid")
-        # (2) fallback: from_address = destinatarul reply-ului, subiect normalizat egal,
-        #     primit înaintea trimiterii (cel mai recent dinainte)
-        to_email = (row["to_email"] or "").strip().lower()
-        norm = _norm_subj(row["title"])
-        if to_email and norm:
-            cands = db.execute(text(_SEL +
-                "WHERE lower(from_address) = :to AND received_at IS NOT NULL "
-                "  AND (CAST(:ref AS timestamptz) IS NULL OR received_at <= CAST(:ref AS timestamptz)) "
-                "ORDER BY received_at DESC LIMIT 25"),
-                {"to": to_email, "ref": row["ref_at"]}).mappings().all()
-            for e in cands:
-                if _norm_subj(e["subject"]) == norm:
-                    return _shape(e, "subject")
-        return None
-
-    paired = _paired()
+    # Imperecherea (msid exact, apoi euristica pe subiect) sta in `operator_email_eval` —
+    # SURSA UNICA, folosita si de tabul „Analiza Operatori". Doua copii ar diverge.
+    _pr, _how = OPEVAL.pair_received(db, row["msid"], row["to_email"], row["title"],
+                                     row["ref_at"])
+    paired = _shape(_pr, _how)
 
     if row["cts_reply_text"] and not refresh:
         return {"ok": True, "cached": True, "available": True, "log_id": str(log_id),
@@ -1248,3 +1215,270 @@ def cts_training_dept_report_mail_steps(
         "chain_labels": [_lbl(c) for c in chain],
         "moves": max(len(chain) - 1, 0),
     }
+
+
+# ── Analiza Operatori — evaluarea AI a răspunsurilor pe email ────────────────────────────────
+# Motor: app/services/operator_email_eval.py. Rularea e LA CERERE (job de fundal): fiecare
+# pereche (mail client + răspuns operator) e un apel la gateway-ul AI, partajat cu clasificarea
+# mailurilor, scorarea apelurilor și satisfacția. De aceea `/coverage` arată costul ÎNAINTE.
+
+def _oa_window(date_from: str, date_to: str):
+    """Fereastra [from, to) — `to` exclusiv, ziua următoare, ca ultima zi să fie inclusă întreagă.
+    Implicit: ultimele 30 de zile. Datele invalide cad pe implicit (nu 400) — aceeași convenție ca
+    `_dept_report_params`."""
+    from datetime import date as _d, timedelta as _td
+    try:
+        df = _d.fromisoformat((date_from or "").strip())
+    except ValueError:
+        df = _d.today() - _td(days=30)
+    try:
+        dt = _d.fromisoformat((date_to or "").strip()) + _td(days=1)
+    except ValueError:
+        dt = _d.today() + _td(days=1)
+    return df.isoformat(), dt.isoformat()
+
+
+_OA_BASE_WHERE = """
+    ev.reply_at >= CAST(:df AS timestamptz) AND ev.reply_at < CAST(:dt AS timestamptz)
+    AND (:dept = '' OR ev.department = :dept)
+    AND (:emp = 0 OR ev.employee_id = :emp)
+"""
+
+
+def _oa_params(date_from, date_to, department, employee_id):
+    df, dt = _oa_window(date_from, date_to)
+    dept = (department or "").strip().lower()
+    if dept and dept not in DEPT_LABELS:
+        dept = ""
+    return {"df": df, "dt": dt, "dept": dept, "emp": int(employee_id or 0)}
+
+
+@router.get("/cts-training/operator-analysis")
+def operator_analysis(date_from: str = Query(""), date_to: str = Query(""),
+                      department: str = Query(""), employee_id: int = Query(0),
+                      db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Agregat per operator: medii pe cele 5 criterii, scor general, câte răspunsuri au rămas cu
+    puncte neadresate. Doar rândurile efectiv evaluate (`score_general IS NOT NULL`); cele sărite
+    se raportează separat, cu motiv, ca să se vadă acoperirea reală."""
+    p = _oa_params(date_from, date_to, department, employee_id)
+
+    rows = db.execute(text("""
+        SELECT ev.employee_id, ev.employee_name, ev.employee_email, ev.department,
+               count(*)                                   AS n,
+               round(avg(ev.score_general)::numeric, 2)    AS scor,
+               round(avg(ev.s_lingvistic)::numeric, 2)     AS lingvistic,
+               round(avg(ev.s_ton)::numeric, 2)            AS ton,
+               round(avg(ev.s_claritate)::numeric, 2)      AS claritate,
+               round(avg(ev.s_acoperire)::numeric, 2)      AS acoperire,
+               round(avg(ev.s_empatie)::numeric, 2)        AS empatie,
+               count(*) FILTER (WHERE jsonb_array_length(COALESCE(ev.puncte_neadresate,'[]'::jsonb)) > 0) AS cu_lipsuri,
+               count(DISTINCT ev.client_id)                AS clienti,
+               min(ev.score_general)                       AS scor_min
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1, 2, 3, 4
+         ORDER BY scor ASC NULLS LAST, n DESC
+    """), p).mappings().all()
+
+    skipped = db.execute(text("""
+        SELECT ev.skipped_reason, count(*) AS n
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.skipped_reason IS NOT NULL
+         GROUP BY 1 ORDER BY 2 DESC
+    """), p).mappings().all()
+
+    months = db.execute(text("""
+        SELECT to_char(date_trunc('month', ev.reply_at), 'YYYY-MM') AS luna,
+               count(*) AS n, round(avg(ev.score_general)::numeric, 2) AS scor
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1 ORDER BY 1
+    """), p).mappings().all()
+
+    items = []
+    for r in rows:
+        items.append({
+            "employee_id": r["employee_id"], "employee_name": r["employee_name"] or r["employee_email"],
+            "employee_email": r["employee_email"],
+            "department": r["department"], "department_label": _lbl(r["department"]) if r["department"] else None,
+            "n": r["n"], "clienti": r["clienti"],
+            "scor": float(r["scor"]) if r["scor"] is not None else None,
+            "scor_min": float(r["scor_min"]) if r["scor_min"] is not None else None,
+            "criterii": {"lingvistic": float(r["lingvistic"] or 0), "ton": float(r["ton"] or 0),
+                         "claritate": float(r["claritate"] or 0), "acoperire": float(r["acoperire"] or 0),
+                         "empatie": float(r["empatie"] or 0)},
+            "cu_lipsuri": r["cu_lipsuri"],
+            "pct_cu_lipsuri": _pct(r["cu_lipsuri"], r["n"]),
+        })
+
+    total_n = sum(i["n"] for i in items)
+    avg_all = (round(sum(i["scor"] * i["n"] for i in items if i["scor"] is not None) / total_n, 2)
+               if total_n else None)
+    return {
+        "range": {"from": p["df"], "to": p["dt"]},
+        "totals": {"evaluari": total_n, "operatori": len(items), "scor_mediu": avg_all,
+                   "cu_lipsuri": sum(i["cu_lipsuri"] for i in items),
+                   "sarite": sum(s["n"] for s in skipped)},
+        "items": items,
+        "skipped": [{"reason": s["skipped_reason"], "n": s["n"]} for s in skipped],
+        "months": [{"luna": m["luna"], "n": m["n"],
+                    "scor": float(m["scor"]) if m["scor"] is not None else None} for m in months],
+    }
+
+
+@router.get("/cts-training/operator-analysis/clients")
+def operator_analysis_clients(employee_id: int = Query(0), date_from: str = Query(""),
+                              date_to: str = Query(""), department: str = Query(""),
+                              db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Pentru un operator (sau pentru tot departamentul, dacă `employee_id=0`): agregat per client."""
+    p = _oa_params(date_from, date_to, department, employee_id)
+    rows = db.execute(text("""
+        SELECT ev.client_id, ev.client_name, count(*) AS n,
+               round(avg(ev.score_general)::numeric, 2) AS scor,
+               count(*) FILTER (WHERE jsonb_array_length(COALESCE(ev.puncte_neadresate,'[]'::jsonb)) > 0) AS cu_lipsuri,
+               min(ev.score_general) AS scor_min, max(ev.reply_at) AS ultimul
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+         GROUP BY 1, 2 ORDER BY scor ASC NULLS LAST, n DESC LIMIT 200
+    """), p).mappings().all()
+    return {"items": [{
+        "client_id": r["client_id"], "client_name": r["client_name"] or "(client neidentificat)",
+        "n": r["n"], "scor": float(r["scor"]) if r["scor"] is not None else None,
+        "scor_min": float(r["scor_min"]) if r["scor_min"] is not None else None,
+        "cu_lipsuri": r["cu_lipsuri"], "pct_cu_lipsuri": _pct(r["cu_lipsuri"], r["n"]),
+        "ultimul": r["ultimul"].isoformat() if r["ultimul"] else None,
+    } for r in rows]}
+
+
+@router.get("/cts-training/operator-analysis/cases")
+def operator_analysis_cases(date_from: str = Query(""), date_to: str = Query(""),
+                            department: str = Query(""), employee_id: int = Query(0),
+                            client_id: int = Query(0), max_score: float = Query(0),
+                            only_gaps: int = Query(0), match_by: str = Query(""),
+                            page: int = Query(1, ge=1), page_size: int = Query(50, ge=5, le=200),
+                            db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Lista perechilor evaluate, paginată. `max_score` > 0 → doar sub prag; `only_gaps=1` → doar
+    cele cu puncte neadresate; `match_by=msid` → doar împerecherile exacte."""
+    p = _oa_params(date_from, date_to, department, employee_id)
+    p.update({"cid": int(client_id or 0), "maxs": float(max_score or 0),
+              "gaps": int(only_gaps or 0), "mb": (match_by or "").strip().lower(),
+              "lim": page_size, "off": (page - 1) * page_size})
+    rows = db.execute(text("""
+        SELECT ev.id, ev.reply_at, ev.employee_name, ev.employee_email, ev.department,
+               ev.client_name, ev.client_id, ev.received_email_id, ev.match_by,
+               ev.score_general, ev.s_lingvistic, ev.s_ton, ev.s_claritate, ev.s_acoperire,
+               ev.s_empatie, ev.puncte_neadresate, ev.message_id,
+               count(*) OVER () AS total
+          FROM email_operator_evaluations ev
+         WHERE """ + _OA_BASE_WHERE + """
+           AND ev.score_general IS NOT NULL
+           AND (:cid = 0 OR ev.client_id = :cid)
+           AND (:maxs = 0 OR ev.score_general <= :maxs)
+           AND (:gaps = 0 OR jsonb_array_length(COALESCE(ev.puncte_neadresate,'[]'::jsonb)) > 0)
+           AND (:mb = '' OR ev.match_by = :mb)
+         ORDER BY ev.score_general ASC, ev.reply_at DESC
+         LIMIT :lim OFFSET :off
+    """), p).mappings().all()
+    total = rows[0]["total"] if rows else 0
+    return {"total": total, "page": page, "page_size": page_size, "items": [{
+        "id": r["id"], "reply_at": r["reply_at"].isoformat() if r["reply_at"] else None,
+        "employee_name": r["employee_name"] or r["employee_email"],
+        "department": r["department"], "department_label": _lbl(r["department"]) if r["department"] else None,
+        "client_name": r["client_name"] or "(client neidentificat)", "client_id": r["client_id"],
+        "received_email_id": r["received_email_id"], "match_by": r["match_by"],
+        "message_id": r["message_id"],
+        "scor": float(r["score_general"]) if r["score_general"] is not None else None,
+        "criterii": {"lingvistic": r["s_lingvistic"], "ton": r["s_ton"], "claritate": r["s_claritate"],
+                     "acoperire": r["s_acoperire"], "empatie": r["s_empatie"]},
+        "puncte_neadresate": r["puncte_neadresate"] or [],
+    } for r in rows]}
+
+
+@router.get("/cts-training/operator-analysis/case")
+def operator_analysis_case(id: int = Query(...), db: Session = Depends(get_db),
+                           admin=Depends(get_current_admin)):
+    """Evaluarea completă a unei perechi + textele pe care le-a văzut modelul (mailul clientului și
+    răspunsul operatorului). Textele se recurăță identic cu momentul evaluării — altfel nu se poate
+    verifica de ce a dat modelul scorul respectiv."""
+    r = db.execute(text("""
+        SELECT ev.*, g.cts_reply_text, g.cts_reply_html
+          FROM email_operator_evaluations ev
+          LEFT JOIN cts_ground_truth g ON g.id = ev.cts_gt_id
+         WHERE ev.id = :id
+    """), {"id": id}).mappings().first()
+    if r is None:
+        raise HTTPException(404, "Evaluare inexistentă")
+    received = None
+    if r["received_email_id"]:
+        e = db.execute(text("SELECT id, subject, from_address, from_name, received_at, "
+                            "body_text, body_html FROM emails WHERE id = :id"),
+                       {"id": r["received_email_id"]}).mappings().first()
+        if e:
+            received = {"email_id": e["id"], "subject": e["subject"],
+                        "from_address": e["from_address"], "from_name": e["from_name"],
+                        "received_at": e["received_at"].isoformat() if e["received_at"] else None,
+                        "text": OPEVAL._clean_body(e["body_text"], e["body_html"])}
+    return {
+        "id": r["id"], "reply_at": r["reply_at"].isoformat() if r["reply_at"] else None,
+        "employee_name": r["employee_name"] or r["employee_email"],
+        "employee_email": r["employee_email"], "department": r["department"],
+        "department_label": _lbl(r["department"]) if r["department"] else None,
+        "client_name": r["client_name"], "client_id": r["client_id"],
+        "match_by": r["match_by"], "message_id": r["message_id"],
+        "scor": float(r["score_general"]) if r["score_general"] is not None else None,
+        "criterii_scoruri": {"lingvistic": r["s_lingvistic"], "ton": r["s_ton"],
+                             "claritate": r["s_claritate"], "acoperire": r["s_acoperire"],
+                             "empatie": r["s_empatie"]},
+        "criterii": r["criterii"] or {},
+        "puncte_neadresate": r["puncte_neadresate"] or [],
+        "sugestii": r["sugestii"] or [],
+        "mentiune": r["mentiune"],
+        "model": r["model"], "prompt_version": r["prompt_version"],
+        "evaluated_at": r["evaluated_at"].isoformat() if r["evaluated_at"] else None,
+        "skipped_reason": r["skipped_reason"],
+        "received": received,
+        "reply_text": OPEVAL._clean_body(r["cts_reply_text"], r["cts_reply_html"]),
+    }
+
+
+@router.get("/cts-training/operator-analysis/coverage")
+def operator_analysis_coverage(date_from: str = Query(""), date_to: str = Query(""),
+                               limit: int = Query(0, ge=0, le=2000),
+                               db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Estimarea unei rulări, FĂRĂ niciun apel AI: câte răspunsuri sunt în perioadă, câte sunt deja
+    evaluate, câte n-au încă textul adus din gateway și câte apeluri AI ar costa rularea."""
+    df, dt = _oa_window(date_from, date_to)
+    return OPEVAL.coverage(db, df, dt, limit=limit or None)
+
+
+@router.post("/cts-training/operator-analysis/run")
+def operator_analysis_run(body: dict = Body(default={}), db: Session = Depends(get_db),
+                          admin=Depends(get_current_admin)):
+    """Pornește evaluarea pe un fir de fundal și întoarce `job_id` imediat.
+
+    NU rulează sincron în request: un apel AI per pereche × sute de perechi = minute bune (vezi
+    `POST /clients/satisfaction-snapshot`, care face exact greșeala asta). Progresul se citește din
+    `/run/status`. `pg_try_advisory_lock` din motor garantează o singură rulare pe toți workerii.
+    """
+    df, dt = _oa_window(str(body.get("date_from") or ""), str(body.get("date_to") or ""))
+    limit = body.get("limit")
+    try:
+        limit = int(limit) if limit else None
+    except (TypeError, ValueError):
+        limit = None
+    job_id = OPEVAL.start_job(df, dt, limit=limit, force=bool(body.get("force")))
+    return {"ok": True, "job_id": job_id, "status": "running",
+            "range": {"from": df, "to": dt}, "limit": limit}
+
+
+@router.get("/cts-training/operator-analysis/run/status")
+def operator_analysis_run_status(job_id: str = Query(...), db: Session = Depends(get_db),
+                                 admin=Depends(get_current_admin)):
+    st = OPEVAL.read_job(db, job_id)
+    if st is None:
+        raise HTTPException(404, "Job inexistent")
+    return st

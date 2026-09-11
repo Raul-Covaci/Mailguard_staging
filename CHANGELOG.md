@@ -8,6 +8,38 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.21.0 - 2026-09-12
+
+### MINOR — „Analiza Operatori": evaluarea AI a răspunsurilor pe email
+
+Tab nou în Mail-uri CTS, după „Raport departamente". Fiecare pereche (mail primit de la client,
+răspuns trimis de operator) trece prin promptul din `app/services/prompts/emails/operator_eval.txt`
+și primește 1-5 pe cinci criterii — corectitudine lingvistică (diacriticele NU se penalizează), ton
+și adresare, claritate și structură, acoperirea completă a sesizării, empatie și orientare spre
+soluție — plus scor general, lista punctelor rămase fără răspuns și maximum 3 sugestii. Agregat per
+operator și per client, cu drill-down până la textele exacte văzute de model.
+
+Promptul e **fișier în repo**, singura sursă de adevăr — fără cache în DB, fără script de sync.
+Model implicit `claude-sonnet-4-6` (Haiku e prea grosier pentru „ce puncte au rămas neadresate" —
+același motiv pentru care a fost schimbat și la satisfacția V6), configurabil din
+`settings.emails.operator_eval` fără redeploy.
+
+**Rularea e la cerere.** Un apel AI per pereche, pe gateway-ul partajat cu clasificarea mailurilor,
+scorarea apelurilor și satisfacția. Butonul „Analizează perioada" cere întâi `/coverage` (zero
+apeluri AI) și pune costul estimat în confirmare; jobul rulează pe fir de fundal cu progres în UI,
+plafonat la 300 de perechi pe rulare și serializat cu `pg_try_advisory_lock`.
+
+**Corpul răspunsurilor nu era materializat** — `cts_ground_truth.cts_reply_text` se scrie doar când
+cineva deschide tichetul în UI, feed-ul CTS nu-l trimite. Pasul 0 al jobului îl aduce din gateway
+(`fetch_email_content`, 200 id-uri/apel) și îl scrie înapoi; altfel majoritatea răspunsurilor ar fi
+fost sărite tăcut.
+
+Se evaluează **doar perechile sigure** (Message-ID exact sau subiect normalizat + expeditor).
+Restul se scriu cu motiv (`no_pair`, `no_reply_text`, `too_short`, `auto_reply`, `client_excluded`,
+`ai_error`) și se raportează separat — un rând scris o dată nu se reîncearcă la fiecare rulare.
+Împerecherea are acum **o singură implementare** (`operator_email_eval.pair_received`), folosită și
+de `GET /cts-training/sent-body`, care avea o copie locală.
+
 ## v3.20.1 - 2026-09-11
 
 ### PATCH — „Reprocesează email": garda de spam nu se aplica niciodată
