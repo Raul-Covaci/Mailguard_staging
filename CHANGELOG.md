@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.22.1 - 2026-09-12
+
+### PATCH — euPlatesc / europayment.services intră cu prioritatea P2
+
+Completează rutarea pe Contabilitate din v3.19.0: departamentul și prioritatea sunt câmpuri
+separate, deci trebuiau amândouă. Regulă nouă pe expeditor în `priority_rules`
+(`pay_processor`) — notificările unui procesator de plăți sunt, prin definiție, despre bani
+intrați sau eșuați, deci se lucrează înaintea rutinei.
+
+Regula se evaluează **înaintea filtrului de mailuri automate**: notificările lor SUNT automate,
+iar dacă subiectul prinde un tipar din `_AUTOMATED_SUBJECT` (ex. „Informare scadență … |
+CargoTrack"), regula veche returna `None` și decizia cădea pe AI, care le dădea tipic P5. Pusă
+înainte, încadrarea P2 e garantată. „Email Scout Report" rămâne deasupra (regulă forțată, P4).
+
+Lista de expeditori stă în **cod**, nu în `settings`: regulile de prioritate sunt deliberat în cod
+(semnale tari, puține, stabile), spre deosebire de cele de departament, care se editează din
+Setări. Cele două liste se schimbă deci în două locuri.
+
+Retroactiv (`migrations/20260912b_euplatesc_priority_p2.sql`): mailurile existente ale acestor
+expeditori trec pe P2 — doar cele netrimise încă la CTS și fără corecție manuală de prioritate.
+
 ## v3.22.0 - 2026-09-12
 
 ### MINOR — Analiza Operatori: trei niveluri de analiză + fișa operatorului

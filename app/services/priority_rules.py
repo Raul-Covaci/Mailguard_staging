@@ -21,6 +21,7 @@ RULE_OP = "pay_op"             # ordin de plata (OP) trimis de client
 RULE_ATTACHMENT = "pay_attachment"  # atasament cu nume clar de OP/dovada
 RULE_URGENCY = "urgency"       # disperare / urgenta clara
 RULE_SCOUT = "scout_report"     # raport intern "Email Scout Report" (office@cargotrack.ro)
+RULE_PROCESSOR = "pay_processor"  # notificare de la un procesator de plati online
 
 
 def _fold(s: str) -> str:
@@ -167,11 +168,33 @@ def match_forced(email: dict):
     return None
 
 
+# --- Procesatori de plati online -> P2, pe EXPEDITOR ---
+# Notificarile lor sunt, prin definitie, despre bani intrati sau esuati: se lucreaza inaintea
+# rutinei, chiar cand textul nu contine nicio formulare de tip "am platit". Cerere business
+# 2026-09-12, aceiasi expeditori care merg pe Contabilitate.
+#
+# Lista sta AICI, in cod, nu in `settings`: regulile de prioritate sunt deliberat in cod (semnale
+# tari, putine, stabile), spre deosebire de regulile de departament, care se editeaza din Setari.
+# Cele doua liste se schimba deci in DOUA locuri — `department_rules.DEFAULT_RULES` + migratia
+# care le duce in store, si aici.
+#
+# Potrivire pe SUBSTRING in expeditor (adresa + nume), ca la regulile de departament: euPlatesc
+# trimite de pe mai multe cutii si domenii (euplatesc.ro / .com), iar pe europayment.services sunt
+# patru cutii cunoscute (notificari@, contact@, noreply@, suport@) si oricand alta noua.
+_PAYMENT_PROCESSORS = ("euplatesc", "@europayment.services")
+
+
+def _is_payment_processor(email: dict) -> bool:
+    hay = _fold((email.get("from_address") or "") + " " + (email.get("from_name") or ""))
+    return any(p in hay for p in _PAYMENT_PROCESSORS)
+
+
 def match(email: dict, att_names: str = ""):
     """Returneaza dict {id, tier, note} pentru primul semnal determinist care loveste, altfel None.
 
     Precedenta P2 > P3: intai PLATILE (P2), apoi urgenta/furie fara plata (P3).
       0.0) regula FORTATA (Email Scout Report) -> P4, inaintea oricarui alt semnal;
+      0.1) procesator de plati online (euPlatesc / europayment.services) -> P2, pe expeditor;
       0) mail automat/template CargoTrack -> None (decide AI);
       1) dovada/confirmare de plata explicita -> P2 (plata);
       2) subiect care e un OP (ordin de plata) trimis de client -> P2 (plata);
@@ -182,6 +205,14 @@ def match(email: dict, att_names: str = ""):
     forced = match_forced(email)
     if forced:
         return forced
+
+    # 0.1) Procesator de plati online -> P2 pe EXPEDITOR, INAINTEA filtrului de mailuri automate.
+    # Notificarile lor sunt automate prin natura lor; daca subiectul prinde un tipar din
+    # `_AUTOMATED_SUBJECT`, regula de mai jos ar returna None si decizia ar cadea pe AI, care le-ar
+    # da tipic P5. Pusa aici, incadrarea P2 e garantata.
+    if _is_payment_processor(email):
+        return {"id": RULE_PROCESSOR, "tier": "P2",
+                "note": "Notificare de la un procesator de plati online -> P2 (plata)."}
 
     subj = _fold(email.get("subject") or "")
     body = _new_body(email)
