@@ -12,6 +12,14 @@ Fluxul complet:
      - Generează PDF cu tabel analitic zilnic (PyMuPDF/fitz, fallback HTML atașat)
      - Trimite email via noreply_sender.send_with_attachments
   4. Marchează KV productivity.last_monthly_sent = YYYY-MM luna curentă.
+
+⛔ PROTECȚIA ANTI-DUPLICAT E `productivity_notification_log`, NU sentinelele din `settings`.
+Rândul (lună raportată, grup, destinatar) se REZERVĂ înainte de trimitere, cu index unic. Cele
+trei porți din `send_monthly_reports_if_due` (zi/oră, etichetă de lună, momentul ultimei
+trimiteri) rămân ca filtru ieftin, dar toate se scriu DUPĂ trimitere — deci orice eroare apărută
+după ce SMTP a acceptat mesajul le sărea, iar cron-ul (5 min) relua la nesfârșit. Așa s-au produs
+peste 250 de duplicate în septembrie 2026 și 5 în august 2026. Nu muta marcajul înapoi după
+trimitere și nu condiționa rezervarea de succesul livrării.
 """
 from __future__ import annotations
 
@@ -570,13 +578,29 @@ def _send_email(db: Session, to_email: str, subject: str, html_body: str,
 
         from app.services.credential_crypto import decrypt_credentials
         password = decrypt_credentials(cfg["smtp_pass_enc"]).get("password", "")
-        with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=20) as server:
+
+        # ⛔ `sendmail` returnand fara exceptie = serverul a ACCEPTAT mesajul, deci mailul a
+        # plecat. Orice cade dupa acel moment (inchiderea conexiunii, un QUIT refuzat, un timeout
+        # la teardown) NU are voie sa raporteze „netrimis": exact asa s-au produs cele 250 de
+        # duplicate — mail livrat, functie intoarce False, marcajul anti-duplicat nu se scrie,
+        # cron-ul reia peste 5 minute. De aceea `delivered` se seteaza IMEDIAT dupa `sendmail`,
+        # iar iesirea din `with` e in propriul try.
+        delivered = False
+        server = smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=20)
+        try:
             if cfg["use_tls"]:
                 server.starttls()
             server.login(cfg["smtp_user"], password)
             server.sendmail(cfg["from_address"], [to_email], msg.as_string())
+            delivered = True
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                logger.warning("SMTP quit a esuat dupa trimiterea catre %s (mesajul e livrat)",
+                               to_email, exc_info=True)
         logger.info("productivity report sent to %s", to_email)
-        return True
+        return delivered
     except Exception:
         logger.exception("failed to send productivity report to %s", to_email)
         return False
@@ -587,10 +611,85 @@ def _strip_html(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html).strip()
 
 
+# ── Evidența trimiterilor: rezervă ÎNAINTE, nu marchează DUPĂ ────────────────────────────────
+# `productivity_notification_log` are index unic pe (month_key, department_group, destinatar).
+# Rândul se inserează ÎNAINTE de trimitere: a doua rulare nu mai poate insera, deci nu mai trimite,
+# indiferent ce se strică după. Sentinelele vechi (`productivity.last_monthly_sent[_at]`) rămân ca
+# poartă ieftină, dar NU mai sunt singura protecție — ele se scriu după trimitere, deci orice
+# eroare intermediară le sărea.
+
+def _claim_recipient(db: Session, month_key: str, group: str, email: str, by: str = "cron") -> bool:
+    """True dacă rezervarea a reușit (= nimeni nu a trimis încă acestui destinatar luna asta).
+
+    Commit imediat: rezervarea trebuie să fie durabilă ÎNAINTE de trimitere. Dacă procesul moare
+    între rezervare și SMTP, destinatarul rămâne fără mail — recuperabil manual din UI. Invers
+    (trimis, nerezervat) ar însemna iar duplicate în lanț, ceea ce nu e recuperabil.
+    """
+    try:
+        row = db.execute(text(
+            "INSERT INTO productivity_notification_log "
+            "  (month_key, department_group, recipient_email, status, claimed_by) "
+            "VALUES (:m, :g, :e, 'claimed', :by) "
+            "ON CONFLICT DO NOTHING RETURNING id"),
+            {"m": month_key, "g": group, "e": email, "by": by}).fetchone()
+        db.commit()
+        return bool(row)
+    except Exception:
+        logger.exception("claim esuat pentru %s (%s %s) — NU se trimite", email, group, month_key)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _release_claim(db: Session, month_key: str, group: str, email: str) -> None:
+    """Șterge rezervarea când trimiterea NU a ajuns la SMTP (eroare de construcție a mesajului,
+    config lipsă). Doar atunci — dacă mesajul a plecat, rândul rămâne, altfel se retrimite."""
+    try:
+        db.execute(text(
+            "DELETE FROM productivity_notification_log "
+            " WHERE month_key=:m AND department_group=:g AND lower(recipient_email)=lower(:e) "
+            "   AND status='claimed'"),
+            {"m": month_key, "g": group, "e": email})
+        db.commit()
+    except Exception:
+        logger.warning("release claim esuat pentru %s", email, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def _mark_claim(db: Session, month_key: str, group: str, email: str, ok: bool,
+                err: str = None) -> None:
+    try:
+        db.execute(text(
+            "UPDATE productivity_notification_log "
+            "   SET status = :st, sent_at = CASE WHEN :st = 'sent' THEN now() ELSE sent_at END, "
+            "       error = :err "
+            " WHERE month_key=:m AND department_group=:g AND lower(recipient_email)=lower(:e)"),
+            {"st": "sent" if ok else "failed", "err": (err or None)[:500] if err else None,
+             "m": month_key, "g": group, "e": email})
+        db.commit()
+    except Exception:
+        logger.warning("actualizarea evidentei esuata pentru %s", email, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 # ── Funcție principală ────────────────────────────────────────────────────────
 
-def send_monthly_reports(db: Session) -> dict:
-    """Trimite rapoarte lunare la toți destinatarii activi. Returnează dict cu statistici."""
+def send_monthly_reports(db: Session, force: bool = False, claimed_by: str = "cron") -> dict:
+    """Trimite rapoarte lunare la toți destinatarii activi. Returnează dict cu statistici.
+
+    Fiecare destinatar se REZERVĂ în `productivity_notification_log` înainte de trimitere; cine e
+    deja rezervat pentru (lună, grup) nu mai primește nimic. `force=True` (retrimitere manuală,
+    explicită) șterge rezervarea existentă înainte de a o relua — singura cale de a trimite a doua
+    oară aceluiași om pentru aceeași lună.
+    """
     from app.services.productivity import department_report, forecast_report
 
     today = _dt.date.today()
@@ -613,7 +712,10 @@ def send_monthly_reports(db: Session) -> dict:
     for _, email, group in rows:
         groups[group].append(email)
 
-    sent = errors = 0
+    # Luna RAPORTATĂ (cea precedentă) e cheia evidenței — nu luna curentă: raportul pe august
+    # rămâne „raportul pe august" indiferent când e retrimis.
+    month_key = f"{prev_year}-{prev_month:02d}"
+    sent = errors = skipped = 0
     for group, recipients in groups.items():
         try:
             depts = _expand_departments(db, group)
@@ -659,12 +761,23 @@ def send_monthly_reports(db: Session) -> dict:
                                           intro, summary_reports, forecast_reports)
             subject = f"Rezumat productivitate {prev_lbl} — {group_lbl}"
 
-            # Trimite la fiecare destinatar
+            # Trimite la fiecare destinatar — rezervare ÎNAINTE, trimitere DUPĂ.
             for email in recipients:
+                if force:
+                    _release_claim(db, month_key, group, email)
+                if not _claim_recipient(db, month_key, group, email, by=claimed_by):
+                    skipped += 1
+                    logger.info("productivity report: %s a primit deja raportul pe %s (%s) — sar",
+                                email, month_key, group)
+                    continue
                 ok = _send_email(db, email, subject, html_body, att_data, att_mime, att_name)
+                _mark_claim(db, month_key, group, email, ok,
+                            None if ok else "trimitere esuata (vezi logurile)")
                 if ok:
                     sent += 1
                 else:
+                    # Rezervarea RĂMÂNE, cu status 'failed': nu se reia automat. Un mail lipsă se
+                    # retrimite manual; 250 de duplicate nu se pot lua înapoi.
                     errors += 1
 
             # Audit log
@@ -704,7 +817,7 @@ def send_monthly_reports(db: Session) -> dict:
     # și inundă destinatarii cu duplicate ale grupurilor care AU reușit.
     if sent > 0:
         _mark_sent(db)
-    return {"sent": sent, "errors": errors}
+    return {"sent": sent, "errors": errors, "skipped": skipped, "month": month_key}
 
 
 def send_monthly_reports_if_due(db: Session) -> dict:

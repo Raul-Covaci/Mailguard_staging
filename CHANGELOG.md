@@ -8,6 +8,41 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.23.0 - 2026-09-12
+
+### MINOR — Rapoartele lunare de productivitate nu se mai pot trimite de două ori
+
+**Incident:** peste 250 de mailuri „Rezumat productivitate August 2026 — Toate departamentele" în
+aceeași căsuță, câte unul la fiecare rulare de cron (5 minute).
+
+**Cauza e ordinea operațiilor, nu o eroare punctuală.** Toate cele trei garduri existente —
+ziua/ora, eticheta de lună `productivity.last_monthly_sent`, momentul `..._sent_at` — se scriu
+**după** trimitere, în `_mark_sent`, și doar dacă `sent > 0`. Orice eroare apărută după ce SMTP a
+acceptat mesajul lăsa destinatarul cu mailul primit și aplicația convinsă că nu a trimis nimic, deci
+cron-ul relua la nesfârșit. Același tipar produsese 5 duplicate pe 03.08.2026; atunci s-a reparat
+cauza punctuală (un INSERT invalid în `audit_log`), nu ordinea.
+
+**Reparație structurală:** tabela nouă `productivity_notification_log`, cu index unic pe
+(lună raportată, grup, destinatar). Rândul se **rezervă înainte** de trimitere cu
+`INSERT ... ON CONFLICT DO NOTHING`: a doua rulare nu mai poate insera, deci nu mai trimite,
+indiferent ce se strică după. Rezervarea se comite imediat — dacă procesul moare între rezervare și
+SMTP, destinatarul rămâne fără mail (recuperabil manual), în loc de duplicate în lanț.
+
+**A doua cauză, independentă:** `_send_email` returna `False` și pentru mailuri livrate. `sendmail`
+întors fără excepție înseamnă că serverul a acceptat mesajul, dar închiderea conexiunii se făcea
+prin ieșirea din `with smtplib.SMTP(...)`, care apelează `quit()`; un `QUIT` refuzat sau o
+conexiune închisă brusc arunca, iar funcția raporta eșec pentru un mail deja plecat — exact
+combustibilul buclei. Acum `delivered` se setează imediat după `sendmail`, iar teardown-ul e
+izolat.
+
+**Eșecurile nu se reiau automat** (rândul rămâne `failed`, vizibil în noul
+`GET /productivity/notifications/log`). Retrimiterea e explicită:
+`POST /productivity/notifications/send-now?force=true`. Fără `force`, `send-now` respectă
+rezervările — un click dublu nu mai trimite nimic.
+
+Migrația seedează defensiv luna deja trimisă, ca un deploy la mijlocul lunii să nu poată declanșa
+o rundă nouă.
+
 ## v3.22.1 - 2026-09-12
 
 ### PATCH — euPlatesc / europayment.services intră cu prioritatea P2

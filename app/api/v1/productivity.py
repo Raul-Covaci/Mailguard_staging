@@ -515,15 +515,45 @@ def delete_notification(notif_id: int, db: Session = Depends(get_db), admin=Depe
 
 
 @router.post("/productivity/notifications/send-now")
-def send_notifications_now(db: Session = Depends(get_db), admin=Depends(require_prod_full)):
-    """Declanșează trimiterea manuală a rapoartelor (ignoră gating zi/oră)."""
+def send_notifications_now(force: bool = Query(False, description="retrimite chiar dacă a plecat deja"),
+                           db: Session = Depends(get_db), admin=Depends(require_prod_full)):
+    """Declanșează trimiterea manuală a rapoartelor (ignoră gating zi/oră).
+
+    NU ignoră evidența per destinatar: cine a primit deja raportul lunii respective e sărit, deci
+    un click repetat nu mai trimite nimic. `force=true` e singura cale de retrimitere — decizie
+    explicită, cerută în URL.
+    """
     from app.services import productivity_notifier as _pn
     try:
-        result = _pn.send_monthly_reports(db)
+        result = _pn.send_monthly_reports(db, force=bool(force), claimed_by="manual")
         return {"ok": True, **result}
     except Exception as exc:
         logger.exception("send_notifications_now failed")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/productivity/notifications/log")
+def notifications_log(month: str = Query("", description="YYYY-MM; implicit ultimele 6 luni"),
+                      limit: int = Query(200, ge=1, le=1000),
+                      db: Session = Depends(get_db), admin=Depends(require_prod_full)):
+    """Evidența trimiterilor lunare — cine a primit raportul, când, și ce a eșuat.
+
+    Sursa de adevăr pentru „s-a trimis sau nu": rândul se scrie ÎNAINTE de trimitere, deci un
+    `claimed` rămas fără `sent_at` înseamnă că procesul a murit între rezervare și SMTP.
+    """
+    rows = db.execute(text(
+        "SELECT month_key, department_group, recipient_email, status, error, "
+        "       claimed_at, sent_at, claimed_by "
+        "  FROM productivity_notification_log "
+        " WHERE (:m = '' OR month_key = :m) "
+        " ORDER BY month_key DESC, department_group, recipient_email "
+        " LIMIT :lim"), {"m": (month or "").strip(), "lim": limit}).mappings().all()
+    return {"items": [{
+        "month": r["month_key"], "group": r["department_group"], "email": r["recipient_email"],
+        "status": r["status"], "error": r["error"], "claimed_by": r["claimed_by"],
+        "claimed_at": r["claimed_at"].isoformat() if r["claimed_at"] else None,
+        "sent_at": r["sent_at"].isoformat() if r["sent_at"] else None,
+    } for r in rows]}
 
 
 @router.post("/productivity/notifications/send-test")

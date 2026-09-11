@@ -76,6 +76,39 @@ modificările durabile se fac în fișierul din repo.
 
 ---
 
+## 📧 RAPOARTE LUNARE PRODUCTIVITATE — anti-duplicat prin REZERVARE, nu prin marcaj (2026-09-12)
+
+Emailul „Rezumat productivitate <luna> — <grup>" pleacă în prima zi lucrătoare a lunii, la ora
+10:00, din `app/services/productivity_notifier.py`, declanșat de tick-ul de 5 minute
+(`POST /process/run-now` → `send_monthly_reports_if_due`).
+
+⛔ **Protecția anti-duplicat e `productivity_notification_log`, NU cheile din `settings`.** Rândul
+`(lună raportată, grup, destinatar)` se REZERVĂ — `INSERT ... ON CONFLICT DO NOTHING` pe un index
+unic — **înainte** de trimitere. A doua rulare nu mai poate insera, deci nu mai trimite, orice s-ar
+strica după. Migrație: `migrations/20260912c_productivity_notification_log.sql`.
+
+⚠️ **De ce nu ajung sentinelele din `settings`.** `productivity.last_monthly_sent` și
+`..._sent_at` se scriu în `_mark_sent`, DUPĂ trimitere și doar dacă `sent > 0`. Orice eroare
+apărută după ce SMTP a acceptat mesajul — conexiune închisă brusc, tranzacție abortată, `QUIT`
+refuzat — lăsa destinatarul cu mailul primit și aplicația convinsă că n-a trimis nimic; cron-ul
+relua din 5 în 5 minute. Rezultatul: **peste 250 de duplicate în septembrie 2026** și 5 în august
+2026 (când cauza punctuală, un INSERT invalid în `audit_log`, a fost reparată fără a schimba
+ordinea „marchează după trimitere"). Cele trei porți din `send_monthly_reports_if_due` rămân ca
+filtru ieftin, dar nu mai sunt singura apărare.
+
+⚠️ **`sendmail` fără excepție = mail livrat.** `_send_email` setează `delivered` IMEDIAT după
+`sendmail`; închiderea conexiunii se face separat, iar un `QUIT` eșuat doar se loghează. Nu muta
+`sendmail` înapoi într-un `with smtplib.SMTP(...)`: ieșirea din context apelează `quit()`, iar o
+excepție acolo raporta „netrimis" pentru un mail deja plecat — exact bucla de mai sus.
+
+⚠️ **Un eșec NU se reia automat.** Rândul rămâne `status='failed'`, vizibil în
+`GET /productivity/notifications/log`. Un mail lipsă se retrimite manual
+(`POST /productivity/notifications/send-now?force=true`, singura cale de retrimitere); 250 de
+duplicate nu se pot lua înapoi. `send-now` fără `force` respectă rezervările, deci un click dublu
+nu mai trimite nimic.
+
+---
+
 ## 🧑‍💼 ANALIZA OPERATORI — evaluarea AI a răspunsurilor pe email (2026-09-12)
 
 Tab nou în „Mail-uri CTS", după „Raport departamente". Fiecare pereche (mail primit de la client,
