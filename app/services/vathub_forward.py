@@ -33,8 +33,29 @@ BATCH_PER_POLL = 12      # câte forwarduri pe rulare, per cont
 # un backlog de 24h în câteva minute.
 
 
+# Cine face redirectul. Din 2026-09-12 sursa e CĂSUȚA PRINCIPALĂ (`vathub_inbox.py`),
+# nu căsuțele personale: mailurile autorităților ajung oricum în căsuța din care se
+# alimentează pagina „Email-uri", iar acolo redirectul nu depinde de credențialele
+# IMAP/SMTP personale ale nimănui. Calea veche rămâne în cod și se poate reactiva
+# fără deploy, punând `source` pe "personal" (sau "both") în `settings.vathub.redirect`.
+DEFAULT_SOURCE = "inbox"
+
+
+def source_of(cfg: dict) -> str:
+    return str((cfg or {}).get("source") or DEFAULT_SOURCE).strip().lower()
+
+
+def personal_enabled(cfg: dict) -> bool:
+    return source_of(cfg) in ("personal", "both")
+
+
+def inbox_enabled(cfg: dict) -> bool:
+    return source_of(cfg) in ("inbox", "both")
+
+
 def _defaults() -> dict:
     return {"target": "vathub@cargotrack.ro", "enabled": False,
+            "source": DEFAULT_SOURCE,
             "domains": {}, "addresses": {}, "max_age_hours": DEFAULT_MAX_AGE_HOURS}
 
 
@@ -241,6 +262,9 @@ def process_account(account: dict, imap_password: str, smtp_password: Optional[s
             return out
         cfg = load_rules(cur)
         if not cfg.get("enabled"):
+            return out
+        if not personal_enabled(cfg):
+            # Redirectul rulează pe căsuța principală; aici ar produce duplicate.
             return out
         out["matched"] = mark_matches(cur, conn, account["id"], cfg)
         out.update(forward_pending(account, imap_password, smtp_password, cur, conn, cfg))

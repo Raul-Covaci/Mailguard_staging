@@ -79,6 +79,17 @@ def build_forward(raw_original: bytes, from_address: str, to_address: str,
     # policy=default: `add_attachment` are nevoie de un obiect EmailMessage ca să
     # producă o parte `message/rfc822` corectă (vezi nota de la add_attachment).
     original = message_from_bytes(raw_original, policy=email.policy.default)
+    return build_forward_msg(original, from_address, to_address, matched_rule, source_mailbox)
+
+
+def build_forward_msg(original, from_address: str, to_address: str,
+                      matched_rule: str, source_mailbox: str) -> EmailMessage:
+    """Varianta care primește mesajul ORIGINAL deja construit/parsat.
+
+    Redirectul din căsuța principală nu are întotdeauna MIME-ul brut (instalările
+    pe parser-email-op), deci reconstruiește originalul din DB și îl dă aici —
+    aceeași împachetare, aceleași headere de urmărire.
+    """
     orig_from = original.get("From", "") or ""
     orig_date = original.get("Date", "") or ""
     orig_to = original.get("To", "") or ""

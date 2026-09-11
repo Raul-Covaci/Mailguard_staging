@@ -1081,6 +1081,19 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
             _pn_db.close()
     except Exception:
         logger.exception("productivity monthly report failed")
+    # REDIRECT VATHUB (căsuța principală): potrivește mailurile noi cu lista de
+    # autorități fiscale și le forwardează spre vathub@cargotrack.ro. Best-effort,
+    # no-op cât timp `settings.vathub.redirect` nu e activ pe sursa "inbox".
+    try:
+        from app.services import vathub_inbox as _vhi_tick
+        from app.database import get_db as _get_db_vh
+        _vh_db = next(_get_db_vh())
+        try:
+            res["vathub_inbox"] = _vhi_tick.run_once(_vh_db)
+        finally:
+            _vh_db.close()
+    except Exception:
+        logger.exception("vathub inbox forward failed")
     # Program departamente: sync pontaj CTS -> department_attendance (rolling ~35 zile).
     # INERT pana la grant Razvan: no-op cat timp pontaj_sync.enabled=false. Folosit doar
     # pt Sambata (singura zi cu requires_attendance=true in department_schedule).
@@ -1273,3 +1286,242 @@ def list_strict(db: Session = Depends(get_db)):
         LIMIT 100
     """)).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# ══ REDIRECT VATHUB — din căsuța principală ═══════════════════════════════════
+# Mailurile oficiale de recuperare TVA (ANAF/MF, NAV, NAP, BZSt, DGFiP, ...) sosesc
+# în căsuța principală, aceeași care alimentează pagina „Email-uri". Cele de la o
+# adresă/domeniu din listă se forwardează spre vathub@cargotrack.ro, de unde le
+# citește aplicația VATHUB. Motor: app/services/vathub_inbox.py.
+#
+# Lista și configul stau în `settings.vathub.redirect` — ACEEAȘI cheie folosită și
+# de calea veche din căsuțele personale, ca să nu existe două liste divergente.
+# `source` decide cine o folosește ("inbox" acum).
+
+from app.services import vathub_inbox as _vhi
+from app.services import vathub_forward as _vhf
+from app.services.vathub_send_guard import ALLOWED_FORWARD_TARGETS as _VH_TARGETS
+
+_VH_LISTS = ("domains", "addresses")
+
+
+def _vh_load(db) -> dict:
+    return _vhi.load_config(db)
+
+
+def _vh_save(db, store: dict, by: str) -> None:
+    db.execute(text(
+        "INSERT INTO settings(key, value, description, updated_by, updated_at) "
+        "VALUES(:k, CAST(:v AS jsonb), "
+        "'Redirect VATHUB: expeditori de autoritate fiscala + adresa tinta', :by, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_by=:by, updated_at=NOW()"
+    ), {"k": _vhi.SETTINGS_KEY, "v": json.dumps(store), "by": by})
+
+
+def _vh_norm(list_name: str, value: str) -> str:
+    """Domeniile se rețin fără `@`, adresele complet. Ambele lowercase."""
+    v = (value or "").strip().lower().lstrip("@")
+    if not v:
+        raise HTTPException(400, "Valoare goală")
+    if list_name == "addresses" and "@" not in v:
+        raise HTTPException(400, "Adresa trebuie să conțină '@' (pentru domeniu folosește lista de domenii)")
+    if list_name == "domains" and "@" in v:
+        raise HTTPException(400, "Domeniul nu conține '@' (pentru adresă folosește lista de adrese)")
+    return v
+
+
+def _vh_entry_out(value: str, meta: dict) -> dict:
+    meta = meta or {}
+    return {"value": value, "muted": bool(meta.get("muted")), "note": meta.get("note"),
+            "source": meta.get("source") or "manual", "by": meta.get("by"), "at": meta.get("at")}
+
+
+def _vh_actor(admin) -> str:
+    if isinstance(admin, dict):
+        return admin.get("username") or admin.get("email") or "admin"
+    return getattr(admin, "username", None) or getattr(admin, "email", None) or "admin"
+
+
+@router.get("/emails/vathub/rules")
+def vh_inbox_rules(db: Session = Depends(get_db), _admin=Depends(get_current_admin)):
+    """Configul redirectului + listele de expeditori + starea cozii."""
+    store = _vh_load(db)
+    out = {
+        "target": store.get("target"),
+        "enabled": bool(store.get("enabled")),
+        "source": _vhf.source_of(store),
+        "active": _vhi.is_active(store),
+        "max_age_hours": int(store.get("max_age_hours") or _vhf.DEFAULT_MAX_AGE_HOURS),
+        "allowed_targets": sorted(_VH_TARGETS),
+    }
+    for lst in _VH_LISTS:
+        items = [_vh_entry_out(k, v) for k, v in (store.get(lst) or {}).items()]
+        items.sort(key=lambda e: (e["muted"], e["value"]))
+        out[lst] = items
+    out["counts"] = {lst: {"total": len(out[lst]),
+                           "active": sum(1 for e in out[lst] if not e["muted"])}
+                     for lst in _VH_LISTS}
+    try:
+        out["stats"] = _vhi.stats(db)
+    except Exception:
+        out["stats"] = {}
+    out["smtp_ready"] = _vhi.smtp_ready(db)
+    return out
+
+
+@router.put("/emails/vathub/rules")
+def vh_inbox_update(body: dict, db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    reviewer = _vh_actor(admin)
+    store = _vh_load(db)
+
+    if body.get("target") is not None:
+        target = (body.get("target") or "").strip().lower()
+        # Whitelist-ul de destinații e în COD, nu în config — vezi vathub_send_guard.
+        if target not in _VH_TARGETS:
+            raise HTTPException(400, "Destinație neaprobată. Permise: " + ", ".join(sorted(_VH_TARGETS)))
+        store["target"] = target
+    if body.get("enabled") is not None:
+        store["enabled"] = bool(body["enabled"])
+    if body.get("source") is not None:
+        src = (body.get("source") or "").strip().lower()
+        if src not in ("inbox", "personal", "both"):
+            raise HTTPException(400, "Sursă invalidă (inbox / personal / both)")
+        store["source"] = src
+    if body.get("max_age_hours") is not None:
+        try:
+            hours = int(body["max_age_hours"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "max_age_hours trebuie să fie număr")
+        if not 1 <= hours <= 720:
+            raise HTTPException(400, "max_age_hours între 1 și 720")
+        store["max_age_hours"] = hours
+
+    _vh_save(db, store, reviewer)
+    db.commit()
+    logger.info("VATHUB inbox config actualizat de %s: enabled=%s source=%s target=%s",
+                reviewer, store.get("enabled"), store.get("source"), store.get("target"))
+    return {"ok": True, "enabled": store["enabled"], "target": store["target"],
+            "source": _vhf.source_of(store)}
+
+
+@router.post("/emails/vathub/entries")
+def vh_inbox_add(body: dict, db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    reviewer = _vh_actor(admin)
+    lst = (body.get("list") or "").strip().lower()
+    if lst not in _VH_LISTS:
+        raise HTTPException(400, "Listă invalidă (domains/addresses)")
+    key = _vh_norm(lst, body.get("value") or "")
+    store = _vh_load(db)
+    if key in store[lst]:
+        raise HTTPException(409, f"'{key}' există deja în listă")
+    store[lst][key] = {"muted": bool(body.get("muted", False)), "note": body.get("note"),
+                       "source": "manual", "by": reviewer,
+                       "at": datetime.now(timezone.utc).isoformat()}
+    _vh_save(db, store, reviewer)
+    db.commit()
+    return {"ok": True, "list": lst, "value": key}
+
+
+@router.put("/emails/vathub/entries")
+def vh_inbox_edit(body: dict, db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Activare/suspendare (`muted`), notă sau redenumire a unei intrări."""
+    reviewer = _vh_actor(admin)
+    lst = (body.get("list") or "").strip().lower()
+    if lst not in _VH_LISTS:
+        raise HTTPException(400, "Listă invalidă (domains/addresses)")
+    key = _vh_norm(lst, body.get("value") or "")
+    store = _vh_load(db)
+    bucket = store[lst]
+    if key not in bucket:
+        raise HTTPException(404, "Intrare inexistentă")
+
+    entry = dict(bucket[key] or {})
+    if body.get("muted") is not None:
+        entry["muted"] = bool(body["muted"])
+        entry["validated_by"] = reviewer
+        entry["validated_at"] = datetime.now(timezone.utc).isoformat()
+    if body.get("note") is not None:
+        entry["note"] = body["note"]
+
+    target_key = key
+    if body.get("new_value"):
+        nk = _vh_norm(lst, body["new_value"])
+        if nk != key:
+            if nk in bucket:
+                raise HTTPException(409, f"'{nk}' există deja în listă")
+            del bucket[key]
+            target_key = nk
+    bucket[target_key] = entry
+    store[lst] = bucket
+    _vh_save(db, store, reviewer)
+    db.commit()
+    return {"ok": True, "value": target_key, "muted": entry.get("muted", False)}
+
+
+@router.delete("/emails/vathub/entries")
+def vh_inbox_delete(list: str = Query(...), value: str = Query(...),
+                    db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    reviewer = _vh_actor(admin)
+    if list not in _VH_LISTS:
+        raise HTTPException(400, "Listă invalidă (domains/addresses)")
+    key = _vh_norm(list, value)
+    store = _vh_load(db)
+    if key not in store[list]:
+        raise HTTPException(404, "Intrare inexistentă")
+    del store[list][key]
+    _vh_save(db, store, reviewer)
+    db.commit()
+    return {"ok": True, "removed": key}
+
+
+@router.get("/emails/vathub/log")
+def vh_inbox_log(limit: int = Query(50, ge=1, le=200),
+                 db: Session = Depends(get_db), _admin=Depends(get_current_admin)):
+    """Mailurile potrivite de regulile VATHUB — trimise, în așteptare sau eșuate."""
+    return {"items": _vhi.recent(db, limit), "stats": _vhi.stats(db)}
+
+
+@router.post("/emails/vathub/run")
+def vh_inbox_run(db: Session = Depends(get_db), _admin=Depends(get_current_admin)):
+    """Rulează manual scanarea + trimiterea, fără să aștepți tick-ul de 5 minute."""
+    cfg = _vh_load(db)
+    if not _vhi.is_active(cfg):
+        raise HTTPException(400, "Redirectul VATHUB nu e activ pe căsuța principală "
+                                 "(verifica bifa Redirect activ si sursa configurata)")
+    res = _vhi.scan(db)
+    res.update(_vhi.forward_pending(db))
+    return res
+
+
+@router.post("/emails/vathub/backfill")
+def vh_inbox_backfill(days: int = Query(7, ge=1, le=90),
+                      limit: int = Query(500, ge=1, le=5000),
+                      db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Caută retroactiv în ultimele N zile și pune la coadă ce potrivește.
+
+    Există fiindcă scanarea normală merge înainte, pe cursor: o regulă adăugată azi
+    nu se aplică singură mailurilor deja intrate. Trimiterea rămâne a motorului.
+    """
+    res = _vhi.backfill(db, days=days, limit=limit)
+    if res.get("error"):
+        raise HTTPException(400, res["error"])
+    logger.info("VATHUB backfill %dz cerut de %s: %s potriviri", days, _vh_actor(admin),
+                res.get("matched"))
+    res.update(_vhi.forward_pending(db))
+    return res
+
+
+@router.post("/emails/vathub/retry")
+def vh_inbox_retry(id: int = Query(..., description="id din vathub_inbox_forward"),
+                   db: Session = Depends(get_db), admin=Depends(get_current_admin)):
+    """Repune pe coadă un mail eșuat sau blocat (resetează contorul de încercări)."""
+    res = db.execute(text("""
+        UPDATE vathub_inbox_forward
+           SET status='pending', attempts=0, error=NULL
+         WHERE id=:id AND status IN ('failed', 'blocked')
+    """), {"id": id})
+    if not res.rowcount:
+        raise HTTPException(404, "Rând inexistent sau deja trimis/în așteptare")
+    db.commit()
+    logger.info("VATHUB retry id=%s cerut de %s", id, _vh_actor(admin))
+    return {"ok": True, "id": id, **_vhi.forward_pending(db)}

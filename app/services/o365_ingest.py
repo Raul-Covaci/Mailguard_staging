@@ -230,6 +230,42 @@ def _delta_fetch(c, tok):
     return msgs, delta_link
 
 
+def raw_message_fetcher():
+    """Returnează o funcție `graph_id -> bytes|None` care aduce MIME-ul BRUT din Graph.
+
+    Folosit de redirectul VATHUB: mesajul autorității pleacă spre vathub@cargotrack.ro
+    INTACT (atașamente, headere, semnături), nu reconstruit din `body_html`.
+    Tokenul se ia O SINGURĂ DATĂ, la construirea funcției — un lot de forwarduri ar
+    face altfel un login OAuth per mail.
+    Returnează None dacă O365 nu e configurat (instalările pe parser-email-op);
+    apelantul cade atunci pe reconstrucția din DB.
+    """
+    c = _cfg()
+    if not is_configured():
+        return None
+    try:
+        tok = _access_token(c)
+    except Exception as e:
+        logger.warning("o365 raw fetcher: auth fail: %s", str(e)[:200])
+        return None
+
+    def _fetch(graph_id):
+        if not graph_id:
+            return None
+        try:
+            r = httpx.get(f"{_base(c)}/messages/{graph_id}/$value",
+                          headers={"Authorization": "Bearer " + tok}, timeout=60)
+        except Exception as e:
+            logger.warning("o365 raw fetch %s: %s", graph_id, str(e)[:160])
+            return None
+        if r.status_code != 200:
+            logger.warning("o365 raw fetch %s: HTTP %s", graph_id, r.status_code)
+            return None
+        return r.content
+
+    return _fetch
+
+
 def _fetch_attachments(c, tok, gid):
     r = httpx.get(f"{_base(c)}/messages/{gid}/attachments", headers={"Authorization": "Bearer " + tok}, timeout=60)
     if r.status_code != 200:

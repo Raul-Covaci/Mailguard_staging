@@ -8,6 +8,53 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.0 - 2026-09-12
+
+### MINOR — Redirectul VATHUB se mută din căsuțele personale în căsuța principală
+
+**Cerință (Raul Covaci):** mailurile autorităților fiscale nu mai trebuie citite din căsuța
+personală a Dianei, ci **direct din căsuța principală** — aceeași care alimentează pagina
+„Email-uri". Orice mail de la o adresă sau un domeniu din listă se forwardează spre
+`vathub@cargotrack.ro`, de unde îl citește aplicația VATHUB.
+
+**Ce se schimbă concret.** Redirectul nu mai depinde de credențialele IMAP/SMTP personale ale
+nimănui: pleacă de pe contul SMTP **no-reply** și rulează în tick-ul obișnuit de 5 minute
+(`POST /process/run-now` → `vathub_inbox.run_once()`). Lista de expeditori se administrează dintr-un
+tab nou **„Redirect VATHUB"** în pagina Email-uri, cu adăugare/suspendare/ștergere, jurnalul
+mailurilor potrivite și buton de reîncercare pe cele eșuate.
+
+**Lista validată e seedată activă:** 29 de adrese + 23 de domenii (ANAF/MF, AT, BE, BG, CZ, DE, DK,
+ES, FR, GR, HR, HU, IT, LT, LU, PL, PT, SE, SI, SK). Domeniile prind și subdomeniile
+(`nav.gov.hu` prinde `elekafa.nav.gov.hu`), adresa exactă bate domeniul, iar `evilnav.gov.hu` NU
+potrivește `nav.gov.hu`. `gov.si` și `anaf.ro` sunt domenii largi — asumate la cererea explicită,
+se pot restrânge din UI.
+
+**Calea veche rămâne, dezactivată.** `vathub_forward.process_account` și coloanele
+`personal_mails.vathub_*` nu au fost șterse; cheia `source` din `settings.vathub.redirect` decide
+cine face redirectul (`inbox` acum, `personal` sau `both` la nevoie), deci comutarea înapoi nu cere
+deploy. Endpoint-urile de configurare au fost scoase din `personal-mailboxes` ca să nu existe două
+locuri care scriu aceeași listă.
+
+**Istoricul NU se retrimite la instalare.** Scanarea merge pe un cursor de id
+(`settings.vathub.inbox_cursor`), pornit de la ultimul `emails.id` existent — altfel prima rulare ar
+fi inundat VATHUB. Pentru mailurile deja intrate există butonul „Caută retroactiv"
+(`POST /emails/vathub/backfill?days=N`).
+
+**Fără duplicate și fără bucle.** Rezervarea rândului e atomică
+(`UPDATE ... FOR UPDATE SKIP LOCKED ... RETURNING`), deci tick-ul și butonul „Rulează acum" nu pot
+trimite același mail de două ori; `attempts` crește înainte de SMTP și se oprește la 5, iar un
+`QUIT` eșuat după o livrare reușită **nu** mai contează ca eșec (lecția din v3.23.0). Destinația
+rămâne whitelist-ată în cod, verificată per mail chiar înainte de conectarea SMTP.
+
+**Mesajul pleacă intact** — MIME brut din Graph când există ingest O365 nativ, altfel reconstruit
+din baza de date (corp + atașamente). Subiectul rămâne neschimbat, fiindcă VATHUB potrivește
+dosarele după numărul de referință din el; expeditorul real ajunge în `Reply-To`.
+
+Migrație: `20260912d_vathub_inbox_forward.sql` (tabela `vathub_inbox_forward`, lista seedată,
+cursorul inițial).
+
+---
+
 ## v3.23.0 - 2026-09-12
 
 ### MINOR — Rapoartele lunare de productivitate nu se mai pot trimite de două ori

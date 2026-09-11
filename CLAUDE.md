@@ -186,79 +186,98 @@ verificabil.
 
 ---
 
-## 📤 REDIRECT VATHUB — căsuțe personale → vathub@cargotrack.ro (2026-08-20)
+## 📤 REDIRECT VATHUB — din CĂSUȚA PRINCIPALĂ către vathub@cargotrack.ro (2026-09-12)
 
-Mailurile oficiale de recuperare TVA (decizii pe declarația 318) sosesc pe adresa PERSONALĂ a
-persoanei care a depus cererea, nu pe o adresă de firmă. Redirectul le duce automat în căsuța
+Mailurile oficiale de recuperare TVA (decizii pe declarația 318) sosesc de la autoritățile
+fiscale din 15 țări. Cele de la o adresă/domeniu din listă se **forwardează automat** în căsuța
 generală `vathub@cargotrack.ro`, citită de aplicația **VATHUB** (repo separat) — Cargo360 doar
 forwardează, nu apelează niciun API al VATHUB.
 
-Traseu: poller-ul de căsuțe personale (`mailguard-personal-poll.timer`, 1 min) → ingest metadata →
-detecție (T2) → mutare foldere (T4) → **`vathub_forward.process_account()`**.
+⚠️ **Sursa e căsuța principală, NU căsuțele personale** (mutare cerută 2026-09-12). Traseu:
+ingest normal (`emails`) → tick de 5 min (`POST /process/run-now`) → `vathub_inbox.run_once()`
+→ scanare + forward. Mailul pleacă **de pe contul SMTP no-reply** (`noreply_smtp_config`), deci
+redirectul nu mai depinde de credențialele IMAP/SMTP personale ale nimănui.
 
-- Motor: `app/services/vathub_forward.py` (potrivire + coadă), `app/services/personal_smtp.py`
-  (construire + trimitere), `app/services/vathub_send_guard.py` (gardă destinație).
-- Config + liste: `settings.vathub.redirect` (`target`, `enabled`, `max_age_hours`, `domains`,
-  `addresses`). Migrație: `migrations/20260820_vathub_forward.sql`.
-- API: `GET/PUT /personal-mailboxes/rules/vathub`, `POST/PUT/DELETE .../vathub/entries`,
-  `GET /personal-mailboxes/{id}/vathub-log`, `POST .../smtp-test`, `POST .../vathub-run`.
-- UI: buton „Email-uri redirect VATHUB" per căsuță în `PersonalMailboxesPage` (`mg-app.js`).
+- Motor: `app/services/vathub_inbox.py`. Coadă: `vathub_inbox_forward`
+  (`migrations/20260912d_vathub_inbox_forward.sql`). Gardă: `app/services/vathub_send_guard.py`.
+- Config + liste: `settings.vathub.redirect` (`target`, `enabled`, **`source`**, `max_age_hours`,
+  `domains`, `addresses`) — ACEEAȘI cheie folosită și de calea veche, ca să nu existe două liste.
+- API: `GET/PUT /emails/vathub/rules`, `POST/PUT/DELETE /emails/vathub/entries`,
+  `GET /emails/vathub/log`, `POST /emails/vathub/run|backfill|retry`.
+- UI: tab **„Redirect VATHUB"** în pagina Email-uri (`VathubRedirect` în `mg-app.js`).
+
+⚠️ **`source` decide cine face redirectul** — `"inbox"` (implicit acum), `"personal"` sau
+`"both"`. Calea veche (`vathub_forward.process_account`, `personal_mails.vathub_*`) rămâne
+INTACTĂ în cod și în schemă, dar e no-op; se reactivează prin config, fără deploy. Nu o șterge:
+e singurul plan de rezervă dacă mailurile autorităților ajung din nou doar pe adrese personale.
 
 ⛔ **Destinația e whitelist-ată în cod, nu în config.** `assert_forward_target_allowed()` se apelează
 **per mail, chiar înainte de conectarea SMTP** — nu la salvarea configului, fiindcă acesta se poate
 schimba din UI între două rulări. Permise: `vathub@cargotrack.ro` + cele două adrese de test ale lui
 Raul. Decizie Raul Covaci, 2026-08-20 (aprobare explicită pentru trimitere reală și pe staging).
-Garda din `feedback_send_guard` e SEPARATĂ și rămâne neatinsă — acolo whitelist-ul protejează
-clienții reali de mailuri de feedback.
+Garda din `feedback_send_guard` e SEPARATĂ și rămâne neatinsă.
 
-**Potrivire pe domeniu, cu subdomenii** (`domain == rule or domain.endswith("." + rule)`):
-`nav.gov.hu` prinde `elekafa@elekafa.nav.gov.hu`, `nra.bg` prinde `b.stoilova@ro22.nra.bg` — la SK,
-CZ, GR, AT, PL scriu inspectori nominali, cu adrese care se schimbă per dosar. Adresa exactă bate
-domeniul. Boundary strict: `evilnav.gov.hu` NU potrivește `nav.gov.hu`.
+⚠️ **Scanarea merge pe CURSOR de id** (`settings.vathub.inbox_cursor`), nu pe un flag per rând:
+`emails` are milioane de rânduri, deci „neexaminat încă" ar fi adevărat pe toate la instalare —
+index inutilizabil plus un UPDATE de masă ca să-l cureți. Cursorul pornește de la `max(emails.id)`
+la migrație, deci **istoricul NU se retrimite**. Consecința: o regulă adăugată azi se aplică
+mailurilor VIITOARE; pentru cele deja intrate există butonul „Caută retroactiv"
+(`POST /emails/vathub/backfill?days=N`).
 
-⚠️ **O intrare `muted: true` e PROPUNERE, nu regulă.** Cele 13 domenii seedate de migrație vin din
-analiza traficului (15 iul – 13 aug 2026) și sunt inactive; se activează doar din UI, după validare
-cu echipa. `enabled=false` la instalare — nimic nu pleacă până nu se bifează explicit.
+⚠️ **Rândurile prea vechi trebuie totuși returnate de scanare**, ca să avanseze cursorul peste ele.
+De aceea `max_age_hours` e o coloană calculată (`fresh`), nu un filtru în `WHERE`: un filtru le-ar
+lăsa la infinit înaintea cursorului și s-ar rescana la fiecare tick.
 
-**Mesajul se trimite INTACT.** Original luat cu `personal_imap.fetch_raw_message()` (`BODY.PEEK[]`,
-deci rămâne NECITIT în căsuța proprietarei), atașat ca `message/rfc822`.
+⚠️ **Rezervarea e ATOMICĂ**: `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`
+crește `attempts` în aceeași instrucțiune care alege rândurile. Tick-ul de 5 minute și butonul
+„Rulează acum" pot cădea simultan pe același rând; un SELECT urmat de UPDATE le-ar lăsa pe amândouă
+să trimită. Verificarea contului SMTP stă ÎNAINTE de rezervare — altfel un SMTP neconfigurat ar arde
+toate cele 5 încercări în 25 de minute și ar marca `failed` mailuri neîncercate.
+
+⚠️ **`sendmail`/`send_message` fără excepție = mail livrat.** `_smtp_send` închide conexiunea separat
+și doar loghează un `QUIT` eșuat. Nu-l muta înapoi într-un `with smtplib.SMTP(...)`: ieșirea din
+context apelează `quit()`, iar o excepție acolo ar raporta „netrimis" pentru un mail deja plecat —
+exact bucla de duplicate din `productivity_notifier` (2026-09-12).
+
+**Mesajul se trimite INTACT când se poate.** Cu ingest O365 nativ se ia MIME-ul brut din Graph
+(`o365_ingest.raw_message_fetcher()` → `/messages/{id}/$value`, token luat o singură dată per lot)
+și se atașează ca `message/rfc822`. Fără el (instalările pe parser-email-op) mesajul se
+RECONSTRUIEȘTE din DB — corp + atașamente de pe disc: nu identic, dar păstrează ce folosește VATHUB
+(expeditor real, dată, subiect, atașamente). Cap de mărime: 25 MB.
 
 ⚠️ `add_attachment()` primește obiectul `Message` deja parsat, NU bytes. Cu bytes, biblioteca
 standard pune `Content-Transfer-Encoding: base64` pe partea `message/rfc822` — interzis de
 RFC 2046 §5.2.1 — iar cititorul (VATHUB) primește un bloc de base64 în loc de un mesaj, deci nu
-poate scoate expeditorul, data sau atașamentele originale. Nu schimba înapoi. Subiectul NU se prefixează
-cu „Fwd:" — VATHUB potrivește dosarele după numărul de referință din subiect (`RO2026…`). `From`
-rămâne adresa proprietarei (rescrierea cu adresa autorității ar pica la SPF); expeditorul real merge
-în `Reply-To` + `X-Vathub-Original-From`. Cap de mărime: `personal_imap.MAX_RAW_BYTES` (25 MB).
+poate scoate expeditorul, data sau atașamentele originale. Nu schimba înapoi. Subiectul NU se
+prefixează cu „Fwd:" — VATHUB potrivește dosarele după numărul de referință din subiect
+(`RO2026…`). `From` e adresa no-reply; expeditorul real merge în `Reply-To` +
+`X-Vathub-Original-From`.
 
-**Două siguranțe contra inundării:** `max_age_hours` (implicit 24) la prima activare, și un mail
-examinat nu se reevaluează — `vathub_matched_at` marchează „examinat" indiferent de rezultat, deci o
-regulă adăugată azi se aplică de la mailurile următoare, nu retroactiv. Eșecurile se reia până la
-`MAX_ATTEMPTS=5`; un mail blocat de gardă e marcat definitiv.
+**Potrivire pe domeniu, cu subdomenii** (`domain == rule or domain.endswith("." + rule)`):
+`nav.gov.hu` prinde `elekafa@elekafa.nav.gov.hu`, `nra.bg` prinde `b.stoilova@ro22.nra.bg` — la SK,
+CZ, GR, AT, PL scriu inspectori nominali, cu adrese care se schimbă per dosar. Adresa exactă bate
+domeniul. Boundary strict: `evilnav.gov.hu` NU potrivește `nav.gov.hu`. Lista validată de Raul
+(2026-09-11): **29 de adrese + 23 de domenii**, toate ACTIVE, seedate de migrație. `gov.si` și
+`anaf.ro` sunt largi (tot guvernul sloven / tot ANAF-ul) — asumat la cererea explicită, se pot
+restrânge din UI.
 
-**SMTP pe contul personal**, nu cont de serviciu (`smtp_host/port/tls/user/smtp_cred_enc` pe
-`personal_mailbox_accounts`). `smtp_cred_enc` NULL + `smtp_host` completat = se folosește parola
-IMAP — cazul obișnuit la Gmail/O365/cPanel.
-
-⚠️ Contorul de încercări crește ÎNAINTE de trimitere (`vathub_attempts`), nu după. Altfel un proces
-oprit între SMTP și `COMMIT` ar relua mailul la infinit. Consecința asumată: la o cădere exact în
-acel interval poate ajunge un duplicat în VATHUB, dar mărginit la `MAX_ATTEMPTS` — preferabil unei
-decizii 318 pierdute. Nu inversa ordinea.
-
-⚠️ `received_at` e nullable (mail cu `Date` nevalid) — filtrul de vechime folosește
-`coalesce(received_at, created_at)`. Un filtru direct pe `received_at` face ca mailurile cu dată
-neparsabilă să nu fie examinate niciodată.
+⚠️ **Un eșec NU se reia la infinit**: `MAX_ATTEMPTS=5`, apoi rândul rămâne `failed` și vizibil în
+jurnal, cu buton „Reîncearcă". Un mail blocat de gardă e marcat definitiv (aceeași destinație
+greșită n-are rost reîncercată).
 
 ### 🎚️ Comutator de filtrare spam/carantină, per căsuță (2026-08-20)
 
 `personal_mailbox_accounts.filter_enabled` (implicit TRUE). OFF = mailurile se ingerează în
-continuare (metadata) și redirectul VATHUB merge, dar NU se scanează și NU se mută nimic în
-SPAM/CARANTINA. Gate-ul e în `_poll_one` din `personal_mailbox_poller.py`; rândurile rămase
+continuare (metadata), dar NU se scanează și NU se mută nimic în SPAM/CARANTINA. (Redirectul
+VATHUB nu mai depinde de acest comutator — a fost mutat pe căsuța principală, vezi mai sus.)
+Gate-ul e în `_poll_one` din `personal_mailbox_poller.py`; rândurile rămase
 `pending` se marchează `verdict='filter_off'` (valoare nouă, `varchar(20)`), ca să nu fie scanate
 retroactiv la repornirea filtrului.
 
 **Filtrarea și redirectul VATHUB sunt comutatoare INDEPENDENTE** — `POST
-/personal-mailboxes/{id}/toggles` le schimbă separat. Activarea VATHUB cere `smtp_host` configurat.
+/personal-mailboxes/{id}/toggles` le schimbă separat. Bifa `vathub_enabled` rămâne în schemă dar e
+inertă cât timp `settings.vathub.redirect.source` e `"inbox"`.
+
 `test-detection` rulează detecția manual, indiferent de comutator (e endpoint de test).
 
 ---
