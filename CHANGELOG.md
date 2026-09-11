@@ -8,6 +8,86 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.20.0 - 2026-09-11
+
+### MINOR — Whitelist-ul eliberează acum retroactiv mailurile deja blocate
+
+**De ce nu s-au reprocesat toate.** O intrare nouă în whitelist (Setări → Liste expeditori)
+schimba DOAR clasificarea viitoare. Pipeline-ul rulează o singură dată per email, la ingestie,
+deci mailurile deja oprite rămâneau oprite — nimic nu le reevalua. Singura eliberare retroactivă
+exista pe butonul „Legit" din pagina Spam, și acoperea numai SPAM-ul, numai pentru expeditorul
+mailului pe care s-a dat click: carantina era exclusă explicit
+(`status NOT IN ('quarantined','quarantined_strict','ndr','deleted')`). De aici simptomul —
+mailurile oprite ca spam au plecat, cele carantinate au rămas.
+
+**`app/services/sender_release.py`** (nou): pentru un expeditor (adresă sau domeniu, cu
+subdomenii) scoate override-ul de spam, eliberează din carantină (`status='clean'` +
+`quarantine_strict` marcat eliberat) și repune mailurile pe calea clean (`queued_general` +
+`manual_clean`), de unde tick-ul de 5 minute le duce prin categorie → departament → CTS.
+
+- `POST /settings/sender-lists` cu `list=whitelist` rulează eliberarea automat și întoarce
+  numărul de mailuri atinse în `released`.
+- `POST /settings/sender-lists/reprocess` (`value`, opțional `dry_run`, `release_quarantine`)
+  face același lucru pentru intrările puse ÎNAINTE de acest release.
+
+⛔ **Blocajele hard nu se eliberează în masă**: malware, executabil / macro / dublă extensie
+(`emails.NEVER_SUPPRESS`) și impersonarea unui domeniu intern. Un cont legitim poate fi
+compromis — whitelist-ul e o decizie despre expeditor, nu despre un atașament infectat. Rămân în
+carantină și se eliberează individual, din pagina de carantină; sunt raportate separat ca
+`hard_blocked`. Mailurile deja trimise la CTS nu se ating — repunerea lor pe coadă ar produce un
+tichet duplicat.
+
+**office@moovleasing.ro**: regulă nouă de departament → Contabilitate, plus eliberarea
+retroactivă de mai sus aplicată o dată pentru acest expeditor
+(`migrations/20260911g_moovleasing_release_contabilitate.sql`).
+
+## v3.19.0 - 2026-09-11
+
+### MINOR — Procesatorii de plăți online (euPlatesc, europayment.services) → Contabilitate
+
+Două reguli deterministe noi de departament, pe expeditor:
+`euplatesc` → Contabilitate, `@europayment.services` → Contabilitate.
+
+Ambele sunt pe **domeniu**, nu pe adresă exactă: euPlatesc trimite de pe mai multe cutii
+(`noreply@`, `suport@`) și de pe mai multe domenii, iar cele 4 adrese cerute de pe
+europayment.services (`notificari@`, `contact@`, `noreply@`, `suport@`) sunt acoperite de o
+singură intrare, împreună cu orice cutie viitoare a aceluiași expeditor.
+
+Ca la orice regulă de departament, seed-ul din `DEFAULT_RULES` nu ajunge pe o instalare care are
+deja `settings.department_rules` — regulile vin prin
+`migrations/20260911f_contabilitate_platesc_europayment.sql` (idempotent pe id), adăugate la coada
+listei: niciun alt rând existent nu potrivește acești expeditori, deci ordinea nu contează aici.
+Retroactiv, aceleași garanții ca la rutările precedente: doar mailurile netrimise încă la CTS și
+fără corecție manuală de departament.
+
+## v3.18.0 - 2026-09-11
+
+### MINOR — Rutare obligatorie pe Suport 1: `noreply@cargotrack.ro` și plățile PPCF
+
+**PPCF mergea la Contabilitate, nu la Suport 1.** Seria se extrăgea corect din OP — problema era
+maparea: `PPCF` exista în allowlist-ul de serii acreditate (`op_extractor._KNOWN_SERIE_PREFIXES`),
+dar NU și în `_SUPORT1_PREFIXES`, iar `_department_from_series()` trimite la Contabilitate orice
+serie acreditată care nu e în setul Suport 1. Regula „PPCF → Suport 1" nu exista nicăieri. Acum
+`_SUPORT1_PREFIXES = {PPCB, PPHU, PPBG, ASCF, PPCF}`.
+
+**`noreply@cargotrack.ro` → Suport 1**, regulă deterministă pe expeditor. Regulile de departament
+se seedează din `department_rules.DEFAULT_RULES` **o singură dată**, la prima citire, dacă
+`settings.department_rules` lipsește — pe o instalare care are deja store-ul, o regulă adăugată în
+cod nu ajunge niciodată în DB. De aceea regula vine și prin migrație
+(`20260911e_suport1_noreply_ppcf.sql`), pusă **prima** în listă: `match()` sortează după numărul de
+criterii, iar la egalitate păstrează ordinea din store — altfel un mail de pe noreply@ cu subiectul
+„Tranzactii zilnice" pleca la Contabilitate.
+
+**Extragerea de serie nu mai calcă deciziile mai tari.** `op_extractor` rulează asincron (worker),
+deci scria `ai_department` DUPĂ pipeline — peste corecția manuală a operatorului
+(`ai_department_manual`) și peste o regulă deterministă de departament. Seria se salvează în
+continuare întotdeauna (e un fapt extras din document), dar departamentul se scrie doar când nu e
+fixat de una din cele două (`_DEPT_PINNED_SQL`). Rezultatele AI și fallback-urile rămân
+suprascrise de serie, ca până acum.
+
+Retroactiv (în migrație): mailurile de pe noreply@ și cele cu `ai_op_series='PPCF'` trec pe
+Suport 1, **doar** cele netrimise încă la CTS și fără corecție manuală.
+
 ## v3.17.0 - 2026-09-11
 
 ### MINOR — Expeditorii de pe blocklist nu mai pot ajunge în CTS (cazul Akcenta)

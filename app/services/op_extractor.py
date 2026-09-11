@@ -2,7 +2,7 @@
 
 Detectează emailurile cu ordin de plată (OP), extrage seria facturii din atașament
 (text local sau vision AI) și rutează emailul la departamentul corect:
-  PPCB / PPBG / PPHU / ASCF → suport_1
+  PPCB / PPBG / PPHU / ASCF / PPCF → suport_1
   orice altă serie sau nicio serie → suport_1 (fallback safe)
   serie ACTS/ECTS/alt prefix non-PPCB → contabilitate
 
@@ -31,8 +31,10 @@ _KNOWN_SERIE_PREFIXES = {
     "ECHU", "FFCF", "FRACB", "AAT", "BP", "BPA", "BCTS", "ECOL", "ATRK",
     "PPCB",
 }
-# Din cele acreditate, DOAR aceste 4 merg pe Suport 1; restul din allowlist → Contabilitate.
-_SUPORT1_PREFIXES = {"PPCB", "PPHU", "PPBG", "ASCF"}
+# Din cele acreditate, DOAR acestea merg pe Suport 1; restul din allowlist → Contabilitate.
+# PPCF adaugat 2026-09-11 (cerere business: platile PPCF -> Suport 1). Era in allowlist-ul de
+# serii acreditate, dar nu si aici, deci `_department_from_series` il trimitea pe Contabilitate.
+_SUPORT1_PREFIXES = {"PPCB", "PPHU", "PPBG", "ASCF", "PPCF"}
 # Serii acreditate care aparțin departamentului Recuperare TVA (nu Contabilitate).
 # Decizie user 2026-07-24 (email #53528, serie FS „Factură servicii Recuperare TVA").
 _RECUPERARE_TVA_PREFIXES = {"FS"}
@@ -347,7 +349,7 @@ def _department_from_series(series: Optional[str]) -> str:
 
     - fără serie → suport_1
     - serie în _RECUPERARE_TVA_PREFIXES (FS) → recuperare_tva
-    - serie în _SUPORT1_PREFIXES (PPCB/PPHU/PPBG/ASCF) → suport_1
+    - serie în _SUPORT1_PREFIXES (PPCB/PPHU/PPBG/ASCF/PPCF) → suport_1
     - serie acreditată (în _KNOWN_SERIE_PREFIXES) → contabilitate
     - serie detectată dar NE-acreditată (plăcuță camion, gunoi) → suport_1 (NU contabilitate)
     """
@@ -448,6 +450,17 @@ def extract_op_series(email_id: int) -> dict:
     return {"series": None, "department": "suport_1"}
 
 
+# ── Cine bate extragerea de serie ────────────────────────────────────────────
+# Extragerea ruleaza ASINCRON (worker), deci scrie ai_department DUPA pipeline. Fara garda de
+# mai jos ar calca doua decizii mai puternice decat o serie ghicita dintr-un document:
+#   - corectia manuala a operatorului (`ai_department_manual`);
+#   - o regula determinista de departament (`department_rules`, model='rule') — reguli scrise
+#     explicit de business, ex. „noreply@cargotrack.ro -> Suport 1 obligatoriu".
+# Restul (AI, fallback) raman suprascrise de serie, ca pana acum.
+_DEPT_PINNED_SQL = ("(ai_department_manual IS TRUE OR "
+                    "ai_department_result->>'model' = 'rule')")
+
+
 # ── Worker periodic ──────────────────────────────────────────────────────────
 
 def advance_op_extract_batch(limit: int = 20) -> dict:
@@ -501,9 +514,10 @@ def _process_one_op(email_id: int, results: dict):
         attempts = (row[0] or 0)
 
         if attempts >= MAX_EXTRACT_ATTEMPTS:
-            # Fallback: prea multe încercări → suport_1
+            # Fallback: prea multe încercări → suport_1 (fără să calce o decizie mai tare)
             cur.execute(
-                "UPDATE emails SET ai_department='suport_1', ai_op_extract_at=NOW() WHERE id=%s",
+                "UPDATE emails SET ai_department=CASE WHEN " + _DEPT_PINNED_SQL +
+                " THEN ai_department ELSE 'suport_1' END, ai_op_extract_at=NOW() WHERE id=%s",
                 (email_id,)
             )
             _set_queue(cur, email_id, 'ready_for_cts')
@@ -530,8 +544,12 @@ def _process_one_op(email_id: int, results: dict):
         # Considerăm "rezolvat" dacă avem serie SAU dacă MDL a forțat departamentul
         resolved = bool(series) or (currency == "MDL")
         if resolved:
+            # Seria se salveaza MEREU (e un fapt extras din document). Departamentul se scrie
+            # doar daca nu e deja fixat de o decizie mai tare — vezi `_DEPT_PINNED_SQL`.
             cur.execute(
-                "UPDATE emails SET ai_department=%s, ai_op_series=%s, ai_op_extract_at=NOW() WHERE id=%s",
+                "UPDATE emails SET ai_department=CASE WHEN " + _DEPT_PINNED_SQL +
+                " THEN ai_department ELSE %s END, "
+                "ai_op_series=%s, ai_op_extract_at=NOW() WHERE id=%s",
                 (department, series, email_id)
             )
             _set_queue(cur, email_id, 'ready_for_cts')

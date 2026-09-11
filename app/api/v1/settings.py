@@ -17,6 +17,7 @@ Dump-urile DB din backups/pre-deploy/ NU sunt afectate: GitHub versioneaza cod, 
 import os
 import re
 import json
+import logging
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,10 @@ from app.services.phishing_detector import RULES_CATALOG, GLOBAL_POLICY
 from app.api.v1.auth import get_current_admin
 from app.database import get_db
 from app.services import sender_lists
+from app.services import sender_release
 from app.services import learning_guidance
+
+logger = logging.getLogger("mailguard.settings")
 
 router = APIRouter()
 
@@ -702,7 +706,44 @@ def add_sender_list(body: dict, db: Session = Depends(get_db), admin=Depends(get
                             % res["conflict"])
     if res.get("error"):
         raise HTTPException(400, res["error"])
+
+    # Whitelist ⇒ eliberare RETROACTIVĂ a mailurilor deja oprite ale expeditorului. Fără asta,
+    # intrarea schimbă doar clasificarea VIITOARE, iar mailurile blocate rămân blocate — nimic
+    # nu le reevaluează, pipeline-ul rulează o singură dată per email. Mailurile cu malware /
+    # impersonare de domeniu intern NU se eliberează în masă (vezi sender_release).
+    if lst == "whitelist":
+        try:
+            rel = sender_release.release_sender(
+                db, body.get("value") or "", reviewer,
+                include_quarantine=bool(body.get("release_quarantine", True)))
+            res["released"] = rel
+        except Exception:
+            logger.exception("whitelist retro release failed pentru %r", body.get("value"))
+            res["released"] = {"error": "Eliberarea retroactivă a eșuat — vezi logurile."}
     return res
+
+
+@router.post("/settings/sender-lists/reprocess")
+def reprocess_sender_list(body: dict, db: Session = Depends(get_db),
+                          admin=Depends(get_current_admin)):
+    """Eliberează retroactiv mailurile oprite ale unui expeditor DEJA aflat pe whitelist.
+
+    Adăugarea în whitelist face asta automat de acum; endpoint-ul acoperă intrările puse
+    ÎNAINTE (cazul raportat: „am pus adresa în whitelist, dar nu s-au reprocesat toate").
+    `dry_run=true` doar numără, fără să schimbe nimic.
+    """
+    reviewer = admin.get("username") or admin.get("email") or "admin"
+    value = (body.get("value") or "").strip()
+    if not value:
+        raise HTTPException(400, "Lipsește `value` (adresă sau domeniu)")
+    if body.get("dry_run"):
+        found = sender_release.find_blocked(db, value)
+        return {"ok": True, "dry_run": True,
+                "spam": len(found["spam"]), "quarantine": len(found["quarantine"]),
+                "hard_blocked": len(found["hard_blocked"])}
+    return sender_release.release_sender(
+        db, value, reviewer,
+        include_quarantine=bool(body.get("release_quarantine", True)))
 
 
 @router.put("/settings/sender-lists")

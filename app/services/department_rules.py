@@ -56,6 +56,12 @@ def _fold(s: str) -> str:
 # Reguli implicite — seedate o singura data (la prima citire daca store-ul lipseste). Ordinea
 # logica grupeaza pe departament; specificitatea (from+subject) e impusa la match, nu de ordine.
 DEFAULT_RULES = [
+    # Notificarile automate ale aplicatiilor noastre pleaca de pe noreply@cargotrack.ro si merg
+    # MEREU la Suport 1 (cerere business 2026-09-11), indiferent de subiect sau continut. Regula
+    # e prima in store ca sa castige si egalitatile de specificitate cu alte reguli pe un singur
+    # criteriu (ex. subiect "Tranzactii zilnice" -> Contabilitate).
+    {"id": "noreply-cargotrack-01", "department": "suport_1", "from": "noreply@cargotrack.ro",
+     "subject": "", "note": "noreply@cargotrack.ro -> Suport 1"},
     # --- Taxe de drum ---
     {"department": "taxe_drum", "from": "support@locatorbg.com", "subject": "Request for refund -",
      "note": "locatorbg + refund -> taxe"},
@@ -78,6 +84,17 @@ DEFAULT_RULES = [
      "note": "locatorbg + DigiToll receipt -> contabilitate"},
     {"department": "contabilitate", "from": "urbansiasociatii.ro", "subject": "", "note": "URBAN & ASOCIATII"},
     {"department": "contabilitate", "from": "mis.batch@btrl.ro", "subject": "", "note": "extrase BTRL"},
+    # Procesatori de plati online -> Contabilitate (cerere business 2026-09-11).
+    # euPlatesc: potrivire pe NUMELE DE DOMENIU, nu pe adresa exacta — notificarile lor pleaca de
+    # pe mai multe cutii (noreply@, suport@) si de pe euplatesc.ro / euplatesc.com.
+    {"id": "euplatesc-01", "department": "contabilitate", "from": "euplatesc",
+     "subject": "", "note": "euPlatesc (orice adresa) -> Contabilitate"},
+    # europayment.services: regula pe domeniu acopera cele 4 cutii cerute (notificari@, contact@,
+    # noreply@, suport@) si orice alta cutie a aceluiasi expeditor.
+    {"id": "europayment-services-01", "department": "contabilitate", "from": "@europayment.services",
+     "subject": "", "note": "europayment.services (orice adresa) -> Contabilitate"},
+    {"id": "moovleasing-01", "department": "contabilitate", "from": "office@moovleasing.ro",
+     "subject": "", "note": "office@moovleasing.ro -> Contabilitate"},
     {"department": "contabilitate", "from": "", "subject": "Tranzactii zilnice", "note": "tranzactii zilnice CARGOTRACK"},
     # Notificarile ONRC (registrul comertului) merg mereu la Contabilitate, indiferent de subiect.
     {"id": "onrc-notificari-01", "department": "contabilitate", "from": "onrc_notificari@onrc.ro",
