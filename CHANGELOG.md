@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.20.1 - 2026-09-11
+
+### PATCH — „Reprocesează email": garda de spam nu se aplica niciodată
+
+Verificare după repararea erorii `UndefinedColumn` (migrația `20260910_ai_intent_ensure.sql`).
+Endpoint-ul funcționează — toate cele 26 de coloane resetate de `POST /emails/{id}/reprocess`,
+plus cele de pe `attachments` și `document_extractions`, sunt acoperite de fișiere din
+`migrations/`. Un defect logic a rămas însă:
+
+Garda `if em["status"] in {'spam','quarantined','quarantined_strict'}` nu bloca niciodată
+spam-ul: **„spam" nu e un status real pe `emails`** — e derivat din `email_spam`
+(`override=TRUE` sau `spam_score >= 50`), exact ca badge-ul din liste; nicio linie de cod nu
+scrie vreodată `status='spam'`. Consecință: butonul apărea și pe mailurile de spam (UI-ul avea
+aceeași verificare moartă), reprocesarea pornea, pipeline-ul le reoprea imediat pe
+`stopped_spam`, iar operatorul vedea mesajul „repus în pipeline, va fi trimis spre CTS" fără
+niciun efect. Acum ambele părți folosesc predicatul derivat, iar mesajul spune ce trebuie făcut
+în locul reprocesării (butonul „Legit" din pagina Spam).
+
+Carantina era verificată corect (acolo `status` chiar ia acele valori) — comportamentul ei nu se
+schimbă.
+
 ## v3.20.0 - 2026-09-11
 
 ### MINOR — Whitelist-ul eliberează acum retroactiv mailurile deja blocate

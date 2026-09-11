@@ -2479,10 +2479,24 @@ function EmailDetail(props) {
     return h('button', { key: 'st', onClick: doTranslate, style: trBtnStyle }, '🌐 Începe traducerea');
   }
 
-  function doReprocess() {
+  // „Spam” nu e status real pe email — e derivat din email_spam (override sau scor peste prag),
+  // la fel ca badge-ul din liste. Verificarea pe status === 'spam' nu se potrivea niciodată, deci
+  // butonul apărea și pe mailurile de spam, iar pipeline-ul le reoprea imediat.
+  function isReprocessBlocked() {
     var sts = email.status || '';
-    if (sts === 'spam' || sts === 'quarantined' || sts === 'quarantined_strict') {
-      mgToast('error', 'Emailurile spam/carantinate nu pot fi reprocesate.'); return;
+    if (sts === 'quarantined' || sts === 'quarantined_strict') return 'carantina';
+    var ov = email.spam_override;
+    if (ov === true) return 'spam';
+    if (ov !== false && email.spam_score != null && Number(email.spam_score) >= 50) return 'spam';
+    return null;
+  }
+
+  function doReprocess() {
+    var blk = isReprocessBlocked();
+    if (blk) {
+      mgToast('error', blk === 'spam'
+        ? 'Email clasificat SPAM — apasă întâi „Legit” în pagina Spam.'
+        : 'Email carantinat — eliberează-l întâi din carantină.'); return;
     }
     setReprBusy(true);
     api('/emails/' + email.id + '/reprocess', { method: 'POST' }).then(function(r) {
@@ -2498,8 +2512,7 @@ function EmailDetail(props) {
   }
   var reprBtnStyle = { padding: '4px 10px', fontSize: 12, fontWeight: 500, color: '#059669', background: '#fff', border: '0.5px solid #6EE7B7', borderRadius: 6, cursor: 'pointer', whiteSpace: 'nowrap' };
   function renderReprocessControl() {
-    var sts = email.status || '';
-    if (sts === 'spam' || sts === 'quarantined' || sts === 'quarantined_strict') return null;
+    if (isReprocessBlocked()) return null;
     if (reprBusy) return h('span', { key: 'rb', style: { fontSize: 12, color: '#059669', whiteSpace: 'nowrap' } }, 'Se reprocesesaza...');
     return h('button', { key: 'rp', onClick: doReprocess, style: reprBtnStyle, title: 'Reset complet + retrimite spre CTS (categorie, departament, documente)' }, '↻ Reproceseaza email');
   }

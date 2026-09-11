@@ -890,14 +890,30 @@ def reprocess_email(email_id: int, background_tasks: BackgroundTasks, db: Sessio
     """Reprocesează un email ca și cum ar fi intrat nou: resetează COMPLET status, documente,
     AI fields → pending, rulează process_one din nou (categorie, departament, documente, CTS).
     Blocate: spam și carantinată — rămân unde sunt. Orice altceva e permis (inclusiv sent_to_cts)."""
-    row = db.execute(text(
-        "SELECT id, status, queue_status FROM emails WHERE id=:id"), {"id": email_id}).fetchone()
+    row = db.execute(text("""
+        SELECT e.id, e.status, e.queue_status,
+               EXISTS (SELECT 1 FROM email_spam s
+                        WHERE s.email_id = e.id
+                          AND (s.override = TRUE
+                               OR (s.override IS DISTINCT FROM FALSE AND s.spam_score >= :thr)))
+                   AS is_spam
+          FROM emails e WHERE e.id = :id
+    """), {"id": email_id, "thr": SPAM_THRESHOLD}).fetchone()
     if not row:
         raise HTTPException(404, "Email not found")
     em = dict(row._mapping)
-    blocked = {'spam', 'quarantined', 'quarantined_strict'}
-    if em.get("status") in blocked:
-        raise HTTPException(400, f"Email cu status '{em['status']}' nu poate fi reprocesат (spam/carantinată).")
+    if em.get("status") in ('quarantined', 'quarantined_strict'):
+        raise HTTPException(400, "Email carantinat — nu poate fi reprocesat. "
+                                 "Eliberează-l întâi din carantină.")
+    # „Spam" NU e un status real in `emails`: e derivat din `email_spam` (override=TRUE sau scor
+    # peste prag), exact ca in listele /emails si /spam. Garda veche compara `status == 'spam'`,
+    # care nu se potriveste NICIODATA — deci butonul mergea si pe mailurile de spam: pipeline-ul
+    # le reoprea imediat (`stopped_spam`), iar operatorul vedea „repus in pipeline" fara niciun
+    # efect vizibil.
+    if em.get("is_spam"):
+        raise HTTPException(400, "Emailul e clasificat SPAM și nu poate fi reprocesat. "
+                                 "Apasă întâi „Legit” în pagina Spam — scoate expeditorul din "
+                                 "blocklist și repune mailurile lui pe calea normală.")
 
     # Reset complet → pending: toate câmpurile AI, CTS, departament, prioritate, documente
     db.execute(text("""
