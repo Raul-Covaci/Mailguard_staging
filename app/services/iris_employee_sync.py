@@ -163,16 +163,14 @@ def _iter_leaves(emp: Dict[str, Any]):
 
 # ── fetch ────────────────────────────────────────────────────────────────────
 def fetch_employees(db: Session) -> List[Dict[str, Any]]:
-    import httpx
+    from app.services.iris_http import get_with_retry
     base, key = _gateway_config()
     if not base or not key:
         raise RuntimeError("Gateway IRIS neconfigurat (iris_api_url / IRIS_MAILGUARD_API_KEY).")
     path = _get_setting(db, "employee_sync.endpoint_path", "/cts/employees") or "/cts/employees"
     if not str(path).startswith("/"):
         path = "/" + str(path)
-    with httpx.Client(timeout=30, verify=False) as cl:
-        r = cl.get(base + path, headers={"X-Mailguard-Key": key})
-    r.raise_for_status()
+    r = get_with_retry(base + path, headers={"X-Mailguard-Key": key}, label=path)
     data = r.json()
     if isinstance(data, list):
         return data

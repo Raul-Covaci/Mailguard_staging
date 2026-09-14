@@ -509,15 +509,14 @@ def _fetch_from_dsn(limit: int, since=None) -> List[Dict[str, Any]]:
 
 
 def _fetch_from_http(limit: int, since=None) -> List[Dict[str, Any]]:
-    import httpx
+    from app.services.iris_http import get_with_retry
     url = os.environ["CTS_GT_URL"]
     tok = os.environ["CTS_GT_TOKEN"]
     params = {"limit": limit}
     if since is not None:
         params["since"] = since if isinstance(since, str) else since.isoformat()
-    r = httpx.get(url, params=params,
-                  headers={"Authorization": "Bearer " + tok}, timeout=30.0)
-    r.raise_for_status()
+    r = get_with_retry(url, params=params,
+                       headers={"Authorization": "Bearer " + tok}, verify=True, label="CTS_GT_URL")
     data = r.json()
     if isinstance(data, list):
         return data
@@ -527,8 +526,8 @@ def _fetch_from_http(limit: int, since=None) -> List[Dict[str, Any]]:
 def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
     """Canalul preferat: GET pe IRIS Gateway, reutilizand cheia Cargo360 (X-Mailguard-Key),
     exact ca iris_sync.py. Read-only. Filtru rolling via ?since=<ISO8601>."""
-    import httpx
     from app.config import get_settings
+    from app.services.iris_http import get_with_retry
     base = (get_settings().iris_api_url or "").rstrip("/")
     key = os.getenv("IRIS_MAILGUARD_API_KEY", "")
     if not base or not key:
@@ -536,9 +535,8 @@ def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
     params = {"limit": limit}
     if since is not None:
         params["since"] = since if isinstance(since, str) else since.isoformat()
-    with httpx.Client(timeout=30, verify=False) as cl:
-        r = cl.get(base + GATEWAY_PATH, params=params, headers={"X-Mailguard-Key": key})
-    r.raise_for_status()
+    r = get_with_retry(base + GATEWAY_PATH, params=params,
+                       headers={"X-Mailguard-Key": key}, label=GATEWAY_PATH)
     data = r.json()
     if isinstance(data, list):
         return data
@@ -551,8 +549,8 @@ def fetch_email_content(log_ids) -> Dict[str, Any]:
     Endpoint: GET /cts/email-content?log_ids=1,2,3 (≤200/apel), header X-Mailguard-Key.
     Read-only. Returneaza dict { "<log_id>": {"reply_text": str|None, "attachments": [...] } }.
     Continutul binar al atasamentelor NU e servit de gateway (unavailable_via_gateway)."""
-    import httpx
     from app.config import get_settings
+    from app.services.iris_http import get_with_retry
     ids = [str(x).strip() for x in (log_ids or []) if str(x).strip()]
     if not ids:
         return {}
@@ -560,11 +558,10 @@ def fetch_email_content(log_ids) -> Dict[str, Any]:
     key = os.getenv("IRIS_MAILGUARD_API_KEY", "")
     if not base or not key:
         raise RuntimeError("Gateway IRIS neconfigurat (iris_api_url / IRIS_MAILGUARD_API_KEY).")
-    with httpx.Client(timeout=60, verify=False) as cl:
-        r = cl.get(base + "/cts/email-content",
-                   params={"log_ids": ",".join(ids[:200])},
-                   headers={"X-Mailguard-Key": key})
-    r.raise_for_status()
+    r = get_with_retry(base + "/cts/email-content",
+                       params={"log_ids": ",".join(ids[:200])},
+                       headers={"X-Mailguard-Key": key},
+                       timeout=60, label="/cts/email-content")
     data = r.json()
     if isinstance(data, dict):
         return data.get("items") or {}

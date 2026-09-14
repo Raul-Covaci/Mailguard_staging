@@ -161,8 +161,8 @@ def _g(rec: Dict[str, Any], *keys):
 def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
     """GET pe IRIS Gateway, reutilizand cheia Cargo360 (X-Mailguard-Key), exact ca la
     cts_groundtruth_sync. Read-only. Filtru rolling via ?since=<ISO8601>, ordine updated_at ASC."""
-    import httpx
     from app.config import get_settings
+    from app.services.iris_http import get_with_retry
     base = (get_settings().iris_api_url or "").rstrip("/")
     key = os.getenv("IRIS_MAILGUARD_API_KEY", "")
     if not base or not key:
@@ -170,9 +170,9 @@ def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
     params = {"limit": limit}
     if since is not None:
         params["since"] = since if isinstance(since, str) else since.isoformat()
-    with httpx.Client(timeout=30, verify=False) as cl:
-        r = cl.get(base + GATEWAY_PATH, params=params, headers={"X-Mailguard-Key": key})
-    r.raise_for_status()
+    # Reincercare pe 5xx/transport: gateway-ul IRIS are pene de cateva secunde (vezi iris_http).
+    r = get_with_retry(base + GATEWAY_PATH, params=params,
+                       headers={"X-Mailguard-Key": key}, label=GATEWAY_PATH)
     data = r.json()
     if isinstance(data, list):
         return data

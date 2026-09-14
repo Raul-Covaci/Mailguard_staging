@@ -98,11 +98,9 @@ def _chunk_date_range(date_from: str, date_to: str, max_days: int = GATEWAY_MAX_
 
 def _fetch_timesheets_window(db: Session, base: str, key: str, path: str,
                               start: str, end: str) -> List[Dict[str, Any]]:
-    import httpx
-    with httpx.Client(timeout=30, verify=False) as cl:
-        r = cl.get(base + path, params={"start": start, "end": end},
-                    headers={"X-Mailguard-Key": key})
-    r.raise_for_status()
+    from app.services.iris_http import get_with_retry
+    r = get_with_retry(base + path, params={"start": start, "end": end},
+                       headers={"X-Mailguard-Key": key}, label=path)
     data = r.json()
     if isinstance(data, list):
         return data

@@ -29,6 +29,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mailguard")
 
+# httpx logheaza fiecare cerere la INFO, cu tot cu textul statusului ("HTTP/1.1 500 Internal
+# Server Error"). Pentru noi e zgomot: fiecare modul de sync isi logheaza singur esecul
+# (cts_gt/cts_calls/cts_tasks/device_ops/pontaj — "... fetch failed: ..."), iar `iris_http`
+# logheaza reincercarile. Linia httpx nu adauga informatie, dar watchdog-ul de productie o
+# raporta ca "eroare critica" desi apelul era deja tratat si reluat (alerta 2026-09-12 03:09).
+# La WARNING raman doar erorile reale de client HTTP.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 # Cit de des verificam scadenta. Nu e intervalul de sync — acela vine din settings
 # (client_sync_interval_minutes) si e respectat prin claim-ul din DB.

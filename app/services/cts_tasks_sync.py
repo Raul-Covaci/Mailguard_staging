@@ -177,8 +177,8 @@ class _GatewayNotBuiltYet(Exception):
 
 
 def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
-    import httpx
     from app.config import get_settings
+    from app.services.iris_http import get_with_retry
     base = (get_settings().iris_api_url or "").rstrip("/")
     key = os.getenv("IRIS_MAILGUARD_API_KEY", "")
     if not base or not key:
@@ -186,8 +186,9 @@ def _fetch_from_gateway(limit: int, since=None) -> List[Dict[str, Any]]:
     params = {"limit": limit}
     if since is not None:
         params["since"] = since if isinstance(since, str) else since.isoformat()
-    with httpx.Client(timeout=30, verify=False) as cl:
-        r = cl.get(base + GATEWAY_PATH, params=params, headers={"X-Mailguard-Key": key})
+    r = get_with_retry(base + GATEWAY_PATH, params=params,
+                       headers={"X-Mailguard-Key": key}, label=GATEWAY_PATH,
+                       allow_statuses=(404,))
     if r.status_code == 404:
         # Endpoint neconstruit inca de IRIS -- ASTEPTAT (vezi OUTBOX_tasks_endpoint.md), nu eroare.
         raise _GatewayNotBuiltYet()

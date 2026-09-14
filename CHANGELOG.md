@@ -8,6 +8,31 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.3 - 2026-09-14
+
+### PATCH — reincercare pe 5xx de la gateway-ul IRIS + gata cu falsele „erori critice" din loguri
+
+Watchdog-ul de productie a raportat pe 2026-09-12, 03:09, „5 erori critice in loguri" avand ca
+exemplu linia `httpx` cu `GET https://iris.cargotrack.ro/cts/calls?limit=5000&since=... "HTTP/1.1
+500 Internal Server Error"`. Verificat ulterior manual pe aceleasi cereri (limit 1/100/1000/5000,
+`since` cu si fara microsecunde, 12 rulari consecutive): **200 de fiecare data**. Deci a fost o pana
+de cateva secunde pe gateway-ul IRIS, nu un bug de contract la noi — datele nu s-au pierdut, fereastra
+e rolling pe 72h si upsert-ul e idempotent.
+
+Doua lucruri erau totusi gresite la noi:
+
+- **O singura incercare.** Fiecare modul de sync facea `httpx.get(...)` + `raise_for_status()`, deci
+  un 500 de o secunda arunca tot tick-ul de 5 minute. Acum exista `app/services/iris_http.py` →
+  `get_with_retry()`: 3 incercari, backoff 2s/5s, **doar** pe 5xx si pe erori de transport/timeout.
+  4xx ies din prima (401/403/404 sunt contract sau cheie — reincercarea nu le repara). `allow_statuses`
+  pastreaza tratarea lui 404 ca „endpoint neconstruit inca de IRIS" la task-uri si device-operations.
+  Folosit de `cts_calls_sync`, `cts_groundtruth_sync` (+ `/cts/email-content`), `cts_tasks_sync`,
+  `device_ops_sync`, `pontaj_sync`, `iris_employee_sync`.
+- **Zgomot in loguri.** `httpx` logheaza fiecare cerere la INFO, cu tot cu textul statusului, deci un
+  apel deja tratat si reluat aparea in journal ca „500 Internal Server Error" si era raportat drept
+  eroare critica. `httpx`/`httpcore` trec pe WARNING in `app/main.py`. Nu se pierde nimic: fiecare
+  modul isi logheaza singur esecul (`... fetch failed: ...`), iar `iris_http` logheaza reincercarile.
+
 ## v3.24.2 - 2026-09-12
 
 ### PATCH — „Redirect VATHUB" mutat în Setări, refăcut în stilul aplicației
