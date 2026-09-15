@@ -528,12 +528,16 @@ def detect_phishing(email: Dict[str, Any], attachments: Optional[List[Dict]] = N
     # carantinat manual devine semnal Layer-4 DECISIV. Adaugat dupa filtrul de suppress, deci
     # nu poate fi suprimat de feedback. (Blacklist-ul hard se aplica DOAR expeditorilor
     # necunoscuti — vezi quarantine_email; clientii cunoscuti sunt scoped pe amprenta.)
+    # Potrivire cu domenii-parinte (`sender_scopes`), ca in sender_block: o intrare pe
+    # `akcenta.eu` trebuie sa prinda si `info@email.akcenta.eu`.
     if blacklist:
-        saddr = (email.get('from_address') or '').lower().strip()
-        sdom = _sender_domain(email)
-        if (saddr and saddr in blacklist) or (sdom and sdom in blacklist):
+        from app.services.spam_detector import sender_scopes
+        saddr, sdoms = sender_scopes(email.get('from_address'))
+        bl_hit = saddr if (saddr and saddr in blacklist) else next(
+            (d for d in sdoms if d in blacklist), None)
+        if bl_hit:
             findings.append({'layer': 4, 'code': 'manual_blacklist', 'weight': 50,
-                             'match_text': saddr or sdom,
+                             'match_text': bl_hit,
                              'details': 'Expeditor pe blacklist (carantinat manual anterior de operator)'})
 
     # Whitelist (de încredere, marcat de operator) — suprimare SOFT a semnalelor slabe.

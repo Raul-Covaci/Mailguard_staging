@@ -21,7 +21,7 @@ from app.database import get_db
 from app.api.v1.auth import get_current_admin
 from app.services.spam_detector import (detect_spam, DEFAULT_SPAM_THRESHOLD,
                                          classify_spam_gate, get_sender_reputation)
-from app.services import sender_lists
+from app.services import sender_block, sender_lists
 
 logger = logging.getLogger("mailguard.spam")
 
@@ -146,7 +146,7 @@ def backfill(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
 
     Aplică ACEEAȘI poartă de liste expeditori ca pipeline-ul live (`classify_spam_gate`):
       - allowlist / whitelist manuală (expeditor real SAU adresă-email citată în thread) ⇒ override=FALSE (NU spam);
-      - blocklist / blacklist tip=spam ⇒ override=TRUE (spam forțat);
+      - blocklist / blacklist de orice tip (sender_block) ⇒ override=TRUE (spam forțat) — BATE whitelist-ul;
       - altfel ⇒ doar scorul, fără a atinge override (păstrează deciziile manuale „legit"/„mark_spam").
     Folosește acest endpoint ca BACKFILL retroactiv după activarea analizei full-thread / whitelist.
     Scorul reflectă ANALYZE_FULL_THREAD (tot thread-ul când e ON). Pur SQL, fără apeluri AI.
@@ -168,6 +168,9 @@ def backfill(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
     except Exception:
         logger.exception("backfill: manual lists load failed")
 
+    # Blacklist de orice tip + blocklist reputație — BAT whitelist-ul (sender_block, 2026-09-15).
+    block_keys = sender_block.load_keys_sa(db)
+
     rows = db.execute(text(
         "SELECT id, from_address, subject, body_text, body_html FROM emails")).fetchall()
     n = bypassed = forced = 0
@@ -176,7 +179,8 @@ def backfill(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
         rep = get_sender_reputation(em.get("from_address"), db)
         score, reasons, override = classify_spam_gate(
             em, reputation=rep, manual_whitelist=manual_whitelist,
-            manual_spamlist=manual_spamlist)
+            manual_spamlist=manual_spamlist,
+            blocked=block_keys.match(em.get("from_address")) is not None)
         if override is False:
             db.execute(text(
                 "INSERT INTO email_spam (email_id, spam_score, spam_reasons, override) "
@@ -227,6 +231,15 @@ def spam_action(email_id: int, body: SpamAction,
     from_addr = _get_from_address(email_id, db)
 
     if act == "legit":
+        # ⛔ Blacklist-ul BATE „Legit" (sender_block, 2026-09-15). Excepție: blocklist-ul de reputație
+        # pe ADRESA EXACTĂ — e rândul scris de „Marchează ca SPAM", iar „Legit" e inversul lui și îl
+        # suprascrie mai jos. Blacklist-ul manual și blocklist-ul pe domeniu se scot din Setări.
+        blocked_by = sender_block.blocked_by_sa(db, from_addr, include_reputation_exact=False)
+        if blocked_by:
+            raise HTTPException(409, "Expeditorul e blocat prin blacklist (%s). Scoate intrarea din "
+                                     "Setări → Liste expeditori (sau marcheaz-o ignorată), apoi "
+                                     "reîncearcă." % blocked_by)
+
         # 1. Upsert allowlist — last-write-wins
         db.execute(text("""
             INSERT INTO spam_sender_reputation

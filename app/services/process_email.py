@@ -839,18 +839,25 @@ def process_one(email_id: int) -> Dict[str, Any]:
         except Exception:
             logger.exception("manual lists load failed email_id=%s", email_id)
 
-        # Verdict pe EXPEDITOR (fara scoring de continut): allowlist/whitelist => exceptat,
-        # blocklist/blacklist-spam => blocat. Aceeasi precedenta ca poarta de spam de mai jos,
-        # din aceeasi sursa unica (`spam_detector`), ca sa nu poata diverge.
+        # Blocaj pe EXPEDITOR (`sender_block`): blacklist de ORICE tip (adresa, domeniu sau
+        # domeniu-parinte) sau blocklist de reputatie pe orice nivel. BATE orice exceptare —
+        # whitelist, allowlist, eliberarea AI din carantina, amprenta de decarantinare, „Automat".
+        # Decizie 2026-09-15: un expeditor din blacklist nu ajunge NICIODATA in CTS. `_rep` (cea mai
+        # specifica reputatie) ramane doar pentru exceptarea din poarta de spam a celor neblocati.
         from app.services import spam_detector as _spam_det
+        from app.services import sender_block as _sender_block
         try:
             _rep = _spam_det.get_sender_reputation_pg(em.get('from_address'), cur)
         except Exception:
             logger.exception("sender reputation lookup failed email_id=%s", email_id)
             _rep = None
-        _sender_blocked = _spam_det.sender_gate_verdict(
-            em, reputation=_rep, manual_whitelist=manual_whitelist,
-            manual_spamlist=manual_spamlist) is True
+        _block_hit = _sender_block.match(em.get('from_address'), manual_spamlist | manual_blacklist)
+        if _block_hit is None:
+            try:
+                _block_hit = _sender_block.reputation_block_pg(cur, em.get('from_address'))
+            except Exception:
+                logger.exception("sender blocklist lookup failed email_id=%s", email_id)
+        _sender_blocked = _block_hit is not None
 
         # ── Gate „Automat" (pattern confirmat din pagina Rapoarte) — ÎNAINTE de orice clasificare.
         # Dacă emailul se potrivește unui pattern „automat" (acelaşi criteriu ca regenerarea:
@@ -864,7 +871,7 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # auto_closed → livrat la CTS) pentru un email NDR. Lasă-l să cadă pe poarta NDR
         # de mai jos (terminal, stopped_ndr). Altfel un report_pattern învățat din greșeală
         # pe mailer-daemon ar scurtcircuita bounce-ul spre backoffice.
-        # La fel si expeditorii BLOCATI (blocklist / blacklist tip=spam): calea „Automat" iese
+        # La fel si expeditorii BLOCATI (orice blacklist / blocklist, `sender_block`): calea „Automat" iese
         # devreme, INAINTE de poarta de spam, si e livrata la CTS (`cts._ELIGIBLE_AUTO`) — deci
         # fara aceasta conditie un expeditor pus pe blocklist continua sa ajunga in CTS ori de
         # cate ori mailul lui se potriveste unui pattern „automat" invatat. Mailul cade mai jos,
@@ -1020,7 +1027,9 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # vine de la un client cunoscut, iar amprenta continutului nou se potriveste cu un mail
         # decarantinat anterior de operator (acelasi expeditor/domeniu) -> auto-clean. Anti
         # false-positive recurent, fara portita de phishing (cere si client cunoscut SI amprenta).
-        if ph_status in ('quarantined', 'quarantined_strict') and client_id is not None and not _hard_block:
+        # Expeditor blocat => nicio eliberare automata (blacklist-ul bate amprenta invatata).
+        if (ph_status in ('quarantined', 'quarantined_strict') and client_id is not None
+                and not _hard_block and not _sender_blocked):
             try:
                 from app.services import template_fingerprint as TFP
                 _wt, _wh, _wq = phishing_detector._new_content(em)
@@ -1085,7 +1094,7 @@ def process_one(email_id: int) -> Dict[str, Any]:
         #   allowlist / whitelist manuala -> score 0 + override=FALSE (NU spam, indiferent de prag)
         #   blocklist -> override=TRUE (apare in lista spam la orice prag, simetric cu allowlist)
         #   niciuna   -> scoring normal pe continut; NU atingem override (pastram decizii manuale)
-        # Whitelist BATE blocklist/spamlist (cf. cerinta: whitelist ⇒ niciodata spam).
+        # Blacklist BATE whitelist (2026-09-15): un expeditor blocat e spam orice ar fi (sender_block).
         try:
             from app.services import spam_detector
             # _rep e rezolvat o singura data, inainte de gate-ul „Automat" (vezi mai sus).
@@ -1093,7 +1102,7 @@ def process_one(email_id: int) -> Dict[str, Any]:
             # spam; altfel scorul decide). Identică cu /spam/backfill — vezi spam_detector.classify_spam_gate.
             _sp_score, _sp_reasons, _override = spam_detector.classify_spam_gate(
                 em, reputation=_rep, manual_whitelist=manual_whitelist,
-                manual_spamlist=manual_spamlist)
+                manual_spamlist=manual_spamlist, blocked=_sender_blocked)
             if _override is False:
                 cur.execute(
                     "INSERT INTO email_spam (email_id, spam_score, spam_reasons, override) "
@@ -1132,7 +1141,8 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # tratat ca periculos). Intent-gate-ul de mai jos poate elibera carantina → re-evaluăm.
         if ph_status in ('quarantined', 'quarantined_strict'):
             _set_queue(cur, email_id, 'stopped_quarantine'); _qdest = 'stopped_quarantine'
-        elif _is_spam_now(cur, email_id):
+        elif _sender_blocked or _is_spam_now(cur, email_id):
+            # `_sender_blocked` explicit: nu depinde de scrierea best-effort in email_spam de mai sus.
             _set_queue(cur, email_id, 'stopped_spam'); _qdest = 'stopped_spam'  # STOP: nu IRIS, nu FC
         else:
             _set_queue(cur, email_id, 'intent_check'); _qdest = 'intent_check'   # clean → calea AI
@@ -1145,7 +1155,8 @@ def process_one(email_id: int) -> Dict[str, Any]:
         # La eroare/timeout/IRIS neconfigurat ramane carantinat (conservator).
         gate_flag = (os.getenv('STRICT_INTENT_GATE_ENABLED', '1') or '').strip().lower()
         if (ph_status in ('quarantined', 'quarantined_strict') and gate_flag not in ('0', 'false', 'no', 'off', '')
-                and _intent_detection_enabled(cur) and not _hard_block):
+                and _intent_detection_enabled(cur) and not _hard_block
+                and not _sender_blocked):  # blacklist-ul bate verdictul „benign" al AI
             try:
                 from app.services import strict_intent_gate
                 _gt, _gh, _gq = phishing_detector._new_content(em)

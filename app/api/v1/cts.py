@@ -35,7 +35,7 @@ from app.api.v1.auth import get_current_admin
 # Traducerea caii atasamentului (container -> host) e single-source in emails.py.
 from app.api.v1.emails import _host_path
 # Reguli deterministe „mailuri automate -> marcheaza SOLVED in CTS" (feed: campul mark_as_solved).
-from app.services import cts_auto_solved
+from app.services import cts_auto_solved, sender_block
 from app.services.doc_stats import STATS_SINCE, clamp_from_date
 # Etichete departament (slug -> label) pentru campurile de clasificare din feed (faza 2).
 try:
@@ -317,6 +317,14 @@ def cts_get_emails(request: Request,
     _effective_flags = _get_cts_send_flags(db)
     # Reguli „mailuri automate -> SOLVED" incarcate o singura data; matches() pur pe fiecare rand.
     _solved_rules = cts_auto_solved.load_rules(db)
+    # ⛔ Poarta FINALA pe expeditor (sender_block, 2026-09-15): un expeditor din blacklist nu intra
+    # NICIODATA in CTS, oricum ar fi devenit eligibil mailul. Fail-closed: fara liste, fara feed.
+    try:
+        _block_keys = sender_block.load_keys_sa(db)
+    except Exception:
+        logger.exception("cts feed: incarcarea listei de expeditori blocati a esuat")
+        db.rollback()
+        raise HTTPException(503, "Lista de expeditori blocati nu poate fi citita — feed oprit")
 
     # --- By-ID (re-pull punctual): daca se cere un email anume dupa id intern, IGNORAM
     # complet eligibilitatea SI starea sent_to_cts si intoarcem EXCLUSIV acel email
@@ -332,6 +340,15 @@ def cts_get_emails(request: Request,
                  summary="email %s inexistent" % id_email, response_meta={"id_email": id_email})
             raise HTTPException(404, "Email %s inexistent" % id_email)
         r = dict(row._mapping)
+        # Re-pull-ul ignora eligibilitatea, dar NU blacklist-ul: un mail nelivrat inca al unui
+        # expeditor blocat ar intra pe usa din spate. Cele deja livrate raman re-trase normal.
+        _blk = _block_keys.match(r.get("from_address")) if r.get("sent_to_cts_at") is None else None
+        if _blk:
+            _log(db, "get_email_by_id", [], requested=1, success=0, total=0,
+                 http_status=403, remote_ip=_client_ip(request),
+                 summary="email %s blocat: expeditor pe blacklist (%s)" % (id_email, _blk),
+                 response_meta={"id_email": id_email, "blocked_by": _blk})
+            raise HTTPException(403, "Email %s blocat: expeditorul e pe blacklist" % id_email)
         atts, missing = [], []
         if r.get("has_attachments"):
             arows = db.execute(text("""
@@ -361,6 +378,17 @@ def cts_get_emails(request: Request,
             "@odata.count": 1,
             "value": [msg],
         }
+
+    # Mailurile eligibile ale expeditorilor blocati ies din feed -> stopped_spam (vizibile in Spam).
+    # Un sweep esuat nu opreste feed-ul: filtrul per rand de mai jos le tine oricum afara.
+    blocked_ids = []
+    try:
+        blocked_ids = sender_block.demote_blocked_eligible(db, _ELIGIBLE, _block_keys)
+        db.commit()
+    except Exception:
+        logger.exception("cts feed: sweep expeditori blocati esuat")
+        db.rollback()
+        blocked_ids = []
 
     where = _ELIGIBLE
     qp = {}
@@ -394,6 +422,9 @@ def cts_get_emails(request: Request,
         if len(value) >= limit:
             break
         r = dict(row._mapping)
+        if _block_keys.match(r.get("from_address")):
+            blocked_ids.append(r["id"])
+            continue
         atts = []
         ok = True
         if r.get("has_attachments"):
@@ -419,9 +450,12 @@ def cts_get_emails(request: Request,
     summary = "%d livrate din %d eligibile" % (len(value), total)
     if skipped:
         summary += "; %d sarite (fisier atasament lipsa)" % len(skipped)
+    if blocked_ids:
+        summary += "; %d oprite (expeditor pe blacklist)" % len(blocked_ids)
     _log(db, "get_emails", returned_ids, requested=limit, success=len(value), total=total,
          http_status=200, remote_ip=_client_ip(request), summary=summary,
-         response_meta={"skipped_missing_file": skipped, "candidates_scanned": len(rows)})
+         response_meta={"skipped_missing_file": skipped, "candidates_scanned": len(rows),
+                        "blocked_sender": blocked_ids})
 
     return {
         "@odata.context": "https://mailguard.cargotrack.ro/api/v1/cts/$metadata#messages",

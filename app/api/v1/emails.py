@@ -659,6 +659,15 @@ def mark_not_phishing(email_id: int, body: FeedbackBody, background_tasks: Backg
         raise HTTPException(404, "Email not found")
     em = dict(row._mapping)
 
+    # ⛔ Blacklist-ul BATE decarantinarea (sender_block, 2026-09-15): mailul eliberat ar merge spre
+    # CTS, iar feed-ul l-ar opri oricum. Operatorul trebuie să scoată întâi expeditorul din blacklist.
+    from app.services import sender_block
+    blocked_by = sender_block.blocked_by_sa(db, em.get("from_address"))
+    if blocked_by:
+        raise HTTPException(409, "Expeditorul e blocat prin blacklist (%s). Scoate intrarea din "
+                                 "Setări → Liste expeditori (sau marcheaz-o ignorată), apoi "
+                                 "reîncearcă." % blocked_by)
+
     from_addr = (em.get("from_address") or "").lower().strip()
     sender_dom = from_addr.split("@", 1)[-1] if "@" in from_addr else ""
     if body.scope == "domain":

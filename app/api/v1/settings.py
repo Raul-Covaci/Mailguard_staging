@@ -699,6 +699,19 @@ def add_sender_list(body: dict, db: Session = Depends(get_db), admin=Depends(get
     tip = (body.get("tip") or "").strip().lower() or None
     if tip and tip not in sender_lists.TIPS:
         raise HTTPException(400, "Tip invalid (carantina/spam)")
+    if lst == "whitelist":
+        # ⛔ Blacklist-ul BATE whitelist-ul (sender_block, 2026-09-15). O intrare acoperită de
+        # blacklist (aceeași adresă, același domeniu sau un domeniu-părinte) n-ar avea efect, iar
+        # eliberarea retroactivă de mai jos ar repune pe coadă mailuri pe care feed-ul CTS le oprește.
+        from app.services import sender_block
+        _key, _scope = sender_lists.normalize(body.get("value") or "")
+        if _key:
+            _probe = _key if _scope == "email" else "x@" + _key
+            _blocked_by = sender_block.blocked_by_sa(db, _probe)
+            if _blocked_by:
+                raise HTTPException(409, "Valoarea e acoperită de blacklist (%s) — blacklist-ul are "
+                                         "prioritate. Șterge întâi intrarea din blacklist."
+                                    % _blocked_by)
     res = sender_lists.add_entry(db, lst, body.get("value") or "", reviewer,
                                  source="manual", note=body.get("note"), tip=tip)
     if res.get("conflict"):

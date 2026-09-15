@@ -291,26 +291,10 @@ def detect_spam_with_reputation(
     return score, reasons
 
 
-def sender_gate_verdict(email: Dict[str, Any], reputation: Optional[str] = None,
-                        manual_whitelist: Optional[set] = None,
-                        manual_spamlist: Optional[set] = None) -> Optional[bool]:
-    """Verdictul pe EXPEDITOR, fara scoring de continut: False=exceptat, True=blocat, None=neutru.
-
-    Aceeasi precedenta ca `classify_spam_gate` (whitelist/allowlist bate blocklist/spamlist),
-    dar nu ruleaza `detect_spam`. Folosita de gate-urile care ies DEVREME din `process_one`
-    (ex. „Automat"), ca un expeditor blocat sa nu poata ocoli oprirea ca spam.
-    """
-    saddr, sdoms = sender_scopes(email.get('from_address'))
-    if reputation == 'allowlist' or _list_hit(saddr, sdoms, manual_whitelist or set()):
-        return False
-    if reputation == 'blocklist' or _list_hit(saddr, sdoms, manual_spamlist or set()):
-        return True
-    return None
-
-
 def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
                        manual_whitelist: Optional[set] = None,
-                       manual_spamlist: Optional[set] = None
+                       manual_spamlist: Optional[set] = None,
+                       blocked: bool = False
                        ) -> Tuple[float, List[Dict[str, Any]], Optional[bool]]:
     """Clasificare spam APLICÂND poarta de liste expeditori. Pură (fără DB/rețea).
 
@@ -322,7 +306,9 @@ def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
       False -> NU spam (allowlist SAU whitelist manuală pe EXPEDITOR);
       True  -> spam forțat (blocklist reputație SAU blacklist tip=spam);
       None  -> fără override — scorul + pragul decid; păstrează deciziile manuale existente.
-    Precedență: whitelist/allowlist BATE blocklist/spamlist (whitelist ⇒ niciodată spam).
+    Precedență: blocklist/blacklist BATE whitelist/allowlist — un expeditor blocat e spam orice ar
+    fi (decizie 2026-09-15). `blocked`: verdictul `sender_block` calculat de apelant (blacklist de
+    orice tip, cu domenii-părinte, plus blocklist de reputație pe orice nivel).
 
     Whitelist-ul se aplică DOAR pe EXPEDITORUL real (from_address sau domeniul lui) — NU pe adrese
     care apar în corpul/thread-ul mailului. Motiv: dacă pe o adresă a noastră (ex. office@) intră
@@ -336,21 +322,23 @@ def classify_spam_gate(email: Dict[str, Any], reputation: Optional[str] = None,
     saddr, sdoms = sender_scopes(email.get('from_address'))
     sdom = sdoms[0] if sdoms else ''
 
-    # 1) Whitelist (bate tot) — DOAR pe expeditorul real (adresă sau domeniu, cu subdomenii).
+    # 1) Blacklist BATE tot (decizie 2026-09-15, vezi sender_block): blocklist reputație, blacklist
+    #    manuală tip=spam, sau `blocked` — verdictul complet al apelantului (orice tip de blacklist,
+    #    blocklist pe domeniu chiar dacă adresa exactă e pe allowlist) → forțează spam.
+    in_spamlist = _list_hit(saddr, sdoms, manual_spamlist)
+    if blocked or reputation == 'blocklist' or in_spamlist:
+        score, reasons = detect_spam(email)
+        bcode = 'manual_blacklist_spam' if in_spamlist else 'blocklist_sender'
+        return float(score), list(reasons) + [
+            {'code': bcode, 'weight': 0, 'match_text': saddr or sdom}], True
+
+    # 2) Whitelist — DOAR pe expeditorul real (adresă sau domeniu, cu subdomenii).
     in_whitelist = _list_hit(saddr, sdoms, manual_whitelist)
     if reputation == 'allowlist' or in_whitelist:
         wl_code = 'manual_whitelist_bypass' if in_whitelist else 'allowlist_bypass'
         return 0.0, [{'code': wl_code, 'weight': 0, 'match_text': saddr or sdom or ''}], False
 
-    # 2) Scoring pe conținut (detect_spam scanează doar mesajul nou, fără istoricul citat).
+    # 3) Nimic din liste → scorul decide (detect_spam scanează doar mesajul nou, fără istoricul
+    #    citat); nu atingem override (păstrăm decizii manuale).
     score, reasons = detect_spam(email)
-
-    # 3) Blocklist reputație SAU blacklist manuală tip=spam → forțează spam.
-    in_spamlist = _list_hit(saddr, sdoms, manual_spamlist)
-    if reputation == 'blocklist' or in_spamlist:
-        bcode = 'blocklist_sender' if reputation == 'blocklist' else 'manual_blacklist_spam'
-        return float(score), list(reasons) + [
-            {'code': bcode, 'weight': 0, 'match_text': saddr or sdom}], True
-
-    # 4) Nimic din liste → scorul decide; nu atingem override (păstrăm decizii manuale).
     return float(score), reasons, None

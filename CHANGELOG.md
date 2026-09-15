@@ -8,6 +8,48 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.4 - 2026-09-15
+
+### PATCH — un expeditor din blacklist nu mai ajunge NICIODATĂ în CTS
+
+Raportat: mailurile Akcenta „CURSURI MATINALE (M.C.)" (`info@email.akcenta.eu` → `facturare@`,
+07.09 și 10.09.2026) intrau în CTS deși adresa era în blacklist. Regula exista, dar avea mai multe
+căi de ocolire:
+
+- **Whitelist-ul bătea blacklist-ul.** `classify_spam_gate` verifica întâi whitelist/allowlist. Un
+  allowlist pe adresă (butonul „Legit") sau un whitelist pe domeniu anula blacklist-ul. În plus,
+  `mark_spam` și sync-ul CTS SPAM nu pot adăuga în blacklist o valoare deja pe whitelist
+  (`add_entry` refuză tăcut conflictul), deci „Marchează ca SPAM" rămânea fără efect.
+- **Blacklist tip=carantina nu oprea nimic definitiv.** Mailul intra în carantină strictă, dar
+  eliberarea AI (intent gate, „benign" + client cunoscut) și amprenta de decarantinare îl
+  eliberau automat spre CTS. Nici calea „Automat" nu îl vedea ca blocat.
+- **Carantina nu vedea subdomeniile.** Potrivirea se făcea doar pe domeniul exact: o intrare
+  `akcenta.eu` nu prindea `email.akcenta.eu`.
+- **Blocklist pe domeniu ignorat.** Reputația folosea doar rândul cel mai specific, deci un
+  allowlist pe adresă anula un blocklist pe domeniu.
+
+Fix — modul nou `app/services/sender_block.py`, sursa unică:
+
+- **Blacklist-ul BATE orice**: orice tip (carantina/spam), adresă, domeniu sau domeniu-părinte,
+  plus blocklist-ul de reputație pe orice nivel. Singurele căi de a debloca: ștergerea intrării
+  sau marcarea ei „ignorată" (muted).
+- **Pipeline** (`process_one`): expeditor blocat ⇒ `stopped_spam`, fără eliberare AI, fără
+  amprentă de decarantinare, fără calea „Automat". `/spam/backfill` aplică aceeași precedență.
+- **Ultima poartă, în feed-ul CTS** (`GET /cts/get_emails`): la fiecare apel, mailurile eligibile
+  ale expeditorilor blocați se mută în `stopped_spam` (override spam, `audit_log`
+  `blocked_sender_cts_gate`), oricum ar fi devenit eligibile. Există și filtru per rând. Re-pull-ul
+  by-id întoarce 403 pentru mailurile încă nelivrate. Dacă listele nu se pot citi, feed-ul
+  răspunde 503 (fail-closed).
+- **Gărzi în UI** (409 cu mesaj): „Legit", decarantinarea (`/emails/{id}/feedback`) și adăugarea
+  în whitelist a unei valori acoperite de blacklist. Excepție: „Legit" poate suprascrie în
+  continuare blocklist-ul de reputație pe adresa exactă, fiind inversul lui „Marchează ca SPAM".
+
+⚠️ Schimbare de comportament: până acum whitelist-ul avea prioritate („whitelist ⇒ niciodată
+spam"). Decizie Raul Covaci, 2026-09-15: blacklist-ul are prioritate, orice ar fi.
+
+Mailurile deja livrate în CTS nu se retrag. Cele eligibile, încă nelivrate, se opresc automat
+la primul apel CTS de după deploy. Fără migrație.
+
 ## v3.24.3 - 2026-09-14
 
 ### PATCH — reincercare pe 5xx de la gateway-ul IRIS + gata cu falsele „erori critice" din loguri

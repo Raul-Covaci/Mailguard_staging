@@ -307,6 +307,33 @@ inertă cât timp `settings.vathub.redirect.source` e `"inbox"`.
 
 ---
 
+## ⛔ BLACKLIST — un expeditor blocat NU ajunge NICIODATĂ în CTS (2026-09-15)
+
+Decizie Raul Covaci (incidentul Akcenta, `info@email.akcenta.eu`): **blacklist-ul BATE orice** —
+whitelist, allowlist, eliberarea AI din carantină, amprenta de decarantinare, calea „Automat".
+Se deblochează DOAR prin ștergerea intrării sau marcarea ei `muted`. Inversează regula veche
+„whitelist ⇒ niciodată spam".
+
+Sursa unică: **`app/services/sender_block.py`**. „Blocat" = blacklist manual
+(`settings.phishing_manual_learning.blacklist`, ORICE tip, ne-muted) SAU
+`spam_sender_reputation.reputation='blocklist'` pe ORICE nivel. Potrivire pe adresă, domeniu și
+domenii-părinte (`spam_detector.sender_scopes`): `akcenta.eu` prinde `email.akcenta.eu`.
+
+Aplicat în DOUĂ locuri, deliberat redundant — nu scoate niciunul:
+1. `process_email.process_one` → `_sender_blocked`: `stopped_spam`, nicio eliberare automată.
+2. **Feed-ul CTS** (`cts.cts_get_emails`): `demote_blocked_eligible` mută în `stopped_spam` orice
+   mail eligibil al unui expeditor blocat, plus filtru per rând și 403 pe by-id nelivrat.
+   Fail-closed (503) dacă listele nu se pot citi. E plasa pentru orice cale care ar face un mail
+   eligibil (Legit, decarantinare, whitelist retroactiv, cod scris mai târziu).
+
+⚠️ `sender_lists.add_entry` refuză TĂCUT o valoare aflată în lista opusă. `mark_spam` și sync-ul
+CTS SPAM se bazează și pe blocklist-ul de reputație, care e respectat de `sender_block` chiar dacă
+intrarea din blacklist n-a putut fi scrisă. Nu scoate reputația din `sender_block`.
+
+⚠️ `BLOCKED_SQL` (predicatul din feed) e oglinda lui `sender_block.match()` — se schimbă ÎMPREUNĂ.
+
+---
+
 ## 🗃️ BACKUP-URI — snapshot-urile de COD sunt DEZACTIVATE (2026-09-10)
 
 Versionarea codului = GitHub (`Mailguard_staging`). Arhivele `mailguard_code_*.tar.gz` ocupau
