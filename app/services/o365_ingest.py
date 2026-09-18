@@ -37,8 +37,14 @@ SELECT_FIELDS = ("id,internetMessageId,internetMessageHeaders,subject,from,sende
 _ALLOWED_CT = {
     # Images
     "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp", "image/tiff",
+    "image/jpg", "image/pjpeg", "image/x-png",                                     # variante nestandard
+    # HEIC/HEIF (poze iPhone) — convertite la JPEG la salvare, vezi heic_convert.py.
+    # Lipseau din listă: atașamentul era aruncat tăcut, deci documentul nu ajungea nici în
+    # Cargo360, nici în CTS (2026-09-18).
+    "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence",
+    "image/x-heic", "image/x-heif",
     # PDF
-    "application/pdf",
+    "application/pdf", "application/x-pdf",
     # Microsoft Office (legacy + OOXML)
     "application/msword",                                                           # .doc
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",     # .docx
@@ -55,6 +61,15 @@ _ALLOWED_CT = {
     # Generic binary (last resort — size+name filters apply)
     "application/octet-stream",
 }
+# Plasă pe EXTENSIE: Graph ia content-type-ul din ce a declarat clientul de mail al
+# expeditorului, iar acolo apar valori exotice (ex. `image/x-citrix-jpeg`) pentru fișiere
+# perfect normale. Un content-type necunoscut nu mai aruncă un fișier cu extensie cunoscută.
+_ALLOWED_EXT = (
+    ".jpg", ".jpeg", ".jpe", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+    ".heic", ".heif", ".hif",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf",
+    ".zip", ".rar", ".7z", ".txt", ".csv",
+)
 _SKIP_NAME = ("pixel", "logo", "signature", "footer", "header",
               "facebook", "twitter", "linkedin", "instagram")
 _MIN_SIZE = 2048
@@ -195,7 +210,10 @@ def _is_real_attachment(a):
     inline = bool(a.get("isInline"))  # contentId poate exista si pe atasamente non-inline in Graph
     if inline and a.get("contentId") and ct.startswith("image/"):
         pass  # keep inline images
-    elif ct not in _ALLOWED_CT:
+    elif ct not in _ALLOWED_CT and not name.endswith(_ALLOWED_EXT):
+        # Logat, nu tăcut: altfel un format nou (cum a fost HEIC) se pierde fără urmă.
+        logger.info("o365: atasament ignorat (tip nepermis) name=%r ct=%r size=%s",
+                    a.get("name"), a.get("contentType"), a.get("size"))
         return False
     if any(p in name for p in _SKIP_NAME):
         return False
@@ -316,19 +334,42 @@ def _save_attachments(c, tok, db, mg_email_id, m):
     body_content = ((m.get("body") or {}).get("content")) or ""
     if not m.get("hasAttachments") and "cid:" not in body_content.lower():
         return 0
+    return _store_attachments(c, db, mg_email_id, _fetch_attachments(c, tok, m.get("id")))
+
+
+def _store_attachments(c, db, mg_email_id, atts, skip_ids=()):
+    """Filtrează + scrie pe disc + inserează în `attachments`. Întoarce câte s-au salvat.
+    `skip_ids` = graph_attachment_id deja prezente (refacerea nu dublează rânduri)."""
+    import base64
+    from app.services import heic_convert
     saved = 0
     base = os.path.join(c["attach_root"], "native", str(mg_email_id))
-    for a in _fetch_attachments(c, tok, m.get("id")):
+    for a in atts:
         try:
+            if a.get("id") and a.get("id") in skip_ids:
+                continue
             if not _is_real_attachment(a):
                 continue
             content_b64 = a.get("contentBytes")
             if not content_b64:
+                logger.warning("o365: atasament fara contentBytes eid=%s name=%r size=%s",
+                               mg_email_id, a.get("name"), a.get("size"))
                 continue
-            import base64
             data = base64.b64decode(content_b64)
+            name, ctype = a.get("name"), a.get("contentType")
             os.makedirs(base, exist_ok=True)
-            fname = a.get("name") or f"attachment-{int(time.time()*1000)}"
+            if heic_convert.is_heif(name, ctype, data):
+                jpg = heic_convert.to_jpeg(data)
+                if jpg:
+                    # Originalul rămâne pe disc lângă JPEG (audit), dar în DB intră doar JPEG-ul:
+                    # tot lanțul de după (OCR, vision, previzualizare, CTS) știe JPEG, nu HEIC.
+                    with open(os.path.join(base, re.sub(r"[/\\]", "_", name or "original.heic")), "wb") as fh:
+                        fh.write(data)
+                    data, name, ctype = jpg, heic_convert.jpeg_name(name), "image/jpeg"
+                else:
+                    logger.warning("o365: HEIC neconvertit eid=%s name=%r — salvat ca atare",
+                                   mg_email_id, name)
+            fname = name or f"attachment-{int(time.time()*1000)}"
             fname = re.sub(r"[/\\]", "_", fname)
             fpath = os.path.join(base, fname)
             with open(fpath, "wb") as fh:
@@ -339,12 +380,74 @@ def _save_attachments(c, tok, db, mg_email_id, m):
             db.execute(text("""
                 INSERT INTO attachments(email_id, graph_attachment_id, name, content_type, storage_path, is_suspicious, content_id, is_inline)
                 VALUES(:eid, :gid, :name, :ct, :sp, FALSE, :cid, :inl)"""), {
-                "eid": mg_email_id, "gid": a.get("id"), "name": a.get("name"),
-                "ct": a.get("contentType"), "sp": fpath, "cid": cid_norm, "inl": inl})
+                "eid": mg_email_id, "gid": a.get("id"), "name": name,
+                "ct": ctype, "sp": fpath, "cid": cid_norm, "inl": inl})
             saved += 1
         except Exception as e:
             logger.warning("attach save failed eid=%s: %s", mg_email_id, str(e)[:160])
     return saved
+
+
+def refetch_attachments(days=14, email_ids=None, apply=False):
+    """Readuce din Graph atașamentele care LIPSESC pe emailuri deja ingerate (ex. HEIC aruncat
+    de filtrul vechi). Emailul există în DB (dedup pe Message-ID), deci re-sync-ul normal nu-l
+    mai atinge — de aici calea separată. `apply=False` = doar raportează ce ar adăuga.
+
+    Lista din Graph se cere FĂRĂ contentBytes (ieftin); conținutul se descarcă doar pentru
+    atașamentele lipsă, și doar cu `apply=True`."""
+    c = _cfg()
+    if not is_configured():
+        return {"ok": False, "error": "o365 neconfigurat"}
+    tok = _access_token(c)
+    headers = {"Authorization": "Bearer " + tok}
+    db = SessionLocal()
+    found, saved, errors = [], 0, 0
+    try:
+        if email_ids:
+            rows = db.execute(text(
+                "SELECT id, raw_graph_payload->>'graph_id' FROM emails WHERE id = ANY(:ids)"),
+                {"ids": list(email_ids)}).fetchall()
+        else:
+            rows = db.execute(text(
+                "SELECT id, raw_graph_payload->>'graph_id' FROM emails "
+                "WHERE raw_graph_payload->>'source' = 'o365-native' "
+                "AND received_at >= NOW() - make_interval(days => :d) ORDER BY id"),
+                {"d": int(days)}).fetchall()
+        for eid, gid in rows:
+            if not gid:
+                continue
+            try:
+                r = httpx.get(f"{_base(c)}/messages/{gid}/attachments",
+                              params={"$select": "id,name,contentType,size,isInline"},
+                              headers=headers, timeout=60)
+                if r.status_code != 200:
+                    continue
+                have = {x[0] for x in db.execute(text(
+                    "SELECT graph_attachment_id FROM attachments WHERE email_id=:e"), {"e": eid})}
+                # `name` al unui HEIC convertit s-a schimbat, dar graph_attachment_id rămâne → dedup corect
+                missing = [a for a in (r.json().get("value") or [])
+                           if a.get("id") not in have and _is_real_attachment(a)]
+                if not missing:
+                    continue
+                found.append({"email_id": eid, "attachments": [
+                    {"name": a.get("name"), "contentType": a.get("contentType"), "size": a.get("size")}
+                    for a in missing]})
+                if apply:
+                    full = [x for x in _fetch_attachments(c, tok, gid)
+                            if x.get("id") in {a.get("id") for a in missing}]
+                    n = _store_attachments(c, db, eid, full, skip_ids=have)
+                    if n:
+                        db.execute(text("UPDATE emails SET has_attachments=TRUE WHERE id=:id"), {"id": eid})
+                    db.commit()
+                    saved += n
+            except Exception as e:
+                db.rollback()
+                errors += 1
+                logger.warning("refetch eid=%s: %s", eid, str(e)[:200])
+    finally:
+        db.close()
+    return {"ok": True, "scanned": len(rows), "emails_with_missing": len(found),
+            "saved": saved, "errors": errors, "apply": apply, "details": found}
 
 
 # ───────────────────────── entrypoint ─────────────────────────

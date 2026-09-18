@@ -334,6 +334,25 @@ intrarea din blacklist n-a putut fi scrisă. Nu scoate reputația din `sender_bl
 
 ---
 
+## 📎 ATAȘAMENTE O365 — HEIC se convertește la JPEG la ingest (2026-09-18)
+
+`o365_ingest._is_real_attachment` e o listă albă (`_ALLOWED_CT`) + o plasă pe extensie
+(`_ALLOWED_EXT`). Tot ce nu trece se LOGHEAZĂ (`o365: atasament ignorat`) — înainte se arunca
+tăcut, așa s-au pierdut pozele `.heic` (nici în Cargo360, nici în CTS).
+
+- HEIC/HEIF → JPEG în `_store_attachments`, prin `app/services/heic_convert.py` (`pillow-heif`).
+  În DB intră doar JPEG-ul (nume `.jpg`, `image/jpeg`); originalul rămâne pe disc lângă el.
+  ⛔ Nu stoca HEIC ca atare: gateway-ul vision, browserul și `_to_pdf_compressed` nu-l citesc.
+- Fără `pillow-heif` instalat, HEIC se salvează neconvertit (vizibil, dar neprocesabil) — după
+  deploy verifică `venv/bin/pip show pillow-heif`.
+- Un email deja ingerat nu se mai re-sincronizează (dedup pe Message-ID), deci atașamentele
+  pierdute se recuperează cu `scripts/o365_refetch_attachments.py` (dry-run implicit, `--apply`).
+  Dedup-ul refacerii e pe `graph_attachment_id`, nu pe nume (numele HEIC se schimbă în `.jpg`).
+- Calea parser-email-op (instalările fără ingest nativ) are filtrul ei, în alt repo — nu e
+  acoperită de fix.
+
+---
+
 ## 🗃️ BACKUP-URI — snapshot-urile de COD sunt DEZACTIVATE (2026-09-10)
 
 Versionarea codului = GitHub (`Mailguard_staging`). Arhivele `mailguard_code_*.tar.gz` ocupau

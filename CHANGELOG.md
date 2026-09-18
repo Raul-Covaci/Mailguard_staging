@@ -8,6 +8,26 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.24.5 - 2026-09-18
+
+### PATCH — pozele .heic (iPhone) nu mai dispar la ingest
+
+Raportat: documente trimise ca poze `.heic` lipseau din Cargo360 și nu ajungeau nici în CTS.
+Cauza: filtrul de atașamente din `o365_ingest._is_real_attachment` accepta doar o listă albă de
+content-type-uri, fără `image/heic`/`image/heif` — atașamentul era aruncat TĂCUT, fără niciun log.
+
+- HEIC/HEIF acceptate și **convertite la JPEG la salvare** (`app/services/heic_convert.py`,
+  dependență nouă `pillow-heif`). Tot lanțul de după (OCR, vision, previzualizare, conversia PDF
+  pentru CTS) primește un JPEG obișnuit. Originalul `.heic` rămâne pe disc lângă JPEG. Detecție
+  pe content-type, extensie și magic bytes (Graph raportează uneori HEIC ca `octet-stream`).
+- Plasă pe **extensie**: un fișier cu extensie cunoscută (`.jpg`, `.pdf`, `.docx` etc.) nu mai e
+  aruncat doar pentru că clientul de mail al expeditorului a declarat un content-type exotic.
+  Adăugate și variantele `image/jpg`, `image/pjpeg`, `image/x-png`, `application/x-pdf`.
+- Atașamentele respinse și cele fără `contentBytes` se **loghează** (`o365: atasament ignorat`),
+  ca un format nou să nu se mai piardă fără urmă.
+- Recuperare pentru mailurile deja ingerate: `scripts/o365_refetch_attachments.py`
+  (`--days N` / `--ids ...`, implicit dry-run, `--apply` scrie).
+
 ## v3.24.4 - 2026-09-15
 
 ### PATCH — un expeditor din blacklist nu mai ajunge NICIODATĂ în CTS
