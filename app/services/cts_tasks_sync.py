@@ -366,6 +366,11 @@ _UPSERT_SQL = text(
     "                          AND cts_task_ground_truth.cts_in_progress_at IS NULL "
     "                         THEN now() "
     "                         ELSE cts_task_ground_truth.cts_in_progress_at END, "
+    # Oglinda liniei din cts_groundtruth_sync._UPSERT_SQL — se schimba IMPREUNA.
+    # `monitor_closed_at` e inchiderea noastra (junk vechi taiat din monitor). Sync-ul n-o scrie
+    # niciodata; o STERGE doar cand cineva chiar preia task-ul, ca munca sa reapara pe monitor.
+    " monitor_closed_at=CASE WHEN EXCLUDED.status IN ('in_progress','in progress') "
+    "                        THEN NULL ELSE cts_task_ground_truth.monitor_closed_at END, "
     " raw_payload=EXCLUDED.raw_payload, last_synced_at=now(), updated_at=now() "
     "RETURNING (xmax = 0) AS inserted")
 

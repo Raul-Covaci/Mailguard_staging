@@ -573,6 +573,78 @@ e un debit al zilei, nu un stoc.
 
 ---
 
+## 🧭 ATRIBUIREA PE DEPARTAMENT — o regulă, două ferestre (2026-09-22)
+
+„Al cui e mailul/task-ul ăsta" se răspundea în TREI feluri: monitorul pe coada CTS, raportul lunar
+pe omul asignat, pagina Mail-uri CTS pe amândouă (`OR`). Monitorul era singurul loc care atribuia
+pe coadă — deci **gauge-ul și barele de pe ACELAȘI card** răspundeau după reguli diferite.
+
+Sursa unică e acum `productivity._LIVE_DEPT_EMAIL_SQL` / `_LIVE_DEPT_TASK_SQL` (+ JOIN-urile
+pereche): **omul asignat întâi, coada CTS ca rezervă**, `enabled` contează. Un singur loc, toți
+consumatorii din `get_monitor_live` (contor de grup, carduri, grafic pe ore, audit).
+
+⚠️ **Două FERESTRE, nu două reguli.** `_LIVE_DEPT_*` = „a cui e munca asta deschisă, ACUM"
+(monitor). `_DEPT_AT_SQL` + `employee_department_history` = „în ce departament era OMUL în luna
+raportată" (rapoarte, scoruri, analitice). A le UNIFICA readuce bug-ul Ticus (2026-09-11); a le
+lăsa să răspundă DIFERIT la aceeași întrebare l-a produs pe cel din 2026-09-22.
+
+⚠️ **Raportul lunar rămâne assignee-ONLY, fără rezerva pe coadă** — un rând neasignat n-are
+operator, deci nu poate intra în scorul nimănui. Rezerva există exclusiv ca munca deschisă
+neasignată să nu dispară din monitor (fix 2026-08-06, 40% din mailurile 'new' n-au assignee;
+`migrations/20260806_cts_department_backfill.sql`).
+
+⚠️ **Predicatele monitorului sunt la nivel de MODUL** în `app/api/v1/productivity.py`
+(`_EMAIL_OPEN_STATES`, `_EMAIL_WIP`, `_EMAIL_BEFORE_TODAY`, `_EFF_DEPT_*` + omoloagele de task).
+Erau locale în `get_monitor_live`, de aceea interogările per departament rescriau expresia INLINE
+și au divergit tăcut. Nu le rescrie: invariantul „suma cardurilor = totalul de grup" se ține doar
+cât timp ambele citesc din același loc.
+
+⚠️ `cts_training.py` (`GET /cts-training/list` + statisticile) folosește DELIBERAT un `OR` peste
+`cts_department` și `ai_department`. E ecran de COMPARAȚIE MG-vs-CTS: o clasificare greșită trebuie
+să apară sub ambele etichete, altfel exact greșeala pe care ecranul există s-o arate ar fi filtrată
+afară. Nu alinia cu monitorul.
+
+⚠️ **Rândurile care cad în afara grupului nu dispar în tăcere.**
+`GET /productivity/monitor/attribution-audit` dă matricea coadă × efectiv pe restanța deschisă +
+`in_afara_grupului` (asignați în `mobilitate`/`comercial`/`it`, care nu sunt în
+`productivity_department_config` — deci invizibili pe ORICE monitor).
+
+⚠️ `_by_dept` nu mai întoarce tăcut `{}` la eroare: adună în `warnings[]`, întors de
+`/productivity/monitor/live` și afișat ca bandă roșie. Un 0 pe un ecran de perete e
+indistinguibil de „n-avem muncă", iar acolo nimeni nu citește logurile.
+
+### 🗑️ Restanța JUNK — închidere în COLOANĂ PROPRIE, nu în `cts_status` (2026-09-22)
+
+`restanta` nu are limită de vechime (corect — un mail din 02.09 trebuie văzut pe 03.09), deci
+tichetele pe care CTS le lasă deschise la nesfârșit se acumulează. Tot ce era deschis și a intrat
+înainte de **01.09.2026** e marcat închis pentru monitor
+(`migrations/20260922_monitor_junk_close.sql`).
+
+⛔ **Marcajul e `monitor_closed_at`, NU `cts_status`.** `cts_ground_truth` și
+`cts_task_ground_truth` sunt OGLINZI ale CTS: upsert-ul de sync suprascrie statusul la fiecare
+rulare (`cts_status=EXCLUDED.cts_status`, `status=EXCLUDED.status`), iar
+`cts_tasks_sync._pending_task_anchor` re-interoghează EXACT rândurile deschise, 60 de zile în urmă.
+Un `UPDATE ... SET status='closed'` s-ar fi anulat singur la următorul tick de 5 minute la
+task-uri și inconsistent la mailuri — cel mai rău caz posibil. Coloana proprie ține oglinda fidelă
+și face închiderea reversibilă.
+
+⚠️ **Rândurile rămân DESCHISE ÎN CTS.** Nu scriem nimic spre ei. E o închidere „pentru monitor".
+
+⚠️ **Sync-ul atinge coloana într-un singur loc, și doar ca s-o ȘTEARGĂ**: când statusul devine
+`in_progress`/`in progress`, cineva chiar a preluat tichetul, deci munca redevine reală și trebuie
+să reapară. Linia e OGLINDITĂ în `cts_groundtruth_sync._UPSERT_SQL` și
+`cts_tasks_sync._UPSERT_SQL` — se schimbă împreună.
+
+⚠️ Predicatul face parte din definiția de „deschis" (`_EMAIL_OPEN_STATES` / `_TASK_OPEN_STATES`),
+ca să se aplice identic în toate barele și în graficul pe ore. Predicatele sunt PARANTEZATE: sunt
+compuse, iar un `NOT {...}` fără paranteze ar nega doar primul termen.
+
+Repetabil fără migrație: `POST /productivity/monitor/close-backlog?before=YYYY-MM-DD`
+(**`dry_run=true` implicit**, întoarce câte rânduri s-ar închide). Anulare, după etichetă:
+`DELETE /productivity/monitor/close-backlog?reason=junk_cutoff_2026-09-01`.
+
+---
+
 ## ⏱️ PRODUCTIVITATE — fereastra de timp = PONTAJ (2026-08-19)
 
 Minutele de lucru (SLA mailuri/task-uri/apeluri/operațiuni) se numără pe **acoperirea

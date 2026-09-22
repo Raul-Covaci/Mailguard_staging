@@ -8,6 +8,76 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.25.0 - 2026-09-22
+
+### MINOR — Monitor operațional: atribuirea pe OMUL asignat + închiderea restanței junk
+
+Raportat de utilizatori: la **Suport 1** bara „Restanță" arăta **26** de mailuri, deși colegii
+recunoșteau doar 3-4 ca fiind munca lor. La **Taxe de drum**, invers: 14 mail / 18 task, deși ei
+aveau vizibil mai mult (postponed + in progress + new din zilele trecute). Două reclamații în
+direcții opuse, cu două cauze distincte — ambele reparate aici.
+
+**Cauza 1 — aplicația răspundea în trei feluri la „al cui e mailul ăsta".**
+
+| Unde | Regulă |
+|---|---|
+| Monitor live (barele) | coada CTS întâi, omul doar ca rezervă |
+| Raport lunar, analitice, breakdown, **gauge-ul de pe ACELAȘI card** | doar omul asignat |
+| Pagina Mail-uri CTS (training) | coada **SAU** ce a zis AI-ul nostru |
+
+Monitorul era **singurul** loc din aplicație care atribuia pe coadă, deci cercul de productivitate
+și barele de sub el, pe același card, răspundeau după reguli diferite. CTS parchează tichete pe
+coada altui departament (`suport_1` e catch-all-ul documentat), așa că mailurile de recuperare TVA
+ale unei colege din alt departament se numărau la Suport 1 — iar munca oamenilor din taxe_drum,
+parcată pe alte cozi, nu se vedea la ei.
+
+- Regula unică: **omul asignat întâi, coada CTS ca rezervă**, `enabled` contează
+  (`productivity._LIVE_DEPT_EMAIL_SQL` / `_LIVE_DEPT_TASK_SQL`). Un singur loc, toți consumatorii.
+- Rândurile NEASIGNATE rămân pe coadă — fixul din 2026-08-06 (40% din mailurile 'new' n-au
+  assignee) e intact. S-a inversat doar PRECEDENȚA.
+- Predicatele monitorului au fost mutate la nivel de modul în `app/api/v1/productivity.py`. Erau
+  variabile locale, motiv pentru care interogările per departament rescriau expresia inline — exact
+  mecanismul prin care regula a putut diverge tăcut de restul aplicației.
+
+**Cauza 2 — restanță junk, niciodată închisă în CTS.** `restanta` nu are limită de vechime
+(corect: un mail din 02.09 rămas deschis trebuie văzut pe 03.09), deci tichetele abandonate se
+acumulau la infinit. Tot ce era deschis și a intrat înainte de **01.09.2026** e marcat închis
+pentru monitor (`migrations/20260922_monitor_junk_close.sql`).
+
+- ⛔ Marcajul stă într-o coloană proprie (`monitor_closed_at`), **nu** în `cts_status`: acelea sunt
+  oglinda CTS, iar upsert-ul de sync le suprascrie la fiecare rulare (`cts_status=EXCLUDED.cts_status`),
+  iar `_pending_task_anchor` re-interoghează exact rândurile deschise, 60 de zile în urmă. Un UPDATE
+  pe status s-ar fi anulat singur la următorul tick de 5 minute.
+- Rândurile rămân **deschise în CTS** — nu scriem nimic spre ei.
+- **Reactivare**: dacă cineva chiar preia un tichet vechi (`in progress`), sync-ul șterge marcajul
+  și tichetul reapare pe monitor. E singura scriere a sync-ului pe coloana asta.
+- Repetabil fără migrație: `POST /productivity/monitor/close-backlog?before=YYYY-MM-DD`
+  (**`dry_run=true` implicit**). Anulare: `DELETE ...?reason=<eticheta>`.
+
+**Ce se schimbă în cifre**
+
+| | Efect |
+|---|---|
+| Suport 1, restanță mail | **scade** — tichetele lucrate de oameni din alte departamente pleacă |
+| Monitor Financiar / recuperare_tva | **crește** cu exact aceleași rânduri |
+| Taxe de drum | **crește** — munca oamenilor lor, parcată pe alte cozi, vine înapoi |
+| Scoruri lunare, analitice, breakdown, snapshot-uri | **ZERO** — erau deja assignee-only |
+
+⚠️ Rândurile al căror asignat e în `mobilitate` / `comercial` / `it` / `hr` dispar din ambele
+monitoare: acele departamente nu sunt în `productivity_department_config`. Semantic e corect, dar
+înainte apăreau sub coada lor. Vizibile în `GET /productivity/monitor/attribution-audit`.
+
+**Auditabilitate** (ca reclamația „26 vs 3-4" să se poată tranșa fără ghicit)
+
+- `GET /productivity/monitor/attribution-audit` — matricea coadă × efectiv pe restanța deschisă,
+  plus ce cade în afara departamentelor configurate. Contra-proba permanentă a regulii.
+- `/productivity/monitor/live` întoarce `warnings[]`, iar monitorul afișează o bandă roșie când o
+  interogare per departament crapă. Înainte întorcea tăcut `{}` și toate cardurile arătau 0 — un 0
+  indistinguibil de „n-avem muncă", pe un ecran de perete unde nimeni nu citește logurile.
+- `app/api/v1/cts_training.py` păstrează DELIBERAT filtrul mai larg (`OR` peste coadă și
+  `ai_department`) — e ecran de comparație MG-vs-CTS. Documentat ca atare, ca să nu fie „aliniat"
+  din greșeală mai târziu.
+
 ## v3.24.5 - 2026-09-18
 
 ### PATCH — pozele .heic (iPhone) nu mai dispar la ingest

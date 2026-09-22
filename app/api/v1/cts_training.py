@@ -65,6 +65,14 @@ def cts_training_list(
     params = {}
 
     if department:
+        # ⚠️ DELIBERAT ALTA REGULA decat atribuirea din monitor
+        # (`productivity._LIVE_DEPT_EMAIL_SQL` — omul asignat intai, coada ca rezerva) si decat
+        # apartenenta istorica (`productivity._DEPT_AT_SQL`). Aici filtrul e o REUNIUNE (`OR`),
+        # nu o atribuire: pagina COMPARA eticheta CTS cu cea pusa de AI-ul nostru, deci un mail
+        # pe care MG l-a incadrat gresit pe alt departament TREBUIE sa apara sub ambele — altfel
+        # exact greseala pe care ecranul exista s-o arate ar fi cea filtrata afara.
+        # NU alinia cu monitorul. Daca ai nevoie de „a cui e munca", foloseste
+        # GET /productivity/monitor/live (sau /monitor/attribution-audit), nu ecranul asta.
         where.append("(gt.cts_department = :dep OR e.ai_department = :dep)")
         params["dep"] = department
 
@@ -327,6 +335,8 @@ def cts_training_stats(
     where_parts = []
     params = {}
     if department:
+        # Aceeasi reuniune ca la /list, si din acelasi motiv — vezi nota de acolo. Cele doua
+        # filtre trebuie sa ramana IDENTICE: statisticile de sub lista se citesc impreuna cu ea.
         where_parts.append("(gt.cts_department = :dep OR e.ai_department = :dep)")
         params["dep"] = department
     if dept_from:

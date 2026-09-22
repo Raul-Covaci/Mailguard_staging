@@ -647,6 +647,13 @@ _UPSERT_SQL = text(
     "                         THEN COALESCE(EXCLUDED.cts_assigned_at, now()) "
     "                         ELSE cts_ground_truth.cts_in_progress_at END, "
     " cts_assignee_email=EXCLUDED.cts_assignee_email, cts_assignee_name=EXCLUDED.cts_assignee_name, cts_assignee_id=EXCLUDED.cts_assignee_id, cts_assigned_at=EXCLUDED.cts_assigned_at, "
+    # `monitor_closed_at` e inchiderea NOASTRA (junk vechi taiat din monitor, vezi
+    # migrations/20260922_monitor_junk_close.sql). Sync-ul NU o scrie — e singurul loc in care o
+    # atinge, si doar ca s-o STEARGA: daca cineva chiar preia un tichet vechi, munca redevine
+    # reala si trebuie sa reapara pe monitor. Ambele ortografii, fiindca feed-ul le scrie pe
+    # amandoua. In rest marcajul supravietuieste oricator resincronizari.
+    " monitor_closed_at=CASE WHEN EXCLUDED.cts_status IN ('in_progress','in progress') "
+    "                        THEN NULL ELSE cts_ground_truth.monitor_closed_at END, "
     " raw=EXCLUDED.raw, fetched_at=now(), last_synced_at=now() "
     "RETURNING (xmax = 0) AS inserted, "
     " (xmax <> 0 AND changed_at IS NOT NULL AND changed_at >= now() - interval '5 seconds') AS changed, "

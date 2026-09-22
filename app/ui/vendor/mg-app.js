@@ -14979,9 +14979,24 @@ function ProductivityDashboard({ group, refreshMin }) {
 
   var bodyStyle = { flex:1, display:'flex', flexDirection:'column', gap:10, padding:'10px', overflow:'auto' };
 
+  // Bandă de avarie: una dintre interogările per departament a crăpat, deci cardurile ei arată 0.
+  // Pe un monitor de perete un 0 e indistinguibil de „n-avem muncă" și nimeni nu citește logurile,
+  // așa că eroarea trebuie să fie pe ecran, nu doar în journalctl. Gol în regim normal.
+  var liveWarn = (live && live.warnings) || [];
+  var warnBar = liveWarn.length ? h('div', { key:'warn', style:{
+    display:'flex', alignItems:'center', gap:8, padding:'7px 12px', borderRadius:'var(--r-sm)',
+    background:'rgba(220,38,38,0.12)', border:'1px solid var(--rd)', color:'var(--rd)',
+    fontSize:12, fontWeight:600
+  } }, [
+    h('span', { key:'i', style:{ display:'flex' } }, h(MonitorIcon, { name:'alert', size:14 })),
+    h('span', { key:'t' }, 'Date indisponibile (cifrele afectate apar ca 0): ' +
+      liveWarn.map(function(w){ return w.scope; }).join(', '))
+  ]) : null;
+
   return h('div', { style:pageStyle }, [
     header,
     h('div', { key:'body', style:bodyStyle }, [
+      warnBar,
       deptRow
     ])
   ]);

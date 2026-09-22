@@ -762,6 +762,53 @@ def get_dashboard_data(group: str = Query("operational"), db: Session = Depends(
 # ar cădea pe ora 07 UTC), iar "azi" s-ar rupe la miezul nopții UTC, nu local.
 _TZ = "Europe/Bucharest"
 
+# ── FRAGMENTELE MONITORULUI — la nivel de MODUL, nu locale in `get_monitor_live` ─────────────
+# Au fost variabile locale pana pe 2026-09-22. De aceea `_by_dept` a putut rescrie expresia de
+# departament INLINE, iar cele doua copii au divergit tacut de restul aplicatiei. Orice interogare
+# noua care raspunde la „ce e deschis acum" (contor de grup, carduri, grafic pe ore, endpoint de
+# audit) foloseste DE AICI, nu isi scrie propria varianta.
+
+# „DESCHIS" = NEterminal, adica NOT IN ('solved','closed') — NU o lista alba de stari.
+# `status` e text liber in ambele tabele („enum CTS TBD" in migratia 20260702), iar setul confirmat
+# de vendor (Razvan, 2026-07-02) e: unallocated, new, in_progress, postponed, closed, solved. O
+# lista alba ar rata `unallocated` (task alocat nimanui — exact munca pe care nimeni n-a preluat-o)
+# si ar depinde de ortografia lui in_progress, scrisa in feed in ambele feluri („in progress" cu
+# spatiu la task-uri, „in_progress" in `cts_groundtruth_sync`). `lower` + `btrim` + `COALESCE` fac
+# expresia imuna la majuscule, spatii si NULL.
+# `monitor_closed_at` = inchiderea NOASTRA, decisa in aplicatie (junk vechi, vezi
+# migrations/20260922_monitor_junk_close.sql si POST /productivity/monitor/close-backlog). NU se
+# scrie in `cts_status`: aceea e oglinda CTS, pe care upsert-ul de sync o suprascrie la fiecare
+# rulare. Face parte din definitia de „deschis" ca sa se aplice IDENTIC in toate barele.
+# Stergerile: mailurile prin `cts_deleted_at IS NULL` (in WHERE), task-urile n-au coloana de stergere.
+# NB: PARANTEZATE. Predicatul e compus (doua conditii), iar apelantii il combina cu `AND`/`NOT`
+# — fara paranteze, un `NOT {_EMAIL_OPEN_STATES}` ar nega doar primul termen, tacut.
+_EMAIL_OPEN_STATES = ("(lower(btrim(COALESCE(g.cts_status,''))) NOT IN ('solved','closed') "
+                      "AND g.monitor_closed_at IS NULL)")
+_TASK_OPEN_STATES = ("(lower(btrim(COALESCE(t.status,''))) NOT IN ('solved','closed') "
+                     "AND t.monitor_closed_at IS NULL)")
+# „IN LUCRU" = preluat de cineva. Ambele ortografii, fiindca feed-ul le scrie pe amandoua:
+# task-urile ca „in progress", iar `cts_groundtruth_sync` verifica mailurile pe „in_progress".
+# Restul starilor deschise (new, unallocated, postponed, NULL) sunt NEPRELUATE, deci merg la „Noi".
+_EMAIL_WIP = "lower(btrim(COALESCE(g.cts_status,''))) IN ('in progress','in_progress')"
+_TASK_WIP = "lower(btrim(COALESCE(t.status,''))) IN ('in progress','in_progress')"
+# „NU E DIN ZIUA CURENTA" ca NEGARE EXACTA a ferestrei folosite de barele zilei, nu ca
+# `< CURRENT_DATE`. Motivul: `CURRENT_DATE` e ziua serverului DB, iar data comparata e convertita
+# in Europe/Bucharest. Daca Postgres ruleaza pe UTC, intre 00:00 si 03:00 local cele doua nu
+# coincid, si un rand sosit atunci n-ar fi nici „de azi" nici „< azi" — ar disparea din toate
+# barele, tacut. `IS DISTINCT FROM` acopera si sosirea NULL (join LEFT pe `emails`,
+# `cts_created_at` nullable), deci cele trei bare partitioneaza exact randurile deschise.
+_EMAIL_BEFORE_TODAY = f"(DATE({_EMAIL_ARRIVED_LOCAL}) IS DISTINCT FROM CURRENT_DATE)"
+_TASK_BEFORE_TODAY = (f"(DATE(t.cts_created_at AT TIME ZONE '{_TZ}') "
+                      f"IS DISTINCT FROM CURRENT_DATE)")
+
+# ATRIBUIREA PE DEPARTAMENT — o SINGURA sursa, in serviciu. Vezi comentariul complet de la
+# `productivity._LIVE_DEPT_EMAIL_SQL`: omul asignat intai, coada CTS ca rezerva.
+_DEP_EMAIL_JOIN = P._LIVE_DEPT_EMAIL_JOIN.format(e='edm', g='g')
+_EFF_DEPT_EMAIL = P._LIVE_DEPT_EMAIL_SQL.format(e='edm', g='g')
+_DEP_EMAIL_W = f"AND {_EFF_DEPT_EMAIL} = ANY(:depts)"
+_DEP_TASK_JOIN = P._LIVE_DEPT_TASK_JOIN.format(e='edm', t='t')
+_EFF_DEPT_TASK = P._LIVE_DEPT_TASK_SQL.format(e='edm', t='t')
+
 
 @router.get("/productivity/monitor/live")
 def get_monitor_live(group: str = Query("operational"), db: Session = Depends(get_db)):
@@ -781,64 +828,34 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     # Atribuirea se face prin asignat -> employee_department_mapping, exact ca în
     # productivity._fetch_email_rows.
     _p = {"depts": depts}
-    # DEPARTAMENTUL UNUI MAIL = cel al TICHETULUI din CTS (`cts_department`), nu al persoanei
-    # asignate. JOIN-ul vechi (INNER pe `cts_assignee_email` = edm.email) arunca orice mail
-    # NEASIGNAT: 69 din 171 de mailuri 'new' (40%) nu au assignee — in CTS stau in coada
-    # departamentului, la noi dispareau complet. Suport 1 arata 0 'new' in loc de 47 (constatat
-    # 2026-08-06). In plus, mailuri asignate cuiva din alt departament decat cel al tichetului
-    # se numarau la departamentul greșit (contabilitate arata 20 in loc de 8).
-    # Fallback pe departamentul assignee-ului doar cand `cts_department` lipseste (4066 rânduri,
-    # toate 'solved' istorice — nici un mail deschis nu e afectat).
-    _dep_email = """
-        LEFT JOIN employee_department_mapping edm
-          ON lower(g.cts_assignee_email) = lower(edm.email)
-    """
-    # ── RESTANȚĂ: deschis ACUM, dar sosit ÎNAINTE de azi ────────────────────────────────────
-    # Un mail/task din 02.09 rămas 'new'/'in progress' trebuie să se vadă și pe 03.09 (cerere
-    # business owner, 2026-09-10). NU se amestecă însă în barele „Noi"/„În lucru": acelea rămân pe
-    # ziua curentă, fiindcă exact amestecul lor cu restanța istorică a dus la limitarea din
-    # 2026-08-13 (CTS lasă tichete deschise la nesfârșit — Financiar avea 769 'new', unele din
-    # martie). Restanța e o BARĂ SEPARATĂ, deci nimic nu se pierde și nimic nu se contaminează.
-    # „Deschis" = NEterminal, adică NOT IN ('solved','closed') — NU o listă albă de stări.
-    # `status` e text liber în ambele tabele („enum CTS TBD" în migrația 20260702), iar setul
-    # confirmat de vendor (Razvan, 2026-07-02) e: unallocated, new, in_progress, postponed, closed,
-    # solved. O listă albă ar rata `unallocated` (task alocat nimănui — exact munca pe care nimeni
-    # n-a preluat-o) și ar depinde de ortografia lui in_progress, scrisă în feed în ambele feluri
-    # („in progress" cu spațiu la task-uri, „in_progress" în `cts_groundtruth_sync`). `lower` +
-    # `COALESCE` sunt aceeași convenție ca `cts_tasks_sync._pending_task_anchor`, care definește
-    # „pending" pentru backfill; forma complementară e deja folosită de `h_mail_open`/`h_task_open`
-    # mai jos. Ștergerile: mailurile prin `cts_deleted_at IS NULL` (în WHERE), task-urile n-au
-    # coloană de ștergere.
-    _EMAIL_OPEN_STATES = "lower(btrim(COALESCE(g.cts_status,''))) NOT IN ('solved','closed')"
-    _TASK_OPEN_STATES = "lower(btrim(COALESCE(t.status,''))) NOT IN ('solved','closed')"
-    # „În lucru" = preluat de cineva. Ambele ortografii, fiindcă feed-ul le scrie pe amândouă:
-    # task-urile ca „in progress" (nota veche de la `task_row`), iar `cts_groundtruth_sync` verifică
-    # mailurile pe „in_progress". Restul stărilor deschise (new, unallocated, postponed, NULL) sunt
-    # NEPRELUATE, deci merg la „Noi" — vezi mai jos de ce contează.
-    _EMAIL_WIP = "lower(btrim(COALESCE(g.cts_status,''))) IN ('in progress','in_progress')"
-    _TASK_WIP = "lower(btrim(COALESCE(t.status,''))) IN ('in progress','in_progress')"
-    # „Nu e din ziua curentă" ca NEGARE EXACTĂ a ferestrei folosite de barele zilei, nu ca
-    # `< CURRENT_DATE`. Motivul: `CURRENT_DATE` e ziua serverului DB, iar data comparată e convertită
-    # în Europe/Bucharest. Dacă Postgres rulează pe UTC, între 00:00 și 03:00 local cele două nu
-    # coincid, și un rând sosit atunci n-ar fi nici „de azi" nici „< azi" — ar dispărea din toate
-    # barele, tăcut. `IS DISTINCT FROM` acoperă și sosirea NULL (join LEFT pe `emails`,
-    # `cts_created_at` nullable), deci cele trei bare partiționează exact rândurile deschise.
-    _EMAIL_BEFORE_TODAY = f"(DATE({_EMAIL_ARRIVED_LOCAL}) IS DISTINCT FROM CURRENT_DATE)"
-    _TASK_BEFORE_TODAY = (f"(DATE(t.cts_created_at AT TIME ZONE '{_TZ}') "
-                          f"IS DISTINCT FROM CURRENT_DATE)")
-
-    # Expresia de departament efectiv, refolosita in GROUP BY / WHERE.
-    _EFF_DEPT_EMAIL = "COALESCE(g.cts_department, edm.department)"
-    _dep_email_w = f"AND {_EFF_DEPT_EMAIL} = ANY(:depts)"
+    # ── ATRIBUIREA PE DEPARTAMENT ───────────────────────────────────────────────────────────
+    # OMUL ASIGNAT INTAI, COADA CA REZERVA — `_EFF_DEPT_EMAIL` / `_EFF_DEPT_TASK`, definite la
+    # nivel de modul din `productivity._LIVE_DEPT_*_SQL` (sursa unica, vezi comentariul de acolo).
+    #
+    # Pana pe 2026-09-22 era invers (coada intai). Doua consecinte, amandoua reclamate de
+    # utilizatori: tichetele parcate pe coada suport_1 dar lucrate de oameni din alte departamente
+    # umflau Suport 1 (26 de restante raportate, ~4 reale), iar munca oamenilor din taxe_drum
+    # parcata pe alte cozi nu se vedea la ei. Monitorul era SINGURUL loc din aplicatie care
+    # atribuia pe coada: raportul lunar, analiticele si breakdown-ul o faceau deja pe assignee,
+    # deci gauge-ul si barele de pe ACELASI card raspundeau dupa reguli diferite.
+    #
+    # Join-ul ramane LEFT, si rezerva pe coada ramane: fixul din 2026-08-06 (69 din 171 de mailuri
+    # 'new' n-au assignee — in CTS stau in coada departamentului) nu se pierde. S-a inversat doar
+    # PRECEDENTA, nu tratarea randurilor neasignate.
+    #
+    # ── RESTANTA: deschis ACUM, dar sosit INAINTE de azi ────────────────────────────────────
+    # Un mail/task din 02.09 ramas 'new'/'in progress' trebuie sa se vada si pe 03.09 (cerere
+    # business owner, 2026-09-10). NU se amesteca insa in barele „Noi"/„In lucru": acelea raman pe
+    # ziua curenta, fiindca exact amestecul lor cu restanta istorica a dus la limitarea din
+    # 2026-08-13 (CTS lasa tichete deschise la nesfarsit — Financiar avea 769 'new', unele din
+    # martie). Restanta e o BARA SEPARATA, deci nimic nu se pierde si nimic nu se contamineaza.
+    # Predicatele (`_EMAIL_OPEN_STATES`, `_EMAIL_WIP`, `_EMAIL_BEFORE_TODAY` + omoloagele de task)
+    # sunt la nivel de MODUL — nu le rescrie inline, vezi nota de acolo.
+    _dep_email = _DEP_EMAIL_JOIN
+    _dep_email_w = _DEP_EMAIL_W
     # task-uri și device ops au cheie străină numerică spre edm.id (NU iris_id, care
     # e text și nu se potrivește)
-    # Idem pentru task-uri: `cts_task_ground_truth.department` e departamentul tichetului din CTS,
-    # prezent si pe task-urile neasignate (10 'new' pe mobilitate, 2026-08-06).
-    _dep_task = """
-        LEFT JOIN employee_department_mapping edm
-          ON t.assignee_employee_id = edm.id
-    """
-    _EFF_DEPT_TASK = "COALESCE(t.department, edm.department)"
+    _dep_task = _DEP_TASK_JOIN
     _dep_dev = """
         JOIN employee_department_mapping edm
           ON d.closed_by_employee_id = edm.id AND edm.department = ANY(:depts)
@@ -1282,24 +1299,31 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
     #   - apel azi            = DATE(cts_started_at) = azi
     #   - reclamații          = categorie 'reclamatie' din coalesce(cts_category, ai_category)
     per_dept = []
+    warnings = []
     if depts:
-        def _by_dept(sql: str, ncols: int) -> dict:
-            """Rulează o interogare grupată pe departament; la eroare întoarce dict gol."""
+        def _by_dept(sql: str, ncols: int, label: str) -> dict:
+            """Rulează o interogare grupată pe departament; la eroare întoarce dict gol.
+
+            ⚠️ Dict-ul gol face TOATE cardurile să afișeze 0, iar un 0 e indistinguibil de un
+            departament fără muncă. Monitorul e un ecran de perete — nimeni nu se uită în loguri
+            când o cifră scade. De aceea eroarea se și RAPORTEAZĂ, în `warnings`, iar UI-ul o
+            afișează ca bandă; `logger.exception` singur nu ajunge la nimeni.
+            """
             try:
                 rows = db.execute(text(sql), {"depts": depts}).fetchall()
                 return {r[0]: tuple(int(r[i] or 0) for i in range(1, ncols + 1)) for r in rows}
-            except Exception:
-                logger.exception("monitor_live per_dept")
+            except Exception as e:
+                logger.exception("monitor_live per_dept [%s]", label)
+                warnings.append({"scope": label, "error": str(e)[:200]})
                 return {}
 
-        # Departamentul unui mail = cel al TICHETULUI din CTS (`cts_department`), cu fallback pe
-        # departamentul assignee-ului. Vezi comentariul de la `_dep_email` in get_dashboard_data:
-        # JOIN-ul INNER pe assignee arunca mailurile neasignate (40% din cele 'new'), motiv pentru
-        # care Suport 1 arata 0 'new' desi CTS avea 47.
-        # Stările deschise sunt filtrate pe ce a SOSIT AZI — aceeași regulă ca la contoarele de
-        # grup de mai sus, ca suma cardurilor să rămână egală cu totalul.
+        # Aceleași fragmente ca la contoarele de grup de mai sus — `_EFF_DEPT_EMAIL`,
+        # `_EMAIL_OPEN_STATES` & co. Blocurile astea aveau, până pe 2026-09-22, expresia de
+        # departament scrisă INLINE: așa a putut monitorul să atribuie pe coadă în timp ce tot
+        # restul aplicației atribuia pe omul asignat. Nu le rescrie — invariantul „suma
+        # cardurilor = totalul de grup" se ține doar atâta timp cât ambele citesc din același loc.
         d_mail = _by_dept(f"""
-            SELECT COALESCE(g.cts_department, edm.department) AS dept,
+            SELECT {_EFF_DEPT_EMAIL} AS dept,
                    COUNT(*) FILTER (WHERE g.cts_status IN ('solved','closed')
                                     AND DATE(g.cts_solved_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
                    COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES} AND {_EMAIL_WIP}
@@ -1311,18 +1335,17 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    COUNT(*) FILTER (WHERE {_EMAIL_OPEN_STATES}
                                     AND {_EMAIL_BEFORE_TODAY})                       AS restanta
             FROM cts_ground_truth g
-            LEFT JOIN employee_department_mapping edm
-              ON lower(g.cts_assignee_email) = lower(edm.email)
+            {_DEP_EMAIL_JOIN}
             {_J_EMAIL_EXCL}
             WHERE g.cts_deleted_at IS NULL
               AND COALESCE(g.cts_direction,'received') = 'received'
-              AND COALESCE(g.cts_department, edm.department) = ANY(:depts)
+              AND {_EFF_DEPT_EMAIL} = ANY(:depts)
               AND {_EMAIL_EXCLUDE_SQL}
             GROUP BY 1
-        """, 5)
+        """, 5, "mailuri per departament")
 
         d_task = _by_dept(f"""
-            SELECT COALESCE(t.department, edm.department) AS dept,
+            SELECT {_EFF_DEPT_TASK} AS dept,
                    COUNT(*) FILTER (WHERE t.status IN ('solved','closed')
                                     AND DATE(t.cts_updated_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS rezolvate_azi,
                    COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_WIP}
@@ -1332,11 +1355,10 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                    COUNT(*) FILTER (WHERE DATE(t.cts_created_at AT TIME ZONE '{_TZ}') = CURRENT_DATE) AS intrate_azi,
                    COUNT(*) FILTER (WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY})     AS restanta
             FROM {_SRC_TASK} t
-            LEFT JOIN employee_department_mapping edm
-              ON t.assignee_employee_id = edm.id
-            WHERE COALESCE(t.department, edm.department) = ANY(:depts)
+            {_DEP_TASK_JOIN}
+            WHERE {_EFF_DEPT_TASK} = ANY(:depts)
             GROUP BY 1
-        """, 5)
+        """, 5, "task-uri per departament")
 
         # Apeluri per departament — aceeași sursă (`calls`) și exact aceleași filtre ca `call_row`,
         # deci suma cardurilor = contorul de grup. Atribuirea e a agentului din centrală
@@ -1353,7 +1375,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
               AND {P._APEL_DAY_SQL} = {P._APEL_TODAY_RO_SQL}
               AND edm.department = ANY(:depts)
             GROUP BY 1
-        """, 2)
+        """, 2, "apeluri per departament")
 
         # Reclamații: primite azi + rezolvate azi + deschise acum. Sursa e categoria emailului
         # (nu există tabelă dedicată). "Primite" = momentul real de sosire (`extra.email_date`,
@@ -1423,7 +1445,7 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
                   AND COALESCE(ev.department, dep.department) = ANY(:depts)
             ) s
             GROUP BY 1
-        """, 6)
+        """, 6, "reclamații per departament")
 
         # `_z5` = zero-ul pentru mail/task (5 coloane, ultima e `restanta`).
         _z5, _z3, _z2 = (0, 0, 0, 0, 0), (0, 0, 0, 0, 0, 0), (0, 0)
@@ -1544,7 +1566,206 @@ def get_monitor_live(group: str = Query("operational"), db: Session = Depends(ge
         "rezolvate_categorii": rezolvate_categorii,
         "hourly": hourly,
         "per_dept": per_dept,
+        # Interogările per departament care au eșuat. Gol în regim normal. Nevid = cifrele din
+        # cardurile respective sunt 0 pentru că query-ul a crăpat, nu pentru că nu e muncă;
+        # UI-ul afișează o bandă, ca zeroul să nu treacă drept realitate.
+        "warnings": warnings,
     }
+
+
+# ── INCHIDEREA RESTANTEI JUNK ────────────────────────────────────────────────────────────────
+# Predicatele de vechime, o singura data, ca endpoint-ul si migratia
+# (20260922_monitor_junk_close.sql) sa taie EXACT aceleasi randuri. `{op}` primeste `<` la
+# inchidere. Data de sosire = aceeasi expresie ca in monitor (P._EMAIL_START_SQL), cu rezerva pe
+# `fetched_at` / `first_synced_at` pentru randurile fara nicio data: predicatul de restanta e
+# `IS DISTINCT FROM CURRENT_DATE`, deci un rand nedatat cade MEREU la restanta — exact profilul
+# de junk, care altfel n-ar putea fi taiat niciodata.
+_JUNK_MAIL_AGE_SQL = r"""COALESCE(
+         CASE WHEN g.raw->'extra'->>'email_date' ~ '^\d{4}-\d\d-\d\d'
+              THEN (g.raw->'extra'->>'email_date')::timestamp AT TIME ZONE 'UTC' END,
+         (SELECT e2.received_at FROM emails e2 WHERE e2.id = g.email_id),
+         g.fetched_at
+       ) < CAST(:before AS timestamptz)"""
+_JUNK_TASK_AGE_SQL = ("COALESCE(t.cts_created_at, t.first_synced_at) "
+                      "< CAST(:before AS timestamptz)")
+
+
+@router.post("/productivity/monitor/close-backlog")
+def close_monitor_backlog(before: str = Query(..., description="YYYY-MM-DD — se inchide ce a intrat STRICT inainte"),
+                          kind: str = Query("all", description="all | mail | task"),
+                          dry_run: bool = Query(True),
+                          reason: Optional[str] = Query(None, max_length=120),
+                          db: Session = Depends(get_db), admin=Depends(require_prod_full)):
+    """Marcheaza ca INCHISE PENTRU MONITOR randurile deschise intrate inainte de `before`.
+
+    Junk-ul se reacumuleaza (CTS lasa tichete deschise la nesfarsit), deci taierea trebuie sa fie
+    repetabila fara migratie noua. Refoloseste exact predicatele migratiei
+    20260922_monitor_junk_close.sql.
+
+    ⚠️ `dry_run=true` e IMPLICIT: intoarce cate randuri s-ar inchide, fara sa scrie. O taiere prea
+    larga se anuleaza cu DELETE pe acelasi endpoint, dupa `reason` — de aceea `reason` se
+    persista pe fiecare rand si e obligatoriu sa fie distinctiv.
+
+    ⛔ NU scrie in `cts_status` / `status`: acelea sunt oglinda CTS si upsert-ul de sync le
+    suprascrie la fiecare rulare. Vezi nota din capul migratiei.
+    """
+    kind = (kind or "all").strip().lower()
+    if kind not in ("all", "mail", "task"):
+        raise HTTPException(status_code=400, detail="kind trebuie sa fie 'all', 'mail' sau 'task'.")
+    try:
+        d = _dt.date.fromisoformat((before or "").strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Parametrul 'before' invalid (format YYYY-MM-DD).")
+    if d > _dt.date.today():
+        raise HTTPException(status_code=400, detail="'before' nu poate fi in viitor.")
+    tag = (reason or f"junk_cutoff_{d.isoformat()}").strip()
+    # Miezul noptii LOCAL, nu UTC: „inainte de 1 septembrie" inseamna ora Bucurestiului, altfel
+    # ultimele 3 ore ale zilei de 31 august ar scapa de taiere (sau ar fi taiate in plus).
+    p = {"before": f"{d.isoformat()} 00:00:00+03", "tag": tag}
+
+    _MAIL_WHERE = f"""
+        WHERE g.monitor_closed_at IS NULL
+          AND g.cts_deleted_at IS NULL
+          AND lower(btrim(COALESCE(g.cts_status,''))) NOT IN ('solved','closed')
+          AND {_JUNK_MAIL_AGE_SQL}
+    """
+    _TASK_WHERE = f"""
+        WHERE t.monitor_closed_at IS NULL
+          AND lower(btrim(COALESCE(t.status,''))) NOT IN ('solved','closed')
+          AND {_JUNK_TASK_AGE_SQL}
+    """
+    out = {"before": d.isoformat(), "kind": kind, "dry_run": bool(dry_run), "reason": tag}
+    try:
+        if kind in ("all", "mail"):
+            if dry_run:
+                n = db.execute(text(f"SELECT count(*) FROM cts_ground_truth g {_MAIL_WHERE}"), p).scalar()
+                out["mail"] = {"ar_inchide": int(n or 0)}
+            else:
+                r = db.execute(text(
+                    f"UPDATE cts_ground_truth g SET monitor_closed_at = now(), "
+                    f"monitor_closed_reason = :tag {_MAIL_WHERE}"), p)
+                out["mail"] = {"inchise": int(r.rowcount or 0)}
+        if kind in ("all", "task"):
+            if dry_run:
+                n = db.execute(text(f"SELECT count(*) FROM cts_task_ground_truth t {_TASK_WHERE}"), p).scalar()
+                out["task"] = {"ar_inchide": int(n or 0)}
+            else:
+                r = db.execute(text(
+                    f"UPDATE cts_task_ground_truth t SET monitor_closed_at = now(), "
+                    f"monitor_closed_reason = :tag {_TASK_WHERE}"), p)
+                out["task"] = {"inchise": int(r.rowcount or 0)}
+        if not dry_run:
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("close_monitor_backlog")
+        raise HTTPException(status_code=500, detail="Eroare la inchiderea restantei: %s" % e)
+    return out
+
+
+@router.delete("/productivity/monitor/close-backlog")
+def reopen_monitor_backlog(reason: str = Query(..., max_length=120),
+                           db: Session = Depends(get_db), admin=Depends(require_prod_full)):
+    """Anuleaza o taiere, dupa eticheta ei. Plasa de siguranta daca `before` a fost prea larg.
+
+    Redeschide DOAR randurile marcate cu acel `reason` — o taiere ulterioara, cu alta eticheta,
+    ramane intacta. Randurile redevin vizibile in restanta imediat, la urmatorul poll de 15s.
+    """
+    tag = (reason or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="Parametrul 'reason' e obligatoriu.")
+    try:
+        m = db.execute(text("UPDATE cts_ground_truth SET monitor_closed_at = NULL, "
+                            "monitor_closed_reason = NULL WHERE monitor_closed_reason = :tag"),
+                       {"tag": tag})
+        k = db.execute(text("UPDATE cts_task_ground_truth SET monitor_closed_at = NULL, "
+                            "monitor_closed_reason = NULL WHERE monitor_closed_reason = :tag"),
+                       {"tag": tag})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("reopen_monitor_backlog")
+        raise HTTPException(status_code=500, detail="Eroare la redeschidere: %s" % e)
+    return {"reason": tag, "mail": {"redeschise": int(m.rowcount or 0)},
+            "task": {"redeschise": int(k.rowcount or 0)}}
+
+
+@router.get("/productivity/monitor/attribution-audit")
+def get_attribution_audit(group: str = Query("operational"),
+                          db: Session = Depends(get_db), admin=Depends(require_prod_full)):
+    """Restanta deschisa, numarata pe AMBELE reguli de atribuire, plus ce cade in afara grupului.
+
+    Exista ca sa nu se mai poata intampla ce s-a intamplat pe 2026-09-22: o regula de atribuire
+    divergenta, timp de saptamani, fara ca nimeni sa poata vedea cifra cu cifra ce se muta unde.
+    Nu e un instrument temporar de migrare — e contra-proba permanenta a regulii din
+    `productivity._LIVE_DEPT_EMAIL_SQL`.
+
+    Matricea `coada x efectiv`: diagonala = randurile pe care ambele reguli le pun la fel;
+    restul = exact randurile pe care vechea regula le atribuia gresit. `in_afara_grupului` sunt
+    randurile al caror departament efectiv nu e in `productivity_department_config` (mobilitate,
+    comercial, it...): corecte semantic, dar invizibile pe ORICE monitor — de urmarit, ca sa nu
+    devina o a doua gaura tacuta.
+    """
+    depts = _dashboard_depts(db, group)
+    out = {"group": group, "departamente_configurate": depts}
+
+    def _matrix(sql: str, label: str) -> list:
+        try:
+            return [{"dept_coada": r[0], "dept_efectiv": r[1], "n": int(r[2] or 0)}
+                    for r in db.execute(text(sql)).fetchall()]
+        except Exception as e:
+            logger.exception("attribution_audit [%s]", label)
+            out.setdefault("warnings", []).append({"scope": label, "error": str(e)[:200]})
+            return []
+
+    out["mail"] = _matrix(f"""
+        SELECT COALESCE(g.cts_department, '(fara coada)')  AS dept_coada,
+               COALESCE({_EFF_DEPT_EMAIL}, '(neatribuit)') AS dept_efectiv,
+               COUNT(*) AS n
+        FROM cts_ground_truth g
+        {_DEP_EMAIL_JOIN}
+        {_J_EMAIL_EXCL}
+        WHERE g.cts_deleted_at IS NULL
+          AND COALESCE(g.cts_direction,'received') = 'received'
+          AND {_EMAIL_EXCLUDE_SQL}
+          AND {_EMAIL_OPEN_STATES} AND {_EMAIL_BEFORE_TODAY}
+        GROUP BY 1, 2
+        ORDER BY 3 DESC
+    """, "mail")
+
+    out["task"] = _matrix(f"""
+        SELECT COALESCE(t.department, '(fara coada)')     AS dept_coada,
+               COALESCE({_EFF_DEPT_TASK}, '(neatribuit)') AS dept_efectiv,
+               COUNT(*) AS n
+        FROM {_SRC_TASK} t
+        {_DEP_TASK_JOIN}
+        WHERE {_TASK_OPEN_STATES} AND {_TASK_BEFORE_TODAY}
+        GROUP BY 1, 2
+        ORDER BY 3 DESC
+    """, "task")
+
+    # Sumarele care raspund direct la intrebarea „cat s-a mutat si unde".
+    _known = set(depts)
+    for kind in ("mail", "task"):
+        rows = out.get(kind) or []
+        out[kind + "_sumar"] = {
+            "total": sum(r["n"] for r in rows),
+            "pe_coada": _sum_by(rows, "dept_coada"),
+            "pe_efectiv": _sum_by(rows, "dept_efectiv"),
+            # Randurile pe care cele doua reguli le pun in departamente DIFERITE.
+            "mutate": sum(r["n"] for r in rows if r["dept_coada"] != r["dept_efectiv"]),
+            "in_afara_grupului": _sum_by(
+                [r for r in rows if r["dept_efectiv"] not in _known], "dept_efectiv"),
+        }
+    return out
+
+
+def _sum_by(rows: list, key: str) -> dict:
+    """Agregă rândurile matricei pe una dintre axe. Sortat descrescător, ca să se citească."""
+    acc = {}
+    for r in rows:
+        acc[r[key]] = acc.get(r[key], 0) + r["n"]
+    return dict(sorted(acc.items(), key=lambda kv: -kv[1]))
 
 
 @router.get("/productivity/dashboard/{group}")

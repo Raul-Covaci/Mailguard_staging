@@ -794,6 +794,46 @@ _EMPLOYED_AT_SQL = """EXISTS (SELECT 1 FROM employee_department_history h_e
                                  AND h_e.valid_from <= {day}
                                  AND (h_e.valid_to IS NULL OR h_e.valid_to > {day}))"""
 
+# ─────────── DEPARTAMENTUL EFECTIV AL UNUI RAND DESCHIS, IN VEDEREA „ACUM" ───────────
+#
+# ⚠️ NU confunda cu _DEPT_AT_SQL de mai sus. Sunt doua INTREBARI diferite, nu doua reguli pentru
+# aceeasi intrebare:
+#   _DEPT_AT_SQL      — „in ce departament era OMUL in luna raportata" (istoric,
+#                        employee_department_history). Rapoarte, scoruri, analitice.
+#   _LIVE_DEPT_*_SQL  — „a cui e munca asta DESCHISA, acum". Monitorul live.
+# A le UNIFICA readuce bug-ul Ticus (promovare care muta retroactiv lunile trecute, 2026-09-11).
+# A le lasa sa raspunda DIFERIT l-a produs pe cel din 2026-09-22: monitorul atribuia pe COADA,
+# tot restul aplicatiei pe OM, iar Suport 1 arata 26 de restante din care majoritatea erau
+# mailuri de recuperare TVA ale unei colege din alt departament, parcate pe coada suport_1.
+#
+# REGULA: OMUL ASIGNAT INTAI, COADA CA REZERVA.
+#   1. tichet luat de un angajat ACTIV -> departamentul LUI. CTS parcheaza tichete pe coada altui
+#      departament (suport_1 e catch-all-ul documentat — department_classifier.FALLBACK), dar
+#      munca e a omului care o face. Exact ce fac deja _fetch_email_rows / _fetch_task_rows
+#      pentru scoruri, deci monitorul si raportul nu mai pot raspunde diferit.
+#   2. altfel -> coada CTS. Pastreaza fixul din 2026-08-06: 40% din mailurile 'new' n-au assignee,
+#      iar un INNER JOIN le-ar face sa dispara din monitor. Vezi
+#      migrations/20260806_cts_department_backfill.sql.
+#   3. `enabled` conteaza: tichetul unui om plecat din firma cade pe coada, adica exact acolo unde
+#      trebuie sa-l ia altcineva. E o vedere „acum", deci `enabled` e legitim aici — vezi nota din
+#      CLAUDE.md, sectiunea ISTORIC DEPARTAMENT (in caile ISTORICE nu se filtreaza pe `enabled`).
+#
+# `{e}` = aliasul lui employee_department_mapping, `{g}` = al lui cts_ground_truth,
+# `{t}` = al lui cts_task_ground_truth in query-ul gazda.
+_LIVE_DEPT_EMAIL_JOIN = """
+        LEFT JOIN employee_department_mapping {e}
+          ON lower({g}.cts_assignee_email) = lower({e}.email)
+"""
+_LIVE_DEPT_EMAIL_SQL = ("COALESCE(CASE WHEN {e}.enabled THEN {e}.department END, "
+                        "{g}.cts_department)")
+
+_LIVE_DEPT_TASK_JOIN = """
+        LEFT JOIN employee_department_mapping {e}
+          ON {t}.assignee_employee_id = {e}.id
+"""
+_LIVE_DEPT_TASK_SQL = ("COALESCE(CASE WHEN {e}.enabled THEN {e}.department END, "
+                       "{t}.department)")
+
 
 def _iris_int(val) -> Optional[int]:
     """`employee_department_mapping.iris_id` e TEXT — un rand cu valoare ne-numerica (import
