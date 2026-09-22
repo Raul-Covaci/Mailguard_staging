@@ -1,10 +1,19 @@
 """CTS auto-solved — reguli deterministe pentru mailuri automate care pot pleca
 direct marcate SOLVED spre CTS (feed: campul `mark_as_solved`).
 
-O regula = {senders: [...], subject_contains: [...]}. Se potriveste daca expeditorul e
-in `senders` (lowercase; match exact pe adresa SAU pe domeniu cu cheia '@domeniu') SI
-(subject_contains gol => orice subiect; altfel vreun substring se regaseste in subiect,
-case-insensitive). Built-in + override din settings['cts.auto_solved_rules'] (fail-safe la built-in).
+O regula = {senders: [...], subject_contains: [...], subject_not_contains: [...]}. Se potriveste
+daca expeditorul e in `senders` (lowercase; adresa exacta SAU cheia '@domeniu' — domeniul
+expeditorului sau orice domeniu-parinte, `spam_detector.sender_scopes`, deci '@akcenta.eu'
+prinde si 'info@email.akcenta.eu') SI (subject_contains gol => orice subiect; altfel vreun
+substring se regaseste in subiect) SI niciun substring din `subject_not_contains` nu apare in
+subiect. Totul case-insensitive.
+
+⚠️ `subject_not_contains` e EXCEPTIA, si e evaluata ULTIMA: regula „tot de la expeditorul X
+pleaca SOLVED, in afara de mailurile Y" (Akcenta, 2026-09-22 — „Decontarea nr." si
+„Confirmarea nr." trebuie lucrate de om, deci pleaca ca NEW). Fara ea ar trebui enumerate toate
+subiectele care SE marcheaza — imposibil pentru un expeditor care trimite orice.
+
+Built-in + override din settings['cts.auto_solved_rules'] (fail-safe la built-in).
 
 Folosit de feed-ul CTS (get_emails -> mark_as_solved per mail) si de ack (update_emails ->
 persistare emails.cts_mark_solved pe ce a plecat efectiv ca solved). `matches` e o functie PURA
@@ -15,6 +24,8 @@ from typing import Optional, List, Dict, Any
 
 from sqlalchemy import text
 from app.database import SessionLocal
+# Sursa UNICA pentru „adresa + domeniu + domenii-parinte" (aceeasi folosita de sender_block).
+from app.services.spam_detector import sender_scopes
 
 logger = logging.getLogger("mailguard.cts_auto_solved")
 
@@ -32,6 +43,12 @@ _DEFAULT_RULES: List[Dict[str, Any]] = [
     {"senders": ["notificari@euplatesc.ro", "mis.batch@btrl.ro", "notificari@europayment.services",
                  "decontari@europayment.services"],
      "subject_contains": ["Tranzactii zilnice", "Tranzactii ecomm", "Decontari EuPlatesc -", "Factura EuPlatesc -"]},
+    # AKCENTA (2026-09-22): tot ce vine de pe domeniu (inclusiv subdomeniile de trimitere, ex.
+    # info@email.akcenta.eu) pleaca SOLVED — sunt notificari/marketing pe care nu le lucreaza
+    # nimeni. EXCEPTIE: „Decontarea nr." si „Confirmarea nr." sunt documente contabile reale,
+    # trebuie sa ajunga NEW in CTS. Vezi migratia 20260922b_akcenta_unblock_auto_solved.sql.
+    {"senders": ["@akcenta.eu"], "subject_contains": [],
+     "subject_not_contains": ["decontarea nr", "confirmarea nr"]},
 ]
 
 
@@ -46,9 +63,10 @@ def _normalize(rules) -> List[Dict[str, Any]]:
             continue
         senders = [str(s).strip().lower() for s in (r.get("senders") or []) if str(s).strip()]
         subs = [str(s).strip().lower() for s in (r.get("subject_contains") or []) if str(s).strip()]
+        nots = [str(s).strip().lower() for s in (r.get("subject_not_contains") or []) if str(s).strip()]
         if not senders:
             continue
-        out.append({"senders": senders, "subject_contains": subs})
+        out.append({"senders": senders, "subject_contains": subs, "subject_not_contains": nots})
     return out
 
 
@@ -76,26 +94,35 @@ def load_rules(db=None) -> List[Dict[str, Any]]:
 
 
 def _sender_match(fa: str, senders: List[str]) -> bool:
+    """Adresa exacta SAU '@domeniu' — domeniul expeditorului ori oricare domeniu-parinte.
+
+    Domeniile-parinte vin din `sender_scopes` (aceeasi sursa ca `sender_block`): o cheie
+    '@akcenta.eu' prinde si 'info@email.akcenta.eu'. TLD-ul singur ('@eu') e exclus acolo,
+    deci o cheie de tip TLD nu poate marca tot traficul.
+    """
     if fa in senders:
         return True
-    if "@" in fa:
-        return ("@" + fa.split("@", 1)[1]) in senders
-    return False
+    addr, doms = sender_scopes(fa)
+    return any(("@" + d) in senders for d in doms)
+
+
+def _rule_hit(fa: str, subj: str, r: Dict[str, Any]) -> bool:
+    """Un rand (expeditor, subiect deja lowercase) se potriveste regulii `r`.
+
+    Sursa UNICA a potrivirii — `matches` si `match_label` o refolosesc, ca eticheta de log sa
+    nu poata diverge de decizia reala.
+    """
+    if not _sender_match(fa, r.get("senders") or []):
+        return False
+    if any(nc in subj for nc in (r.get("subject_not_contains") or [])):
+        return False       # exceptia bate includerea
+    subs = r.get("subject_contains") or []
+    return (not subs) or any(sc in subj for sc in subs)
 
 
 def matches(from_address: Optional[str], subject: Optional[str], rules: List[Dict[str, Any]]) -> bool:
     """True daca (from_address, subject) se potriveste vreunei reguli. Functie PURA (fara DB)."""
-    fa = (from_address or "").strip().lower()
-    if not fa or not rules:
-        return False
-    subj = (subject or "").lower()
-    for r in rules:
-        if not _sender_match(fa, r.get("senders") or []):
-            continue
-        subs = r.get("subject_contains") or []
-        if not subs or any(sc in subj for sc in subs):
-            return True
-    return False
+    return match_label(from_address, subject, rules) is not None
 
 
 def match_label(from_address: Optional[str], subject: Optional[str], rules: List[Dict[str, Any]]) -> Optional[str]:
@@ -105,9 +132,6 @@ def match_label(from_address: Optional[str], subject: Optional[str], rules: List
         return None
     subj = (subject or "").lower()
     for r in rules:
-        if not _sender_match(fa, r.get("senders") or []):
-            continue
-        subs = r.get("subject_contains") or []
-        if not subs or any(sc in subj for sc in subs):
+        if _rule_hit(fa, subj, r):
             return (r.get("senders") or ["?"])[0]
     return None

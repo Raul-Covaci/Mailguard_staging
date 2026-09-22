@@ -8,6 +8,45 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.26.0 - 2026-09-22
+
+### MINOR — Akcenta iese din blacklist: tot spre CTS, aproape tot marcat SOLVED
+
+Cerere business (Raul Covaci): blocarea totală a expeditorului, decisă pe 2026-09-11, era prea
+dură. Mailurile de tip **„Decontarea nr. …"** și **„Confirmarea nr. …"** sunt documente contabile
+reale și trebuie lucrate de Contabilitate; restul (notificări, marketing, „CURSURI MATINALE")
+n-are cine le lucra, dar nici nu deranjează pe nimeni dacă ajunge în CTS deja închis.
+
+Regula nouă:
+
+- **Nimic de la `akcenta.eu` (inclusiv subdomeniile de trimitere) nu se mai oprește ca spam.**
+- „Decontarea nr." / „Confirmarea nr." → flux normal, tichet **New**, departament
+  **Contabilitate**.
+- Orice alt mail Akcenta → tot pleacă spre CTS, dar cu `mark_as_solved`, deci tichet **Solved**.
+
+**Regula generală „blacklist-ul bate orice" rămâne NEATINSĂ** — s-a schimbat doar apartenența
+expeditorului: intrările Akcenta ies din blacklist-ul manual și din blocklist-ul de reputație, iar
+domeniul intră pe allowlist (altfel scoringul de bulk l-ar fi oprit oricum la primul newsletter).
+
+**Auto-SOLVED cu excepții** (`app/services/cts_auto_solved.py`):
+
+- Câmp nou de regulă, `subject_not_contains` — evaluat ULTIMUL, bate `subject_contains`. Fără el
+  regula nici nu se putea scrie: ar fi cerut enumerarea tuturor subiectelor care SE marchează,
+  imposibil pentru un expeditor care trimite orice.
+- Potrivirea pe expeditor acceptă acum și **domeniile-părinte** (`spam_detector.sender_scopes`),
+  deci cheia `@akcenta.eu` prinde `info@email.akcenta.eu`. Regulile existente, toate pe adrese
+  exacte, nu-și schimbă comportamentul.
+- `matches()` și `match_label()` folosesc aceeași funcție `_rule_hit()`, ca eticheta din log să nu
+  poată diverge de decizia reală.
+
+**Migrație** `migrations/20260922b_akcenta_unblock_auto_solved.sql`: scoaterea din blacklist
+(manual + reputație), allowlist pe domeniu, whitelist manual (domeniu **și** cele două cutii —
+`sender_lists.add_entry` verifică conflictul pe cheie exactă, deci doar domeniul n-ar opri
+`cts_spam_sync` să re-blocheze adresa), regula auto-SOLVED, regula de departament `akcenta-01`,
+plus eliberarea retroactivă a mailurilor Akcenta oprite și **netrimise încă** la CTS (carantină
+fără blocaje hard → clean, `override=FALSE`, înapoi pe `queued_general`). Cele deja plecate la CTS
+nu se ating.
+
 ## v3.25.0 - 2026-09-22
 
 ### MINOR — Monitor operațional: atribuirea pe OMUL asignat + închiderea restanței junk

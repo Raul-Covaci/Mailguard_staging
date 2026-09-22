@@ -332,6 +332,42 @@ intrarea din blacklist n-a putut fi scrisă. Nu scoate reputația din `sender_bl
 
 ⚠️ `BLOCKED_SQL` (predicatul din feed) e oglinda lui `sender_block.match()` — se schimbă ÎMPREUNĂ.
 
+⚠️ **Akcenta NU mai e pe blacklist din 2026-09-22** (`migrations/20260922b_akcenta_unblock_auto_solved.sql`).
+Regula generală de mai sus rămâne neatinsă — s-a schimbat doar apartenența expeditorului. Vezi
+secțiunea următoare: acum trece integral spre CTS, aproape tot marcat SOLVED.
+
+---
+
+## ✅ AUTO-SOLVED SPRE CTS — regula e „tot, în afară de" (Akcenta, 2026-09-22)
+
+`app/services/cts_auto_solved.py` decide câmpul `mark_as_solved` din feed: un mail livrat cu el
+deschide în CTS un tichet deja **Solved**, deci nu intră în coada nimănui. O regulă =
+`{senders, subject_contains, subject_not_contains}`.
+
+**Akcenta** (`info@akcenta.eu`, `info@email.akcenta.eu`): TOT trece spre CTS, nimic nu se mai
+oprește ca spam. Marcat SOLVED implicit; **excepție** subiectele „Decontarea nr. …" și
+„Confirmarea nr. …", care pleacă NEW — sunt documente contabile reale, le lucrează
+Contabilitatea (regulă de departament `akcenta-01`). Decizie Raul Covaci, 2026-09-22.
+
+⚠️ **`subject_not_contains` bate `subject_contains`** și e motivul pentru care regula se poate
+scrie deloc: enumerarea subiectelor care SE marchează e imposibilă pentru un expeditor care
+trimite orice. `_rule_hit()` e sursa unică — `matches()` și `match_label()` o refolosesc, ca
+eticheta din log să nu poată diverge de decizia reală.
+
+⚠️ **Potrivirea pe expeditor include domeniile-părinte** (`spam_detector.sender_scopes`), deci
+cheia `@akcenta.eu` prinde și `info@email.akcenta.eu`. Boundary strict: `evilakcenta.eu` nu
+potrivește. Înainte era egalitate exactă pe `@domeniu` — regulile vechi, toate pe adrese exacte,
+nu-și schimbă comportamentul.
+
+⚠️ **Două surse, de ținut în oglindă**: `_DEFAULT_RULES` din cod (fail-safe) și
+`settings['cts.auto_solved_rules']` (bate codul; `[]` = kill-switch). Nu există UI de editare a
+lor — modificarea durabilă se face în fișier + migrație.
+
+⚠️ **Whitelist-ul manual e ce ține Akcenta deblocat.** `cts_spam_sync` re-adaugă în blacklist
+orice adresă din lista de spam a CTS; `sender_lists.add_entry` refuză o valoare aflată în lista
+opusă, dar **pe cheie exactă, nu pe domeniu** — de aceea în whitelist stau și cele două cutii, nu
+doar `akcenta.eu`. O adresă Akcenta nouă care ajunge în lista CTS poate fi re-blocată.
+
 ---
 
 ## 📎 ATAȘAMENTE O365 — HEIC se convertește la JPEG la ingest (2026-09-18)
@@ -1249,7 +1285,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.15.0` (staging, 2026-09-10)
+**Versiunea curentă:** `v3.26.0` (staging, 2026-09-22)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:
