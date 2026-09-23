@@ -5,6 +5,7 @@ oricând noi tipuri de întrebări AI). La prima rulare, seeding automat din SEE
 Scoring-ul rulează batch nocturn via score_batch().
 """
 import json
+import re
 import logging
 import os as _os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -307,6 +308,93 @@ def _build_transcript(call_row) -> str:
     return text_out[:_MAX_TRANSCRIPT_CHARS]
 
 
+def _salvage_json(raw: str) -> Optional[dict]:
+    """Recupereaza un obiect JSON dintr-un raspuns de model imperfect. None daca nu se poate.
+
+    Doua defecte reale, ambele observate in productie (2026-09-23, promptul `agentulSaPrezentat`,
+    ~3-4 WARNING/minut):
+      1. GHILIMELE NESCAPATE intr-o valoare. Sase prompturi cer un CITAT exact ("evidence must
+         quote the exact phrase"), iar modelul citeaza natural cu ": {"evidence": "a spus "Buna
+         ziua" la inceput"} — a doua ghilimea inchide string-ul si parserul cere o virgula
+         (`Expecting ',' delimiter`). NU diacriticele sau virgulele sunt problema: un string JSON
+         valid le accepta.
+      2. RASPUNS TRUNCHIAT la max_tokens — obiectul se termina brusc.
+    """
+    if not raw or not raw.strip():
+        return None
+    s = raw.strip()
+    if s.startswith("```"):                       # gard de cod markdown
+        s = s.split("```")[1] if len(s.split("```")) > 1 else s
+        s = s[4:] if s.lower().startswith("json") else s
+    i, j = s.find("{"), s.rfind("}")
+    if i < 0:
+        return None
+    candidate = s[i:j + 1] if j > i else s[i:]
+    try:
+        out = json.loads(candidate)
+        return out if isinstance(out, dict) else None
+    except Exception:
+        pass
+
+    # Defectul 1: rescrie valorile de string escapand ghilimelele interioare. Parcurgem caracter
+    # cu caracter; o ghilimea inchide valoarea doar daca urmeaza (dupa spatii) `,` `}` sau `:`.
+    out_chars, in_str, escaped, depth = [], False, False, 0
+    for pos, ch in enumerate(candidate):
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+            out_chars.append(ch)
+            continue
+        if escaped:
+            out_chars.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out_chars.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            # O ghilimea inchide valoarea doar daca URMEAZA structura JSON: `:` (era o cheie),
+            # `}`/`]` (sfarsit de obiect) sau `,` urmata de o CHEIE noua (`"nume":`). Un citat
+            # terminat cu virgula — `a zis doar "Alo", fara nume` — nu inchide nimic, iar un
+            # test naiv pe caracterul urmator l-ar rupe exact aici.
+            rest = candidate[pos + 1:].lstrip()
+            if rest[:1] in (":", "}", "]") or not rest:
+                closes = True
+            elif rest[:1] == ",":
+                closes = re.match(r',\s*"[^"]{1,80}"\s*:', rest) is not None
+            else:
+                closes = False
+            if closes:
+                in_str = False
+                out_chars.append(ch)
+            else:
+                out_chars.append('\\"')       # ghilimea din interiorul citatului
+            continue
+        out_chars.append(ch)
+    repaired = "".join(out_chars)
+    try:
+        out = json.loads(repaired)
+        if isinstance(out, dict):
+            return out
+    except Exception:
+        pass
+
+    # Defectul 2: obiect trunchiat — inchide string-ul/parantezele ramase deschise.
+    if in_str:
+        repaired += '"'
+    repaired += "}" * max(0, depth)
+    try:
+        out = json.loads(repaired)
+        return out if isinstance(out, dict) else None
+    except Exception:
+        return None
+
+
 def _run_one_prompt(key: str, prompt_text: str, transcript: str, output_type: str = "json") -> tuple[str, Any]:
     """Rulează un singur prompt pe transcript. Returnează (key, parsed_result sau text)."""
     is_text = output_type == "text"
@@ -320,15 +408,30 @@ def _run_one_prompt(key: str, prompt_text: str, transcript: str, output_type: st
         task=f"call_score_{key}",
         no_cache=True,
     )
-    if not res.get("ok"):
-        logger.warning("call_scorer prompt %s failed: %s", key, res.get("error"))
-        return key, None
     if is_text:
+        if not res.get("ok"):
+            logger.warning("call_scorer prompt %s failed: %s", key, res.get("error"))
+            return key, None
         return key, res.get("text") or res.get("raw_text") or res.get("content")
-    if not res.get("parsed"):
-        logger.warning("call_scorer prompt %s failed: %s", key, res.get("error"))
-        return key, None
-    return key, res["parsed"]
+
+    parsed = res.get("parsed") if res.get("ok") else None
+    if isinstance(parsed, dict):
+        return key, parsed
+
+    # JSON invalid sau apel esuat: incearca recuperarea din textul brut inainte de a arunca
+    # rezultatul (tiparul din satisfaction_engine._iris_call). Cazuri reale: ghilimele nescapate
+    # intr-un citat cerut de prompt ("evidence") si raspuns taiat la max_tokens.
+    err = res.get("error") or {}
+    raw = err.get("raw_text") or res.get("text") or res.get("raw_text") or ""
+    salvaged = _salvage_json(raw)
+    if isinstance(salvaged, dict):
+        logger.warning("call_scorer prompt %s: JSON invalid (code=%s) — recuperat din raw_text",
+                       key, err.get("code"))
+        return key, salvaged
+    logger.warning("call_scorer prompt %s failed: code=%s msg=%s raw=%.200s",
+                   key, err.get("code"), str(err.get("message") or "")[:120],
+                   (raw or "").replace("\n", " "))
+    return key, None
 
 
 def _avg(*vals) -> Optional[float]:

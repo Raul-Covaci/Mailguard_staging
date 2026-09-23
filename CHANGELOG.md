@@ -8,6 +8,39 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.29.0 - 2026-09-23
+
+### MINOR — scorarea apelurilor nu mai pierde răspunsul când modelul citează cu ghilimele
+
+Watchdog-ul de producție a raportat pe 2026-09-23, 08:41, „erori critice în loguri": ~3-4
+WARNING/minut din `mailguard.call_scorer`, promptul `agentulSaPrezentat`, `JSON_PARSE_ERROR —
+Expecting ',' delimiter`. Toate erau WARNING, pipeline-ul de apeluri rula normal
+(`transcribe/classify/diarize` → `errors: 0`), dar întrebarea binară rămânea necompletată la
+fiecare apel.
+
+⚠️ **Cauza NU erau virgulele sau diacriticele** (prima ipoteză, infirmată): un string JSON valid le
+acceptă fără probleme. Cauza reală sunt **ghilimelele duble nescapate**, cerute chiar de prompt:
+`"evidence" must quote the exact opening line`. Modelul citează firesc cu `"` —
+`{"evidence": "a spus "Bună ziua" la început"}` — iar a doua ghilimea închide string-ul prematur.
+De asta eșua doar `agentulSaPrezentat`: e cel mai des pus în situația de a cita o deschidere de apel.
+
+**Problema era latentă în ȘASE prompturi**, nu doar în cel care a lovit-o: `agentulSaPrezentat`,
+`clientulAmintaRenuntare`, `clientulAmintaJudecata`, `clientulContactatAnterior`,
+`masiniCareNuTransmit`, `issueResolution` — toate cer un citat exact, niciunul nu avea vreo regulă
+despre ghilimele. Toate șase au primit acum instrucțiunea de a folosi «…» în loc de `"`.
+
+A doua apărare, în cod: `call_scorer._run_one_prompt` arunca rezultatul la orice eșec de parsare
+(`return key, None`), deși `satisfaction_engine` și `ai_department` au de mult recuperare din
+`raw_text` pentru exact acest caz. Noul `_salvage_json()` repară ghilimelele interioare (o ghilimea
+închide valoarea doar dacă urmează `:`/`}`/`]` sau `,` + o cheie nouă — un citat terminat în virgulă
+NU închide nimic), taie gardurile markdown și închide obiectele trunchiate la `max_tokens`. La eșec
+real se loghează acum și `raw_text` (200 car.) — până acum eroarea se pierdea fără urmă.
+
+⚠️ Prompturile din `app/services/prompts/calls/` sunt sursa de adevăr, iar tabela
+`call_scoring_prompts` e doar cache: după deploy trebuie rulat
+`venv/bin/python3 scripts/sync_call_prompts.py`, altfel modelul primește în continuare textul vechi
+și fixul de prompt nu are efect (recuperarea din cod funcționează oricum).
+
 ## v3.28.0 - 2026-09-23
 
 ### MINOR — `cts_api_log` nu mai înghite baza de date (18 GB din 22 GB pe producție)

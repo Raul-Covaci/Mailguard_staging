@@ -22,6 +22,9 @@ IMPORTANT NUANCE: the distinguishing element is the SILENCE, not the dissatisfac
 - Respond only in Romanian and strictly in JSON format, without any additional comments or observations.
 - Judge ONLY the customer's words.
 - "evidence" must quote the exact phrase that decided the answer.
+- Inside JSON string values, never use the double-quote character ("). To mark a quotation, use
+  Romanian guillemets «...» or no marks at all. A raw " inside a value breaks the JSON and the
+  whole answer is discarded.
 -------------------------------
 {
   "result": "<true daca clientul spune ca a contactat anterior compania pe aceeasi tema si nu a primit niciun raspuns, false in rest>",

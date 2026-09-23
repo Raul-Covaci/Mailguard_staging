@@ -65,6 +65,9 @@ Poor solution/handling includes:
 ✗ Customer finding solution, not agent
 -------------------------------
 - Provide your response strictly in Romanian and in JSON format as shown. Do not include any additional comments or observations.
+- Inside JSON string values, never use the double-quote character ("). To mark a quotation, use
+  Romanian guillemets «...» or no marks at all. A raw " inside a value breaks the JSON and the
+  whole answer is discarded.
 - Be HONEST about whether problem was truly solved - don't be generous
 - Do NOT treat an out-of-scope request as a resolution failure just because the company couldn't act on it - judge the quality of the explanation instead
 - "mainProblem": Offer a concise but complete summary (50-100 words) that captures the core issue
