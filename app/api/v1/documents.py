@@ -2203,6 +2203,84 @@ def _save_extraction(db, att, status, category=None, detected_type=None, documen
     return status
 
 
+def _group_candidate(db, att, is_image: bool) -> bool:
+    """Merita amanat discard-ul ca sa incerce autogruparea? DOAR imagini din emailuri cu >=2 imagini.
+
+    `_autogroup_holistic` lucreaza exclusiv pe `content_type LIKE 'image/%'` si iese la <2 randuri,
+    deci pentru un email cu o singura poza amanarea n-ar schimba nimic — doar ar intarzia discard-ul.
+    """
+    if not is_image:
+        return False
+    try:
+        n = db.execute(text(
+            "SELECT count(*) FROM attachments "
+            " WHERE email_id = :eid AND NOT COALESCE(doc_discarded, false) "
+            "   AND lower(COALESCE(content_type,'')) LIKE 'image/%'"),
+            {"eid": att.get("email_id")}).scalar()
+        return int(n or 0) >= 2
+    except Exception:
+        logger.warning("group_candidate: numarare imagini esuata email=%s", att.get("email_id"),
+                       exc_info=True)
+        return False
+
+
+def _defer_for_grouping(db, att, reason: str = None, raw_text: str = None,
+                        confidence=None, detected_type: str = None) -> str:
+    """Amana discard-ul unei IMAGINI pana dupa autogrupare, ca sa poata fi revendicata ca pagina.
+
+    O pagina de MIJLOC a unui contract fotografiat (doar "ART. 6", clauze, fara titlu/numar) nu e
+    identificabila izolat, deci cade sub praguri si era aruncata INAINTE ca `_autogroup_holistic`
+    sa ruleze (drain: proceseaza tot, apoi grupeaza). Gruparea ramanea fara materie prima, desi
+    promptul ei trateaza explicit exact aceste pagini.
+
+    Randul se scrie `needs_review` + `pending_group=true`, fara tip: gruparea il vede (statusul e
+    in selectia ei) si il numara ca 'incert' la garda anti-supragrupare. `_sweep_pending_group`
+    arunca, dupa grupare, ce n-a fost revendicat — cu motivul original, pastrat in
+    `confidence_reason`. NU trece prin `_save_extraction`: un rand provizoriu nu trebuie sa declanseze
+    rename, validare de active sau tracking.
+    """
+    db.execute(text(
+        "INSERT INTO document_extractions "
+        "(email_id, attachment_id, part_no, status, detected_type, confidence, raw_text, "
+        " confidence_reason, pending_group, created_at, updated_at) "
+        "VALUES (:eid,:aid,0,'needs_review',:dt,:conf,:rt,:creason,true,now(),now()) "
+        "ON CONFLICT (attachment_id, part_no) DO UPDATE SET "
+        "  status='needs_review', document_type_id=NULL, detected_type=EXCLUDED.detected_type, "
+        "  confidence=EXCLUDED.confidence, raw_text=EXCLUDED.raw_text, "
+        "  confidence_reason=EXCLUDED.confidence_reason, pending_group=true, updated_at=now()"),
+        {"eid": att["email_id"], "aid": att["id"],
+         "dt": (detected_type or "")[:160] or None, "conf": confidence,
+         "rt": (raw_text or "")[:20000] or None, "creason": (reason or "")[:1000] or None})
+    db.commit()
+    return "pending_group"
+
+
+def _sweep_pending_group(db, email_id) -> int:
+    """Dupa autogrupare: arunca paginile provizorii pe care gruparea NU le-a revendicat.
+
+    Revendicata = `grouped_into IS NOT NULL` (membru) sau exista membri care arata spre ea (primar).
+    Restul reintra pe comportamentul vechi: discard cu motivul original din `confidence_reason`.
+    Fara pasul asta, un rand nerevendicat ar ramane agatat ca 'needs_review' in listele operatorului.
+    """
+    rows = [dict(r._mapping) for r in db.execute(text(
+        "SELECT d.id, d.attachment_id, d.email_id, d.confidence_reason "
+        "  FROM document_extractions d "
+        " WHERE d.email_id = :eid AND d.pending_group "
+        "   AND d.grouped_into IS NULL "
+        "   AND NOT EXISTS (SELECT 1 FROM document_extractions x WHERE x.grouped_into = d.id)"),
+        {"eid": email_id}).fetchall()]
+    for r in rows:
+        _discard_attachment(db, {"id": r["attachment_id"], "email_id": r["email_id"]},
+                            r.get("confidence_reason") or "necunoscut (auto-skip)")
+    if rows:
+        logger.info("pending_group sweep: email=%s aruncate=%d", email_id, len(rows))
+    # Randurile revendicate nu mai sunt provizorii: flagul se stinge ca sa nu fie re-maturate.
+    db.execute(text("UPDATE document_extractions SET pending_group=false, updated_at=now() "
+                    "WHERE email_id = :eid AND pending_group"), {"eid": email_id})
+    db.commit()
+    return len(rows)
+
+
 def _discard_attachment(db, att, reason: str = None) -> str:
     """Junk (logo/iconita, OP/factura, fara categorie, confidenta <50%, tip necunoscut):
     NU pastram rand in document_extractions (dispare automat din TOATE listele, care nu
@@ -3322,9 +3400,6 @@ def _process_attachment(db, att, force=False) -> str:
         if len(valid_tids) >= 2:
             return _process_multidoc(db, att, mdocs, path, mime, doc_text, catalog, cmodel)
     category = (cls.get("category") or "").strip() or None
-    if category not in ("vehicul", "sofer", "contract"):
-        return _discard_attachment(
-            db, att, (cls.get("reason") or "nu s-a putut incadra intr-o categorie cunoscuta"))
     try:
         conf = float(cls.get("confidence"))
     except Exception:
@@ -3334,21 +3409,32 @@ def _process_attachment(db, att, force=False) -> str:
     if tid not in tmap:
         tid = None
     creason = cls.get("reason")
+    # Cele patru porti de mai jos arunca un atasament pe motiv de TIP/CONFIDENTA. Pentru o imagine
+    # dintr-un email cu mai multe imagini, decizia se AMANA pana dupa autogrupare: o pagina de mijloc
+    # de contract e neidentificabila izolat, dar perfect identificabila in ansamblul paginilor.
+    _defer = _group_candidate(db, att, is_image)
+    _dt_hint = cls.get("type_name") or cls.get("detected_type")
+
+    def _reject(reason):
+        if _defer:
+            return _defer_for_grouping(db, att, reason=reason, raw_text=doc_text,
+                                       confidence=conf, detected_type=_dt_hint)
+        return _discard_attachment(db, att, reason)
+
+    if category not in ("vehicul", "sofer", "contract"):
+        return _reject(cls.get("reason") or "nu s-a putut incadra intr-o categorie cunoscuta")
     # Confidenta prea mica (<50%) = nu seamana clar cu niciun document -> junk -> discard.
     if conf is not None and conf < DOC_DISCARD_CONF_MIN:
-        return _discard_attachment(
-            db, att, "confidenta " + str(round(conf * 100)) + "% < 50% — " + (creason or "incert"))
+        return _reject("confidenta " + str(round(conf * 100)) + "% < 50% — " + (creason or "incert"))
     if not tid:
         # Categorie clara, dar NU corespunde niciunui tip din catalog -> junk (decizie user:
         # "sterge si necunoscut"). Recuperabil daca se defineste un tip nou + restore.
-        return _discard_attachment(
-            db, att, (creason or "categorie clara, dar tip necunoscut (nedefinit in catalog)"))
+        return _reject(creason or "categorie clara, dar tip necunoscut (nedefinit in catalog)")
     if conf is not None and conf < AUTO_CONF_MIN:
         # Pilot automat (Task user): sub incredere-efectiva "sigura" (85%) -> necunoscut -> discard,
         # nu se mai propaga spre verificare manuala (fara CLASSIFY_CONF_MIN separat — un singur prag).
-        return _discard_attachment(
-            db, att, "incredere clasificare " + str(round(conf * 100)) + "% < "
-            + str(round(AUTO_CONF_MIN * 100)) + "% — necunoscut (auto-skip)")
+        return _reject("incredere clasificare " + str(round(conf * 100)) + "% < "
+                       + str(round(AUTO_CONF_MIN * 100)) + "% — necunoscut (auto-skip)")
     # --- extragere conform tipului ---
     t = _get_type(db, tid)
     _eng = _doc_engine(db)
@@ -3613,6 +3699,17 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
                         _gpdb.close()
                 except Exception:
                     logger.exception("autogroup fata/verso pdf email %s failed", _eid_pdf)
+            # Paginile amanate pentru grupare (_defer_for_grouping): ce n-a fost revendicat de
+            # niciuna dintre grupari se arunca acum, cu motivul original. DUPA ambele grupari.
+            for _eid_pg in {r.get("email_id") for r in rows if r.get("email_id")}:
+                try:
+                    _pgdb = SessionLocal()
+                    try:
+                        _sweep_pending_group(_pgdb, _eid_pg)
+                    finally:
+                        _pgdb.close()
+                except Exception:
+                    logger.exception("pending_group sweep email %s failed", _eid_pg)
             # auto-dismiss pagini neidentificate din multi-doc (nu pot fi revizuite de operator)
             try:
                 db.execute(text(
@@ -4061,7 +4158,13 @@ def _autogroup_holistic(db, email_id):
                         "updated_at=now() WHERE id = ANY(:ids)"),
                    {"pid": primary, "ids": member_ids})
         db.commit()
-        st = _extract_group(db, primary)
+        # Primar fara tip (toate paginile erau incerte — cazul unui contract fotografiat, unde
+        # nicio pagina izolata nu e identificabila): reclasifica pe ANSAMBLUL grupului, ca PASS 2.
+        # `_extract_group` singur ar iesi devreme pe tip lipsa si grupul ar rimane netipizat.
+        if primary_row.get("document_type_id") is None:
+            st = _reclassify_group_primary(db, primary)
+        else:
+            st = _extract_group(db, primary)
         created += 1
         logger.info("autogroup holistic: email=%s primar=%s membri=%s tip=%s -> %s",
                     email_id, primary, member_ids, primary_row.get("detected_type"), st)

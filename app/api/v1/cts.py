@@ -611,6 +611,52 @@ def _doc_piece_bytes(path, ctype, part_bbox, page_from, page_to, category=None, 
         return None
 
 
+def _append_group_pages(db: Session, m: dict, primary_piece):
+    """Pentru un rand PRIMAR cu membri grupati: (bytes, mime) = PDF cu TOATE paginile grupului.
+
+    Randul primar e singurul care ajunge in feed (`grouped_into IS NULL`), deci paginile 2..N ale
+    unui contract fotografiat trebuie adaugate aici — altfel CTS primeste doar prima pagina.
+    Un rand fara membri se intoarce neschimbat (nicio interogare in plus peste cea de membri).
+    """
+    try:
+        members = db.execute(text(
+            "SELECT d.id, a.storage_path, a.content_type "
+            "  FROM document_extractions d JOIN attachments a ON a.id = d.attachment_id "
+            " WHERE d.grouped_into = :pid "
+            " ORDER BY a.name ASC, a.id ASC"), {"pid": m.get("id")}).fetchall()
+        if not members:
+            return primary_piece
+
+        pieces = [primary_piece]
+        for r in members:
+            mm = dict(r._mapping)
+            # Membrii sunt atasamente INTREGI (bbox/page-range apartin doar primarului, care poate
+            # fi o bucata dintr-un multi-doc) => fara part_bbox/page_from/page_to aici.
+            p = _doc_piece_bytes(_host_path(mm.get("storage_path")), mm.get("content_type"),
+                                 None, None, None,
+                                 category=(m.get("type_category") or m.get("category")),
+                                 att_id=None)
+            if p is None:
+                logger.warning("cts: pagina de grup indisponibila (ex_id=%s, primar=%s)",
+                               mm.get("id"), m.get("id"))
+                continue
+            pieces.append(p)
+
+        if len(pieces) < 2:
+            return primary_piece
+        from app.services.doc_group_pdf import build_group_pdf
+        gbytes, gmime = build_group_pdf(pieces)
+        if not gbytes:
+            return primary_piece
+        logger.info("cts: grup primar=%s -> PDF cu %d pagini-sursa (%d bytes)",
+                    m.get("id"), len(pieces), len(gbytes))
+        return gbytes, gmime
+    except Exception:
+        # Un grup problematic nu are voie sa blocheze livrarea documentului: cade pe prima pagina.
+        logger.exception("cts: concatenare grup esuata (primar=%s)", m.get("id"))
+        return primary_piece
+
+
 _EMISSION_MAP = {
     # text din document -> valoare int CTS (emission_class_list din CTS)
     "noneuro": 0, "non euro": 0, "non-euro": 0,
@@ -866,6 +912,11 @@ def cts_get_email_documents(request: Request,
                                      m.get("content_type"), part_bbox, pf, pt,
                                      category=(m.get("type_category") or m.get("category")),
                                      att_id=att_id)
+            # Grup de pagini (contract fotografiat pagina cu pagina): feed-ul selecteaza doar
+            # primarul (grouped_into IS NULL), deci fara pasul asta paginile 2..N nu ar urca
+            # NICIODATA pe contractul clientului. Le concatenam intr-un singur PDF.
+            if piece is not None:
+                piece = _append_group_pages(db, m, piece)
             if piece is None:
                 doc["file"] = None
                 missing.append(att_id)

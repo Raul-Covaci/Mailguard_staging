@@ -8,6 +8,49 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.27.0 - 2026-09-22
+
+### MINOR — contractul trimis ca 5 poze ajunge din nou UN singur PDF în CTS
+
+Raportat: un contract fotografiat pagină cu pagină (email #87959, 7 poze inline de la un client
+iCloud) nu se mai grupa într-un singur document. Gruparea nu era ruptă — **nu ajungea să ruleze**.
+
+- **Paginile erau aruncate înainte de grupare.** `_drain_doc_extractions` procesează toate
+  atașamentele, **apoi** grupează. `_process_attachment` clasifica fiecare poză IZOLAT și o arunca
+  definitiv (`doc_discarded=true`) sub `AUTO_CONF_MIN` (85%) / `DOC_DISCARD_CONF_MIN` (50%) sau cu
+  tip necunoscut. O pagină de mijloc de contract (doar „ART. 6", clauze, fără titlu sau număr) NU e
+  identificabilă izolat — modelul chiar scria asta în motive: *„pagina partiala"*, *„fara a
+  identifica tipul exact"*. Din 7 poze, 6 erau aruncate; `document_extractions` rămânea GOL, iar
+  `_autogroup_holistic` ieșea pe `len(rows) < 2`. Ironia: garda lui anti-supragrupare cere să existe
+  măcar o imagine INCERTĂ — exact paginile măturate în amonte.
+- **Fix:** pentru o imagine dintr-un email cu ≥2 imagini, cele patru porți de tip/confidență nu mai
+  arunca — amână (`_defer_for_grouping`: rând `needs_review` + `pending_group=true`, fără tip, cu
+  motivul păstrat în `confidence_reason`). Gruparea le vede și le poate revendica.
+  `_sweep_pending_group` rulează DUPĂ ambele grupări și aruncă ce n-a fost revendicat, cu motivul
+  original — comportamentul vechi, doar amânat. Porțile de fișier corupt/arhivă/SVG/imagine mică
+  rămân neatinse (nu sunt despre identificare).
+- **Primar fără tip se reclasifică pe ansamblu.** Când toate paginile erau incerte, primarul rămânea
+  netipizat și `_extract_group` ieșea devreme. Calea holistică folosește acum
+  `_reclassify_group_primary` în acel caz, ca PASS 2.
+
+⛔ Al doilea defect, independent, care s-ar fi văzut imediat după primul: **nu exista nicio
+concatenare PDF.** `_extract_group` combina doar TEXTUL, iar feed-ul CTS selectează exclusiv rândul
+primar (`grouped_into IS NULL`) și îi trimitea un singur `storage_path` — deci CTS primea **doar
+pagina 1**, oricât de corectă ar fi fost gruparea.
+
+- Modul nou `app/services/doc_group_pdf.py` → `build_group_pdf()`: concatenează paginile grupului
+  (PyMuPDF, deja în `requirements.txt`). Tolerant la o pagină coruptă (o sare, restul ajung la CTS),
+  plafon 14 MB, un singur fișier trece neschimbat.
+- `cts.py` → `_append_group_pages()`, apelat la construirea `doc["file"]`: dacă primarul are membri,
+  CTS primește PDF-ul cu toate paginile. Ordinea paginilor = `a.name ASC` (cum le numerotează
+  telefonul). Membrii se adaugă ca atașamente ÎNTREGI — `part_bbox`/`page_from`/`page_to` aparțin
+  doar primarului, care poate fi o bucată dintr-un multi-doc.
+
+Migrație: `20260922_doc_pending_group.sql` (aditivă, idempotentă — coloană `pending_group` + index
+parțial). Mailurile deja procesate NU se reprocesează: plafonul dur de 1 zi din `doc_window` rămâne
+neschimbat, deci #87959 nu se recuperează automat (cele 6 rânduri aruncate rămân recuperabile prin
+`restore-discarded`).
+
 ## v3.26.0 - 2026-09-22
 
 ### MINOR — Akcenta iese din blacklist: tot spre CTS, aproape tot marcat SOLVED
