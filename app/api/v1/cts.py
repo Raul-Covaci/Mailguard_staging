@@ -286,8 +286,21 @@ def _to_graph_message(r: dict, atts: list, send_flags: dict | None = None,
     return msg
 
 
+# Actiuni de POLLING: CTS le apeleaza continuu, iar marea majoritate a apelurilor nu au ce livra.
+# Un rand per apel gol a facut din cts_api_log 81% din baza de productie (18 GB din 22 GB, 2026-09-23),
+# pana la a rupe backup-ul pre-release prin timeout. Un "CTS a intrebat si n-avea nimic" nu e informatie:
+# se logheaza doar apelurile care chiar au livrat ceva, cele cu eroare si toate celelalte actiuni.
+_POLL_ACTIONS = ("get_email_documents", "get_emails")
+
+
 def _log(db: Session, action: str, ids: list, requested: int, success: int,
-         total: int, http_status: int, remote_ip, summary: str, response_meta: dict):
+         total: int, http_status: int, remote_ip, summary: str, response_meta: dict,
+         force_log: bool = False):
+    # `total` = cate au fost efectiv livrate. Criteriul e ASTA, nu `ids`: feed-ul de documente
+    # trimite mereu id_email-ul interogat, deci un filtru pe `ids` n-ar prinde nimic. Erorile
+    # (http != 200) se pastreaza intotdeauna, oricat de goale ar fi.
+    if not force_log and action in _POLL_ACTIONS and not total and int(http_status or 200) == 200:
+        return
     try:
         db.execute(text("""
             INSERT INTO cts_api_log(action, email_ids, requested, success, total,
@@ -772,10 +785,13 @@ def cts_get_email_documents(request: Request,
     # Switch UI: send_documente OFF → canal dezactivat (indiferent de mediu)
     _doc_flags = _get_cts_send_flags(db)
     if not _doc_flags.get("send_documente", True):
+        # `force_log`: total=0, dar e o stare de CONFIGURARE (canal inchis din UI), nu un poll gol —
+        # trebuie sa se vada in jurnal, altfel "de ce nu primeste CTS documente?" nu are raspuns.
         _log(db, "get_email_documents", [id_email], requested=1, success=1, total=0,
              http_status=200, remote_ip=_client_ip(request),
              summary="doc-feed dezactivat prin switch UI",
-             response_meta={"id_email": id_email, "flag": "send_documente=false"})
+             response_meta={"id_email": id_email, "flag": "send_documente=false"},
+             force_log=True)
         return {"id_email": id_email, "status": "disabled",
                 "note": "Canalul de documente este dezactivat din setări.",
                 "documents": []}

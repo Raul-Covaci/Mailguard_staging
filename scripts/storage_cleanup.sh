@@ -171,6 +171,36 @@ else
     log "  document_extractions: $DOC_DELETED rânduri șterse"
 fi
 
+# ── 4. CTS_API_LOG — apeluri de polling fără rezultat, mai vechi de 7 zile ──
+# CTS interoghează continuu feed-ul; apelurile care n-au ce livra nu sunt informație. Pe producție
+# tabela ajunsese 18 GB din 22 GB (2026-09-23) și rupea backup-ul pre-release prin timeout.
+# Din v3.28.0 apelurile goale nu se mai scriu (`cts._log`); pasul ăsta ține în frâu ce mai intră
+# (erori repetate, instalări cu cod vechi) și curăță treptat istoricul.
+#
+# Se șterg DOAR apelurile de polling fără livrare și fără eroare. Orice apel care a livrat ceva,
+# orice http != 200 și orice altă acțiune rămân. Ștergerea e plafonată la 200k rânduri/noapte:
+# pe o tabelă de 18 GB un DELETE nelimitat ar umfla WAL-ul și ar ține lock lung.
+CTS_LOG_RETENTION_DAYS=7
+CTS_LOG_MAX_DELETE=200000
+
+DEL_CTS=$(_count_deleted "WITH doomed AS (
+       SELECT id FROM cts_api_log
+        WHERE action IN ('get_email_documents','get_emails')
+          AND COALESCE(total, 0) = 0
+          AND COALESCE(http_status, 200) = 200
+          AND ts < now() - make_interval(days => $CTS_LOG_RETENTION_DAYS)
+        ORDER BY id
+        LIMIT $CTS_LOG_MAX_DELETE)
+     DELETE FROM cts_api_log t USING doomed d WHERE t.id = d.id
+     RETURNING t.id")
+
+if [ "$DEL_CTS" = "ERR" ]; then
+    log "  cts_api_log: CURĂȚENIE EȘUATĂ — vezi eroarea de mai sus"
+    CLEANUP_FAILED=1
+else
+    log "  cts_api_log: $DEL_CTS rânduri șterse (polling gol > ${CTS_LOG_RETENTION_DAYS}z)"
+fi
+
 # ── RAPORT FINAL ────────────────────────────────────────────────────────────
 DISK_FREE=$(df -h / | awk 'NR==2{print $4}')
 log "Disc liber după cleanup: $DISK_FREE"

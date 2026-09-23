@@ -8,6 +8,40 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.28.0 - 2026-09-23
+
+### MINOR — `cts_api_log` nu mai înghite baza de date (18 GB din 22 GB pe producție)
+
+Backup-ul pre-release de pe producție a dat timeout (600s) pe 2026-09-23: `pg_dump` rula de peste
+3 ore pe o bază de **22 GB**, din care **`cts_api_log` singur ocupa 18 GB (81%)**.
+
+Cauza: CTS interoghează continuu feed-ul, iar **fiecare** apel scria un rând — inclusiv cele care
+n-aveau ce livra. Pe staging, **5.542.275 din 5.875.149 de rânduri (94,3%)** erau apeluri de polling
+cu `total=0`: „CTS a întrebat, n-avea nimic de dat". Tabela se citește doar pentru ecranul de
+diagnostic (ultimele ~50 de apeluri) și pentru `max(ts)` — nimic nu are nevoie de acel istoric.
+
+Trei măsuri, în ordinea în care lovesc problema:
+
+- **La sursă** (`cts._log`): apelurile de polling (`get_email_documents`, `get_emails`) fără livrare
+  și fără eroare nu se mai scriu deloc. Criteriul e `total`, NU `ids` — feed-ul de documente trimite
+  mereu `id_email`-ul interogat, deci un filtru pe `ids` n-ar fi prins nimic. Se păstrează: orice
+  apel care a livrat ceva, orice `http_status != 200`, orice altă acțiune. Canalul închis din UI
+  (`send_documente=false`) are `total=0` dar se loghează explicit (`force_log=True`) — e stare de
+  configurare, nu poll gol, și fără ea „de ce nu primește CTS documente?" n-ar avea răspuns.
+- **Retenție automată**: pas nou în `scripts/storage_cleanup.sh` (rulează deja zilnic la 00:00) —
+  șterge polling-ul gol mai vechi de 7 zile, plafonat la 200.000 rânduri/noapte. Plafonul există
+  pentru că un DELETE nelimitat pe o tabelă de 18 GB umflă WAL-ul și ține lock lung.
+- **Istoricul acumulat**: `scripts/purge_cts_api_log.py` — dry-run implicit, ștergere în loturi cu
+  pauză între ele, plafon de siguranță la numărul de loturi.
+
+Rezultat pe staging: **2011 MB → 105 MB** (5.542.283 rânduri șterse în 190s, 111 loturi), baza de la
+~4,5 GB la 2582 MB. Intacte: cele 3.326 de livrări reale, cele 267.117 erori, toate acțiunile de
+update, istoricul din 17.06.
+
+⚠️ `DELETE` nu întoarce spațiul sistemului de operare — rândurile rămân „dead tuples" și dump-ul
+rămâne la fel de mare. E nevoie de `VACUUM (FULL, ANALYZE) cts_api_log` (**blochează tabela**, de
+rulat în fereastră de mentenanță) sau `pg_repack -t cts_api_log` (fără blocare, cere instalare).
+
 ## v3.27.0 - 2026-09-22
 
 ### MINOR — contractul trimis ca 5 poze ajunge din nou UN singur PDF în CTS
