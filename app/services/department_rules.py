@@ -79,6 +79,15 @@ DEFAULT_RULES = [
      "note": "Corp: dosarul de recuperare TVA -> recuperare_tva"},
     {"department": "recuperare_tva", "from": "", "subject": "", "body": "situatia dosarului dumneavoastra pentru recuperare tva",
      "note": "Corp: situatia dosarului pentru recuperare TVA -> recuperare_tva"},
+    # Confirmarile de depunere a Formularului 150 (inregistrare in SPV pentru rambursarea TVA
+    # extern) veneau pe Suport 1: 58 din 62 de mailuri, plus 3 pe Mobilitate si 1 pe Contabilitate
+    # — clasificare AI inconsecventa, fiindca nicio regula nu acoperea expeditorul (cerere business
+    # 2026-09-24). Pe expeditor + subiect, nu doar pe expeditor: toate cele 62 de mailuri de la
+    # aceasta adresa au subiect "Depunere Formular 150", dar e o cutie de portal care poate incepe
+    # oricand sa trimita si altceva.
+    {"id": "mfinante-f150-01", "department": "recuperare_tva",
+     "from": "admin.portal@mfinante.ro", "subject": "depunere formular 150",
+     "note": "Depunere Formular 150 (SPV) -> recuperare_tva"},
     # --- Contabilitate ---
     {"department": "contabilitate", "from": "support@locatorbg.com", "subject": "Your Purchase Receipt from DigiToll",
      "note": "locatorbg + DigiToll receipt -> contabilitate"},

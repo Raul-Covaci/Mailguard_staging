@@ -8,6 +8,31 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.29.1 - 2026-09-24
+
+### PATCH — „Depunere Formular 150" merge direct pe Recuperare TVA
+
+Confirmările de depunere a Formularului 150 (înregistrare în SPV, pas din dosarul de rambursare TVA
+extern) ajungeau pe departamentul greșit: din 62 de mailuri de la `admin.portal@mfinante.ro`,
+**58 pe Suport 1**, 3 pe Mobilitate, 1 pe Contabilitate. Nicio regulă deterministă nu acoperea
+expeditorul, deci decidea AI-ul — inconsecvent, pe același tip de mail. Cerere business 2026-09-24.
+
+Regulă nouă în `department_rules.DEFAULT_RULES` (`id: mfinante-f150-01`): expeditor
+`admin.portal@mfinante.ro` + subiect `depunere formular 150` → `recuperare_tva`.
+
+Pe expeditor **și** subiect, nu doar pe expeditor: toate cele 62 de mailuri de la adresa asta au
+subiectul „Depunere Formular 150", dar e o cutie de portal ANAF care poate începe oricând să trimită
+și altceva. Potrivirea e case- și diacritice-insensitive (`_fold`).
+
+⚠️ Migrație OBLIGATORIE: `migrations/20260924_dept_rule_formular150.sql`. `DEFAULT_RULES` se
+seedează o SINGURĂ dată, la prima citire, deci pe un mediu cu store existent (staging și producție)
+modificarea din cod **nu ar avea niciun efect** — regula trebuie inserată în
+`settings['department_rules']`. Idempotentă: adaugă doar dacă `id`-ul lipsește.
+
+Verificat pe staging: mailuri reale mutate de pe `suport_1`/`mobilitate` pe `recuperare_tva`;
+`autoritate.MFP@mfinante.ro`, `Portal.ANAF@anaf.ro` și același expeditor cu alt subiect rămân
+neatinse (decide AI-ul, ca înainte). Mailurile deja clasificate NU se reîncadrează retroactiv.
+
 ## v3.29.0 - 2026-09-23
 
 ### MINOR — scorarea apelurilor nu mai pierde răspunsul când modelul citează cu ghilimele
