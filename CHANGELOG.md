@@ -8,6 +8,26 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.30.1 - 2026-09-25
+
+### PATCH — „Documente CargoTrack" merge pe Suport 1 cu prioritate P4
+
+Cerere business 2026-09-25: mailurile „Documente CargoTrack, <client>" de la
+`no-reply@cargotrack.ro` → Suport 1, prioritate 4 (documente). Regula existentă
+`noreply-cargotrack-01` prinde doar `noreply@` (fără cratimă), deci pentru `no-reply@` decidea
+AI-ul. Măsurat pe staging, 90 de zile: 140 pe `suport_1`, restul pe `comercial`/`contabilitate`/
+`taxe_drum` sau neîncadrate; prioritatea varia între P5, P4 și P2 (`pay_op_series` — seria din
+OP-ul atașat).
+
+- Departament: regulă nouă `noreply-docs-01` (expeditor `no-reply@cargotrack.ro` + subiect
+  `documente cargotrack`) → `suport_1`.
+- Prioritate: regulă forțată `cargotrack_docs` în `priority_rules.match_forced` → P4, înaintea
+  oricărui alt semnal (inclusiv `pay_op_series`), ca „Email Scout Report".
+
+⚠️ Migrație: `migrations/20260925_dept_rule_cargotrack_docs.sql` (idempotentă; `DEFAULT_RULES` se
+seedează o singură dată, deci pe un store existent regula din cod nu are efect fără ea). Rulează
+automat la pornire prin `scripts/migrate.sh`. Mailurile deja clasificate NU se reîncadrează.
+
 ## v3.30.0 - 2026-09-25
 
 ### MINOR — orice expeditor din lista de redirect VATHUB merge pe Recuperare TVA

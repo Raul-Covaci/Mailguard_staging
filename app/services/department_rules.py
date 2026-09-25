@@ -62,6 +62,10 @@ DEFAULT_RULES = [
     # criteriu (ex. subiect "Tranzactii zilnice" -> Contabilitate).
     {"id": "noreply-cargotrack-01", "department": "suport_1", "from": "noreply@cargotrack.ro",
      "subject": "", "note": "noreply@cargotrack.ro -> Suport 1"},
+    # Documentele trimise din aplicatie ("Documente CargoTrack, <client>") pleaca de pe ALTA cutie,
+    # no-reply@ (cu cratima), pe care regula de mai sus nu o prinde (cerere business 2026-09-25).
+    {"id": "noreply-docs-01", "department": "suport_1", "from": "no-reply@cargotrack.ro",
+     "subject": "documente cargotrack", "note": "Documente CargoTrack (no-reply@) -> Suport 1"},
     # --- Taxe de drum ---
     {"department": "taxe_drum", "from": "support@locatorbg.com", "subject": "Request for refund -",
      "note": "locatorbg + refund -> taxe"},

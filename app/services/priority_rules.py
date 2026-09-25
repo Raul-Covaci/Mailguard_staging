@@ -22,6 +22,7 @@ RULE_ATTACHMENT = "pay_attachment"  # atasament cu nume clar de OP/dovada
 RULE_URGENCY = "urgency"       # disperare / urgenta clara
 RULE_SCOUT = "scout_report"     # raport intern "Email Scout Report" (office@cargotrack.ro)
 RULE_PROCESSOR = "pay_processor"  # notificare de la un procesator de plati online
+RULE_DOCS = "cargotrack_docs"   # "Documente CargoTrack" de la no-reply@cargotrack.ro
 
 
 def _fold(s: str) -> str:
@@ -156,6 +157,10 @@ def _attachment_strict_hit(att_names: str) -> bool:
 # priority_classifier._classify_priority_core), deci nimic nu il mai poate urca.
 _SCOUT_FROM = "office@cargotrack.ro"
 _SCOUT_SUBJECT = "email scout report"
+# "Documente CargoTrack, <client>" (cerere business 2026-09-25): sunt documente, deci P4. Fortata
+# pentru ca seria din OP-ul atasat le urca altfel pe P2 (pay_op_series).
+_DOCS_FROM = "no-reply@cargotrack.ro"
+_DOCS_SUBJECT = "documente cargotrack"
 
 
 def match_forced(email: dict):
@@ -165,6 +170,9 @@ def match_forced(email: dict):
     if _SCOUT_FROM in hay_from and _SCOUT_SUBJECT in subj:
         return {"id": RULE_SCOUT, "tier": "P4",
                 "note": "Email Scout Report de la office@cargotrack.ro -> P4 (raport intern)."}
+    if _DOCS_FROM in hay_from and _DOCS_SUBJECT in subj:
+        return {"id": RULE_DOCS, "tier": "P4",
+                "note": "Documente CargoTrack de la no-reply@cargotrack.ro -> P4 (documente)."}
     return None
 
 
