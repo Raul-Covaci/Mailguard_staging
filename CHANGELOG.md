@@ -8,6 +8,27 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.30.0 - 2026-09-25
+
+### MINOR — orice expeditor din lista de redirect VATHUB merge pe Recuperare TVA
+
+Cerere business 2026-09-25: toate mailurile de la expeditorii din lista de redirect spre
+`vathub@cargotrack.ro` (`settings['vathub.redirect']`, editabilă din Setări) trebuie încadrate pe
+`recuperare_tva`. Include cererile punctuale „MFP - Activare cont pentru utilizarea serviciului
+Depunere Declaratii" (`autoritate.MFP@mfinante.ro`) și „Cod validare email formular 150"
+(`Portal.ANAF@anaf.ro`) — ambele adrese sunt deja în listă. Măsurat pe staging, ultimele 90 de zile:
+459 de mailuri de la acești expeditori, doar 131 pe `recuperare_tva`; restul majoritar pe
+`suport_1` (decidea AI-ul).
+
+`department_rules.match` verifică lista ÎNAINTEA regulilor deterministe, cu aceeași potrivire ca
+forward-ul (`vathub_forward.match_sender`: adresă exactă sau domeniu + subdomenii; intrările
+`muted` sunt sărite). Rezultatul poartă `rule_id = "vathub-redirect"`. O singură sursă de
+adevăr: adăugarea/scoaterea unui expeditor din listă schimbă și forward-ul, și departamentul.
+
+Atenție: lista conține domenii întregi (`anaf.ro`, `mfinante.ro`), deci și „Documente noi SPV",
+„Fisa specimen" etc. de la ANAF ajung pe Recuperare TVA (unele erau pe Contabilitate).
+Mailurile deja clasificate NU se reîncadrează retroactiv. Fără migrație.
+
 ## v3.29.3 - 2026-09-25
 
 ### PATCH — scorarea apelurilor recuperează și valorile citate fără ghilimele JSON

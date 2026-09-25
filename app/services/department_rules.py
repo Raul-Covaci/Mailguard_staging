@@ -265,6 +265,19 @@ def _rule_matches(r: dict, hay_from: str, hay_subject: str, hay_body: str) -> bo
     return True
 
 
+def _match_vathub_redirect(db, email: dict):
+    """Orice expeditor din lista de redirect VATHUB (settings['vathub.redirect'], editabila din
+    Setari) -> recuperare_tva, inaintea regulilor de mai jos. Aceeasi potrivire ca forward-ul
+    (adresa exacta sau domeniu + subdomenii; intrarile `muted` sunt sarite)."""
+    from app.services import vathub_forward, vathub_inbox
+    domains, addresses = vathub_forward.active_entries(vathub_inbox.load_config(db))
+    hit = vathub_forward.match_sender(email.get("from_address"), domains, addresses)
+    if not hit:
+        return None
+    return "recuperare_tva", {"id": "vathub-redirect", "department": "recuperare_tva",
+                              "from": hit, "note": "Lista redirect VATHUB (%s) -> recuperare_tva" % hit}
+
+
 def match(email: dict, db=None):
     """Returneaza (department, rule) pentru prima regula care loveste, altfel None.
     Ordine: mai multe criterii INTAI (mai specific); la egalitate, regulile body-only ULTIMELE
@@ -275,6 +288,9 @@ def match(email: dict, db=None):
         db = SessionLocal()
         own = True
     try:
+        vathub_hit = _match_vathub_redirect(db, email)
+        if vathub_hit:
+            return vathub_hit
         rules = list_all(db)
     finally:
         if own:
