@@ -4037,16 +4037,28 @@ def _reclassify_group_primary(db, primary_id) -> str:
     if not isinstance(result, dict) or not result.get("type_id"):
         logger.info("reclassify_group primary=%s: neidentificat dupa vision", primary_id)
         return "needs_review"
+    # Modelul poate intoarce un slug ("ITP") in loc de id; coloana e bigint.
+    try:
+        tid = int(result.get("type_id"))
+    except (TypeError, ValueError):
+        tid = None
+    tmap = {t["id"]: t for t in _types_catalog(db)}
+    if tid not in tmap:
+        logger.warning("reclassify_group primary=%s: type_id invalid %r -> needs_review",
+                       primary_id, result.get("type_id"))
+        return "needs_review"
+    try:
+        conf = float(result.get("confidence") or 0.7)
+    except (TypeError, ValueError):
+        conf = 0.7
     db.execute(text(
         "UPDATE document_extractions SET document_type_id=:tid, category=:cat, "
         "detected_type=:dt, confidence=:conf, status='classified', updated_at=now() "
         "WHERE id=:id"),
-        {"tid": result["type_id"], "cat": result.get("category"),
-         "dt": result.get("type_name"), "conf": float(result.get("confidence") or 0.7),
-         "id": primary_id})
+        {"tid": tid, "cat": tmap[tid]["category"], "dt": tmap[tid]["name"],
+         "conf": conf, "id": primary_id})
     db.commit()
-    logger.info("reclassify_group primary=%s -> type_id=%s conf=%.2f",
-                primary_id, result["type_id"], float(result.get("confidence") or 0.7))
+    logger.info("reclassify_group primary=%s -> type_id=%s conf=%.2f", primary_id, tid, conf)
     return _extract_group(db, primary_id)
 
 

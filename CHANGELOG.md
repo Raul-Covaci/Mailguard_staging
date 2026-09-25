@@ -8,6 +8,21 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.29.2 - 2026-09-25
+
+### PATCH — reclasificarea grupurilor de imagini nu mai scrie slug-uri în `document_type_id`
+
+Producție, 2026-09-25 07:09:53: `invalid input syntax for type bigint: "ITP"` în
+`_reclassify_group_primary` (lanț `_autogroup_email_images` → `_autogroup_holistic`). Vision-classify
+a întors `{"type_id": "ITP", ...}` — slug în loc de id — iar funcția îl pasa brut în
+`UPDATE document_extractions SET document_type_id=...` (coloană `bigint`). Tranzacția pica
+(`InFailedSqlTransaction` pe commit-ul următor); o singură apariție (email 104314, extraction
+1542013), datele au rămas intacte, extracția a rămas `needs_review`.
+
+`_reclassify_group_primary` validează acum `type_id` la fel ca `_dedupe_multidoc`: `int()` +
+existență în `_types_catalog(db)` (tipuri active+enabled). Id invalid/necunoscut → `needs_review`,
+fără UPDATE. `category`/`detected_type` se iau din catalog, nu din răspunsul modelului.
+
 ## v3.29.1 - 2026-09-24
 
 ### PATCH — „Depunere Formular 150" merge direct pe Recuperare TVA
