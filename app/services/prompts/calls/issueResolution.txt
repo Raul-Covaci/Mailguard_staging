@@ -68,6 +68,8 @@ Poor solution/handling includes:
 - Inside JSON string values, never use the double-quote character ("). To mark a quotation, use
   Romanian guillemets «...» or no marks at all. A raw " inside a value breaks the JSON and the
   whole answer is discarded.
+- The value itself is still a normal JSON string wrapped in straight double quotes; «...» go only
+  INSIDE it. Correct: "evidence": "a spus «Bună ziua, sunt Ana» la început". Wrong: "evidence": «Bună ziua»
 - Be HONEST about whether problem was truly solved - don't be generous
 - Do NOT treat an out-of-scope request as a resolution failure just because the company couldn't act on it - judge the quality of the explanation instead
 - "mainProblem": Offer a concise but complete summary (50-100 words) that captures the core issue

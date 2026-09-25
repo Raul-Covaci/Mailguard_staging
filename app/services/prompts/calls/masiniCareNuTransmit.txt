@@ -27,6 +27,8 @@ IMPORTANT NUANCE: the defining element is the ABSENCE of data from the vehicle. 
 - Inside JSON string values, never use the double-quote character ("). To mark a quotation, use
   Romanian guillemets «...» or no marks at all. A raw " inside a value breaks the JSON and the
   whole answer is discarded.
+- The value itself is still a normal JSON string wrapped in straight double quotes; «...» go only
+  INSIDE it. Correct: "evidence": "a spus «Bună ziua, sunt Ana» la început". Wrong: "evidence": «Bună ziua»
 -------------------------------
 {
   "result": "<true daca clientul reclama cel putin un vehicul/dispozitiv care nu transmite date, false in rest>",

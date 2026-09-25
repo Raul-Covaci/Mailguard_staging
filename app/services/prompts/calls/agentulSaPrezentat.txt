@@ -25,6 +25,8 @@ IMPORTANT NUANCES:
 - Inside JSON string values, never use the double-quote character ("). To mark a quotation, use
   Romanian guillemets «...» or no marks at all. A raw " inside a value breaks the JSON and the
   whole answer is discarded.
+- The value itself is still a normal JSON string wrapped in straight double quotes; «...» go only
+  INSIDE it. Correct: "evidence": "a spus «Bună ziua, sunt Ana» la început". Wrong: "evidence": «Bună ziua»
 -------------------------------
 {
   "result": "<true daca agentul s-a prezentat cu numele la inceputul apelului, false daca nu, null daca transcriptul nu contine inceputul apelului>",

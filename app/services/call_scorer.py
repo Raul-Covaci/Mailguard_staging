@@ -319,6 +319,8 @@ def _salvage_json(raw: str) -> Optional[dict]:
          (`Expecting ',' delimiter`). NU diacriticele sau virgulele sunt problema: un string JSON
          valid le accepta.
       2. RASPUNS TRUNCHIAT la max_tokens — obiectul se termina brusc.
+      3. VALOARE FARA GHILIMELE (2026-09-25): cerut sa citeze cu «...», modelul scoate uneori si
+         ghilimelele JSON ale valorii — `"evidence": «Buna ziua» ...` (`Expecting value`).
     """
     if not raw or not raw.strip():
         return None
@@ -390,9 +392,67 @@ def _salvage_json(raw: str) -> Optional[dict]:
     repaired += "}" * max(0, depth)
     try:
         out = json.loads(repaired)
-        return out if isinstance(out, dict) else None
+        if isinstance(out, dict):
+            return out
     except Exception:
+        pass
+
+    # Defectul 3: valoare fara ghilimele — `"evidence": «Buna ziua» ...`. Ultima incercare, ca sa
+    # nu atinga raspunsurile pe care reparatiile de mai sus le recupereaza deja.
+    bare = _quote_bare_values(candidate)
+    if bare == candidate:
         return None
+    for attempt in (bare, bare + "}"):
+        try:
+            out = json.loads(attempt)
+            if isinstance(out, dict):
+                return out
+        except Exception:
+            pass
+    return None
+
+
+_JSON_LITERAL_RE = re.compile(r'(?:true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(?:[,}\]]|$)')
+_NEXT_KEY_RE = re.compile(r',\s*"[^"]{1,80}"\s*:')
+
+
+def _quote_bare_values(s: str) -> str:
+    """Pune intre ghilimele valorile care nu incep cu un token JSON valid. Valoarea se intinde pana
+    la urmatoarea cheie (`, "nume":`) sau pana la ultima acolada."""
+    out, i, in_str, escaped, n = [], 0, False, False, len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+        if ch == '"':
+            in_str = True
+            continue
+        if ch != ":":
+            continue
+        j = i
+        while j < n and s[j] in " \t\r\n":
+            j += 1
+        if j >= n or s[j] in '"{[' or _JSON_LITERAL_RE.match(s, j):
+            continue
+        m = _NEXT_KEY_RE.search(s, j)
+        last_brace = s.rfind("}")
+        end = m.start() if m else (last_brace if last_brace > j else n)
+        value = s[j:end].rstrip()
+        out.append(s[i:j])
+        out.append(json.dumps(value, ensure_ascii=False))
+        out.append(s[j + len(value):end])
+        i = end
+    return "".join(out)
 
 
 def _run_one_prompt(key: str, prompt_text: str, transcript: str, output_type: str = "json") -> tuple[str, Any]:

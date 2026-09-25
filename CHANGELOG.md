@@ -8,6 +8,28 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.29.3 - 2026-09-25
+
+### PATCH — scorarea apelurilor recuperează și valorile citate fără ghilimele JSON
+
+Watchdog producție, 2026-09-25 07:32–07:35: `call_scorer prompt agentulSaPrezentat failed:
+code=JSON_PARSE_ERROR msg=Expecting value: line 3 column 15`. Efect secundar al v3.29.0: cerut să
+citeze cu «…» în loc de `"`, modelul scoate uneori și ghilimelele care încadrează valoarea —
+`"evidence": «Bună, vă sun de la CargoTrack» — ...` — iar `_salvage_json` nu acoperea cazul
+(poziția erorii cade exact pe primul caracter după `"evidence": `). Doar WARNING; se pierdea
+răspunsul binar al promptului pe apelul respectiv.
+
+- Prompturi (aceleași șase din v3.29.0): regulă explicită că valoarea rămâne string JSON încadrat de
+  `"`, cu «…» doar în interior, plus exemplu corect/greșit.
+- `call_scorer._salvage_json`: al treilea defect recuperat — valoare care nu începe cu un token JSON
+  valid e încadrată în ghilimele până la următoarea cheie sau ultima acoladă (și la răspuns
+  trunchiat). Rulează doar după ce reparațiile existente eșuează, deci cazurile deja acoperite nu se
+  schimbă.
+
+⚠️ După deploy/release: `venv/bin/python3 scripts/sync_call_prompts.py` (tabela
+`call_scoring_prompts` e cache), altfel fixul de prompt nu are efect; recuperarea din cod
+funcționează oricum.
+
 ## v3.29.2 - 2026-09-25
 
 ### PATCH — reclasificarea grupurilor de imagini nu mai scrie slug-uri în `document_type_id`
