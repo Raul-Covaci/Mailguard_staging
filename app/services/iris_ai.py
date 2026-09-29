@@ -23,6 +23,8 @@ import time
 import logging
 import httpx
 
+from app.services import ai_cache
+
 logger = logging.getLogger("mailguard.iris_ai")
 
 # IRIS gateway hard limit on the transcript field.
@@ -144,7 +146,8 @@ def run_prompt(system: str, content: str, *,
                learn: bool = False,
                learn_scope: str = None,
                no_cache: bool = False,
-               timeout: float = None) -> dict:
+               timeout: float = None,
+               cache_ok=None) -> dict:
     """Run a formatted prompt through IRIS. Returns a normalized result dict:
 
       { "ok": bool,
@@ -155,6 +158,10 @@ def run_prompt(system: str, content: str, *,
         "task": str | None }
 
     Never raises — transport/HTTP/gateway errors are reported in `error`.
+
+    `cache_ok` (T3-L1): validatorul apelantului pentru cache-ul de rezultat (`ai_cache`) — un
+    rezultat ok:true intră în cache doar dacă `cache_ok(rezultat)` e True. Relevant doar când
+    cache-ul e activ pentru prefixul task-ului; altfel ignorat.
     """
     if _ai_disabled():
         return {"ok": False, "text": "", "parsed": None, "usage": None, "task": task,
@@ -220,6 +227,14 @@ def run_prompt(system: str, content: str, *,
         if learn:
             payload["learn"] = True
 
+    # T3-L1: cache de rezultat, cheiat pe payload-ul de mai sus. Inert cât timp
+    # settings['ai_cache.enabled'] e false; orice eșec al lui = apel normal (vezi ai_cache).
+    _cache = ai_cache.prepare(task, payload, temperature)
+    if _cache is not None:
+        _hit = ai_cache.lookup(_cache)
+        if _hit is not None:
+            return {**_hit, "task": task}
+
     headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
 
     last_transport_err = None
@@ -267,7 +282,7 @@ def run_prompt(system: str, content: str, *,
     _model = data.get("model") if isinstance(data, dict) else None
     _usage = data.get("usage") if isinstance(data, dict) else None
     _log_call(task, _model, _usage, True, None, email_id=email_id)
-    return {
+    result = {
         "ok": True,
         "text": (data.get("raw_text") or "") if isinstance(data, dict) else "",
         "parsed": data.get("parsed") if isinstance(data, dict) else None,
@@ -277,3 +292,6 @@ def run_prompt(system: str, content: str, *,
         "task": task,
         "truncated": truncated,
     }
+    if _cache is not None:
+        ai_cache.store(_cache, result, payload["response_format"], cache_ok)
+    return result

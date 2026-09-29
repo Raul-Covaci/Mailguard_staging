@@ -1141,6 +1141,15 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
         res["doc_drain_started"] = documents._kick_drain("auto")
     except Exception:
         logger.exception("doc drain kick failed")
+    # T3-L1: curăță cache-ul de rezultat AI expirat — cel mult o dată pe oră (poartă atomică în
+    # settings), doar cu cache-ul activ. Nu aruncă; blocul try e doar centură.
+    try:
+        from app.services import ai_cache as _aic
+        _aic_purged = _aic.purge_expired_if_due()
+        if _aic_purged is not None:          # OFF / nu e momentul -> răspunsul tick-ului neschimbat
+            res["ai_cache_purged"] = _aic_purged
+    except Exception:
+        logger.exception("ai_cache purge failed")
     # MODUL APELURI (While1): download audio -> transcriere IRIS -> clasificare interna.
     # Fire-and-forget (daemon thread + pg_advisory_lock 778240): NU blocheaza cron-ul de emailuri
     # chiar daca exista backlog mare de apeluri netranscrise (timeout 600s/fisier × N fisiere).

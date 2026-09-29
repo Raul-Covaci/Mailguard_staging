@@ -28,6 +28,7 @@ from sqlalchemy import text, bindparam
 from app.database import get_db, SessionLocal
 from app.api.v1.auth import get_current_admin
 from app.services import iris_ai
+from app.services import ai_cache
 from app.services import iris_docsvc
 from app.services.doc_stats import STATS_SINCE
 from app.services import doc_window
@@ -769,7 +770,7 @@ def _rename_doc(db, att_id: int, part_no: int, tip_document: str, raw_text: str,
         res = iris_ai.run_prompt(
             RENAME_SYSTEM_PROMPT, content,
             response_format="json", temperature=0.0, max_tokens=300,
-            task=task, timeout=25)
+            task=task, timeout=25, cache_ok=_cache_ok_parsed_dict)
         if res and res.get("ok") and isinstance(res.get("parsed"), dict):
             renamed = (res["parsed"].get("nume_complet") or "").strip() or None
         else:
@@ -800,7 +801,7 @@ def _extract_doc(system: str, doc_text: str, type_id: int, name: str = None, fie
     for attempt in range(_attempts):
         res = iris_ai.run_prompt(
             system, content, response_format="json", temperature=0.0, max_tokens=700,
-            task=task, timeout=_ctimeout)
+            task=task, timeout=_ctimeout, cache_ok=_cache_ok_parsed_dict)
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         time.sleep(1.2 * (attempt + 1))
@@ -831,6 +832,19 @@ def _salvage_json(s):
         except Exception:
             pass
     return None
+
+
+def _cache_ok_salvage(res) -> bool:
+    """Validator de cache (T3-L1, `iris_ai.run_prompt(cache_ok=…)`) pentru apelurile vision cu
+    parsare proprie: EXACT verificarea apelantului — `parsed` dict sau `_salvage_json(text)` reușit.
+    Un răspuns pe care apelantul îl respinge n-are voie în cache: ar deveni eșec permanent."""
+    parsed = res.get("parsed") if isinstance(res.get("parsed"), dict) else _salvage_json(res.get("text"))
+    return isinstance(parsed, dict)
+
+
+def _cache_ok_parsed_dict(res) -> bool:
+    """Validator de cache (T3-L1) pentru apelurile json care cer `parsed` dict (ca apelantul)."""
+    return isinstance(res.get("parsed"), dict)
 
 
 def _extract_doc_vision(system: str, files, type_id: int,
@@ -885,7 +899,7 @@ def _extract_doc_vision(system: str, files, type_id: int,
         res = iris_ai.run_prompt(
             system, content, response_format="text", model_hint="sonnet",
             temperature=0.0, max_tokens=900, task=task, timeout=_ctimeout,
-            attachments=atts)
+            attachments=atts, cache_ok=_cache_ok_salvage)
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         time.sleep(1.2 * (attempt + 1))
@@ -2003,7 +2017,8 @@ def _classify_attachment(classify_system: str, doc_text: str, att_name: str = No
     _attempts, _ctimeout = _ai_budget()
     for attempt in range(_attempts):
         res = iris_ai.run_prompt(classify_system, content, response_format="json",
-                                 temperature=0.0, max_tokens=900, task=task, timeout=_ctimeout)
+                                 temperature=0.0, max_tokens=900, task=task, timeout=_ctimeout,
+                                 cache_ok=_cache_ok_parsed_dict)
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         time.sleep(1.2 * (attempt + 1))
@@ -2043,7 +2058,7 @@ def _classify_attachment_vision(classify_system: str, path: str, mime: str,
     for attempt in range(_attempts):
         res = iris_ai.run_prompt(classify_system, content, response_format="text", model_hint="sonnet",
                                  temperature=0.0, max_tokens=1200, task=task, timeout=_ctimeout,
-                                 attachments=atts)
+                                 attachments=atts, cache_ok=_cache_ok_salvage)
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         time.sleep(1.2 * (attempt + 1))
@@ -2902,7 +2917,8 @@ def _segment_pages(path, mime, catalog, page_count):
             for attempt in range(_attempts):
                 res = iris_ai.run_prompt(system, content, response_format="text", model_hint=mdl,
                                          temperature=0.0, max_tokens=400, task=task,
-                                         timeout=_ctimeout, attachments=atts)
+                                         timeout=_ctimeout, attachments=atts,
+                                         cache_ok=_cache_ok_salvage)
                 if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
                     break
                 time.sleep(1.0 * (attempt + 1))
@@ -4137,7 +4153,7 @@ def _autogroup_holistic(db, email_id):
     for attempt in range(_attempts):
         res = iris_ai.run_prompt(system, content, response_format="text", model_hint="sonnet",
                                  temperature=0.0, max_tokens=500, task=task, timeout=_ctimeout,
-                                 attachments=(atts or None))
+                                 attachments=(atts or None), cache_ok=_cache_ok_salvage)
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         _time.sleep(1.2 * (attempt + 1))
@@ -4261,7 +4277,7 @@ def _autogroup_email_images(db, email_id):
         for attempt in range(_attempts):
             res = iris_ai.run_prompt(system, content, response_format="text", model_hint="sonnet",
                                      temperature=0.0, max_tokens=400, task=task, timeout=_ctimeout,
-                                     attachments=atts)
+                                     attachments=atts, cache_ok=_cache_ok_salvage)
             if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
                 break
             time.sleep(1.2 * (attempt + 1))
@@ -4353,7 +4369,7 @@ def _autogroup_email_images(db, email_id):
             for attempt2 in range(_attempts2):
                 res2 = iris_ai.run_prompt(system2, content2, response_format="text", model_hint="sonnet",
                                           temperature=0.0, max_tokens=400, task=task2, timeout=_ctimeout2,
-                                          attachments=atts2)
+                                          attachments=atts2, cache_ok=_cache_ok_salvage)
                 if res2.get("ok") or (res2.get("error") or {}).get("code") not in _RETRY_CODES:
                     break
                 time.sleep(1.2 * (attempt2 + 1))
@@ -4843,7 +4859,18 @@ def update_extraction(ex_id: int, body: dict, db: Session = Depends(get_db),
 def reidentify_extraction(ex_id: int, type_id: int = None, db: Session = Depends(get_db),
                           admin=Depends(get_current_admin)):
     """Fara type_id: reclasifica (categorie->tip) + extrage. Cu type_id: forteaza tipul
-    ales manual si re-extrage cu campurile acelui tip (cheile difera de extragerea veche)."""
+    ales manual si re-extrage cu campurile acelui tip (cheile difera de extragerea veche).
+
+    Singura actiune care OCOLESTE cache-ul de rezultat AI (T3-L1): operatorul cere o incercare
+    noua pe un singur document. reprocess-by-ids / ungroup / unsplit / drain folosesc cache-ul."""
+    tok = ai_cache.ai_cache_bypass.set(True)
+    try:
+        return _reidentify_extraction(ex_id, type_id, db, admin)
+    finally:
+        ai_cache.ai_cache_bypass.reset(tok)
+
+
+def _reidentify_extraction(ex_id: int, type_id, db, admin):
     _INTERACTIVE.set(True)   # click-and-wait: fail-fast pe gateway (vezi _ai_budget)
     r = db.execute(text(
         "SELECT a.id, a.email_id, a.name, a.content_type, a.storage_path, d.raw_text AS _raw, "
