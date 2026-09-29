@@ -303,7 +303,61 @@ class Report:
         return self.doc.tobytes(deflate=True)
 
 
-def generate_cost_report_pdf(meta, totals, by_model, by_task, by_task_model):
+# ── T3-R1: fluxuri — aceeași mapare task → flux în tot raportul (PDF, CSV) ──────────────────────────
+FLOW_ORDER = ["scoring", "call_category", "email_classification", "documente", "op_series",
+              "satisfaction", "client_context", "altele"]
+_EMAIL_CLASSIFICATION = ("email_category", "email_department", "email_priority", "email_assignee",
+                         "intent_gate")
+
+
+def task_flow(task) -> str:
+    """Fluxul unui task din ai_call_log (cu sau fără prefixul `cargo360:` și sufixele de hash)."""
+    t = (task or "").strip()
+    if t.startswith("cargo360:"):
+        t = t[len("cargo360:"):]
+    fn = t.split(":", 1)[0]
+    if fn.startswith("call_score_"):
+        return "scoring"
+    if fn == "call_category":
+        return "call_category"
+    if fn.startswith(_EMAIL_CLASSIFICATION):
+        return "email_classification"
+    if fn.startswith("doc_"):
+        return "documente"
+    if fn == "op_series":
+        return "op_series"
+    if fn.startswith("satisfaction"):
+        return "satisfaction"
+    if fn.startswith("client_context"):
+        return "client_context"
+    return "altele"
+
+
+def aggregate_flows(by_task):
+    """Rânduri pe flux din rândurile pe task (sumele pe flux = totalul raportului)."""
+    acc = {f: {"flow": f, "calls": 0, "cost": 0.0, "errors": 0, "failed_cost": 0.0} for f in FLOW_ORDER}
+    for t in by_task:
+        a = acc[task_flow(t.get("task"))]
+        a["calls"] += int(t.get("calls") or 0)
+        a["cost"] += float(t.get("cost") or 0)
+        a["errors"] += int(t.get("errors") or 0)
+        a["failed_cost"] += float(t.get("failed_cost") or 0)
+    out = []
+    for f in FLOW_ORDER:
+        a = acc[f]
+        if not a["calls"]:
+            continue
+        a["cost_per_call"] = a["cost"] / a["calls"]
+        out.append(a)
+    return out
+
+
+def _pct(part, whole):
+    return ("%.1f%%" % (100.0 * part / whole)) if whole else "—"
+
+
+def generate_cost_report_pdf(meta, totals, by_model, by_task, by_task_model, by_flow=None,
+                             cache_savings=None):
     rep = Report(meta)
 
     rep.cards([
@@ -337,14 +391,27 @@ def generate_cost_report_pdf(meta, totals, by_model, by_task, by_task_model):
              ("Claude plătit (Haiku/Sonnet)", paid_calls, RED)],
             note="Din totalul de " + grp(iris_calls + paid_calls) + " interogări — câte au fost procesate gratuit local vs contra cost.")
 
+    if by_flow is not None:
+        rep.section("Pe flux", "Toate task-urile (inclusiv cele cu hash în nume), grupate pe flux. "
+                               "Sumele sunt egale cu totalul raportului.")
+        frows = [[f["flow"], grp(f["calls"]), usd(f["cost"]), grp(f["errors"]), usd(f["failed_cost"]),
+                  usd(f["cost_per_call"], 5)] for f in by_flow]
+        ftot = ["TOTAL", grp(totals.get("calls", 0)), usd(totals.get("cost", 0)),
+                grp(totals.get("errors", 0)), usd(totals.get("failed_cost", 0)),
+                usd((totals.get("cost", 0) / totals["calls"]) if totals.get("calls") else 0, 5)]
+        rep.table(["Flux", "Apeluri", "Cost", "Apeluri eșuate", "Cost eșuate", "Cost / apel"],
+                  [135, 70, 85, 80, 85, 80], frows, ["l", "r", "r", "r", "r", "r"],
+                  total_row=ftot, money_cols=(2, 4, 5))
+
     rep.section("Per tip de task", "Interogări și cost cumulat pe toate modelele, plus modelul dominant (cele mai multe apeluri).")
     trows = []
     for t in by_task:
         share = t.get("top_share")
         dom = model_label(t.get("top_model")) + ((" " + str(int(round(share))) + "%") if share is not None else "")
-        trows.append([t.get("task") or "—", grp(t.get("calls")), usd(t.get("cost")), dom, str(t.get("errors") or 0)])
-    rep.table(["Task", "Interogări", "Cost", "Model dominant", "Erori"],
-              [205, 70, 90, 110, 60], trows, ["l", "r", "r", "l", "r"], money_cols=(2,))
+        trows.append([t.get("task") or "—", grp(t.get("calls")), usd(t.get("cost")), dom, str(t.get("errors") or 0),
+                      usd(t.get("failed_cost") or 0), _pct(t.get("failed_cost") or 0, t.get("cost") or 0)])
+    rep.table(["Task", "Interogări", "Cost", "Model dominant", "Apeluri eșuate", "Cost eșuate", "% cost eșuate"],
+              [150, 55, 70, 90, 55, 65, 50], trows, ["l", "r", "r", "l", "r", "r", "r"], money_cols=(2, 5))
 
     top_tasks = sorted(by_task, key=lambda x: x.get("calls", 0), reverse=True)[:12]
     rep.hbar("Interogări pe task (top 12)",
@@ -366,5 +433,17 @@ def generate_cost_report_pdf(meta, totals, by_model, by_task, by_task_model):
         drows.append(["" if tk == last else tk, model_label(r.get("model")), grp(r.get("calls")), usd(r.get("cost"))])
         last = tk
     rep.table(["Task", "Model", "Interogări", "Cost"], [205, 150, 75, 115], drows, ["l", "l", "r", "r"], money_cols=(3,))
+
+    if cache_savings is not None:
+        rep.section("Economie din cache", "Apeluri evitate de cache-ul de rezultat AI (ai_cache_hit_log), pe prefix.")
+        if cache_savings:
+            crow = [[c["task_prefix"], grp(c["hits"]), usd(c["saved_cost"])] for c in cache_savings]
+            ctot = ["TOTAL", grp(sum(c["hits"] for c in cache_savings)),
+                    usd(sum(c["saved_cost"] for c in cache_savings))]
+            rep.table(["Prefix", "Hit-uri", "Cost evitat"], [255, 120, 160], crow, ["l", "r", "r"],
+                      total_row=ctot, money_cols=(2,))
+        else:
+            rep.table(["Prefix", "Hit-uri", "Cost evitat"], [255, 120, 160],
+                      [["— fără date (cache inactiv sau fără hit-uri în fereastră)", "", ""]], ["l", "r", "r"])
 
     return rep.bytes()

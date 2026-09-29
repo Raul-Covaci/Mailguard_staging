@@ -433,16 +433,19 @@ def ai_cost_report(date_from: str = Query(...), date_to: str = Query(...),
         raise HTTPException(400, "Format dată invalid (asteptat YYYY-MM-DD).")
     if date_from > date_to:
         date_from, date_to = date_to, date_from
-    where = "WHERE (created_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt"
+    # T3-R1: rândurile `local_cache` (apeluri evitate) nu sunt apeluri reale — ies din toate calculele.
+    where = ("WHERE (created_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt "
+             "AND model IS DISTINCT FROM 'local_cache'")
     params = {"df": date_from, "dt": date_to}
 
     tm = db.execute(text(
         "SELECT count(*) AS calls, COALESCE(sum(cost_usd),0) AS cost, "
         "COALESCE(sum(tokens_in),0) AS tin, COALESCE(sum(tokens_out),0) AS tout, "
-        "count(*) FILTER (WHERE NOT ok) AS errors FROM ai_call_log " + where), params).fetchone()._mapping
+        "count(*) FILTER (WHERE NOT ok) AS errors, "
+        "COALESCE(sum(cost_usd) FILTER (WHERE NOT ok),0) AS failed_cost FROM ai_call_log " + where), params).fetchone()._mapping
     totals = {"calls": tm["calls"] or 0, "cost": float(tm["cost"] or 0),
               "tokens_in": int(tm["tin"] or 0), "tokens_out": int(tm["tout"] or 0),
-              "errors": tm["errors"] or 0}
+              "errors": tm["errors"] or 0, "failed_cost": float(tm["failed_cost"] or 0)}
 
     by_model = [{"model": r._mapping["model"], "calls": r._mapping["calls"],
                  "cost": float(r._mapping["cost"] or 0), "tokens_in": int(r._mapping["tin"] or 0),
@@ -463,15 +466,18 @@ def ai_cost_report(date_from: str = Query(...), date_to: str = Query(...),
     by_task_map = {}
     for r in btm_rows:
         t = by_task_map.setdefault(r["task"], {"task": r["task"], "calls": 0, "cost": 0.0,
-                                               "tokens_in": 0, "tokens_out": 0, "errors": 0, "_models": []})
+                                               "tokens_in": 0, "tokens_out": 0, "errors": 0,
+                                               "failed_cost": 0.0, "_models": []})
         t["calls"] += r["calls"]; t["cost"] += r["cost"]
         t["tokens_in"] += r["tin"]; t["tokens_out"] += r["tout"]
         t["_models"].append((r["model"], r["calls"], r["cost"]))
     for r in db.execute(text(
-            "SELECT regexp_replace(task, '(:[0-9a-f]{6,})+$', '') AS task, count(*) FILTER (WHERE NOT ok) AS errors "
+            "SELECT regexp_replace(task, '(:[0-9a-f]{6,})+$', '') AS task, count(*) FILTER (WHERE NOT ok) AS errors, "
+            "COALESCE(sum(cost_usd) FILTER (WHERE NOT ok),0) AS failed_cost "
             "FROM ai_call_log " + where + " GROUP BY 1"), params).fetchall():
         if r._mapping["task"] in by_task_map:
             by_task_map[r._mapping["task"]]["errors"] = r._mapping["errors"] or 0
+            by_task_map[r._mapping["task"]]["failed_cost"] = float(r._mapping["failed_cost"] or 0)
 
     by_task = []
     for t in by_task_map.values():
@@ -483,6 +489,27 @@ def ai_cost_report(date_from: str = Query(...), date_to: str = Query(...),
         by_task.append(t)
     by_task.sort(key=lambda x: x["calls"], reverse=True)
     by_task_model = [{"task": r["task"], "model": r["model"], "calls": r["calls"], "cost": r["cost"]} for r in btm_rows]
+
+    from app.services import cost_report as _cr
+    by_flow = _cr.aggregate_flows(by_task)          # T3-R1: aceeași mapare task → flux peste tot
+
+    # T3-R1: economia din cache pe fereastră (goală dacă tabelul lipsește sau nu are rânduri).
+    cache_savings = []
+    try:
+        if db.execute(text("SELECT to_regclass('ai_cache_hit_log')")).scalar():
+            cache_savings = [{"task_prefix": r._mapping["task_prefix"], "hits": int(r._mapping["hits"] or 0),
+                              "saved_cost": float(r._mapping["saved"] or 0)}
+                             for r in db.execute(text(
+                                 "SELECT task_prefix, count(*) AS hits, COALESCE(sum(saved_cost_usd),0) AS saved "
+                                 "FROM ai_cache_hit_log "
+                                 "WHERE (created_at AT TIME ZONE 'Europe/Bucharest')::date BETWEEN :df AND :dt "
+                                 "GROUP BY 1 ORDER BY saved DESC, hits DESC"), params).fetchall()]
+    except Exception:
+        db.rollback()
+        cache_savings = []
+
+    def _pct(part, whole):
+        return ("%.2f" % (100.0 * part / whole)) if whole else ""
 
     def _lbl(m):
         if not m or m == "?":
@@ -504,16 +531,34 @@ def ai_cost_report(date_from: str = Query(...), date_to: str = Query(...),
             w.writerow([_lbl(m["model"]), m["calls"], "%.6f" % m["cost"], m["tokens_in"], m["tokens_out"]])
         w.writerow(["TOTAL", totals["calls"], "%.6f" % totals["cost"], totals["tokens_in"], totals["tokens_out"]])
         w.writerow([])
+        w.writerow(["PE FLUX"])
+        w.writerow(["flux", "apeluri", "cost_usd", "apeluri_esuate", "cost_esuate_usd", "cost_per_apel_usd"])
+        for f in by_flow:
+            w.writerow([f["flow"], f["calls"], "%.6f" % f["cost"], f["errors"], "%.6f" % f["failed_cost"],
+                        "%.6f" % f["cost_per_call"]])
+        w.writerow(["TOTAL", totals["calls"], "%.6f" % totals["cost"], totals["errors"],
+                    "%.6f" % totals["failed_cost"],
+                    "%.6f" % (totals["cost"] / totals["calls"]) if totals["calls"] else ""])
+        w.writerow([])
         w.writerow(["PER TASK"])
-        w.writerow(["task", "interogari", "cost_usd", "model_dominant", "pct_dominant", "erori"])
+        w.writerow(["task", "interogari", "cost_usd", "model_dominant", "pct_dominant", "erori",
+                    "cost_erori_usd", "pct_cost_erori"])
         for t in by_task:
             share = ("%.0f" % t["top_share"]) if t["top_share"] is not None else ""
-            w.writerow([t["task"], t["calls"], "%.6f" % t["cost"], _lbl(t["top_model"]), share, t["errors"]])
+            w.writerow([t["task"], t["calls"], "%.6f" % t["cost"], _lbl(t["top_model"]), share, t["errors"],
+                        "%.6f" % t["failed_cost"], _pct(t["failed_cost"], t["cost"])])
+        w.writerow(["TOTAL", totals["calls"], "%.6f" % totals["cost"], "", "", totals["errors"],
+                    "%.6f" % totals["failed_cost"], _pct(totals["failed_cost"], totals["cost"])])
         w.writerow([])
         w.writerow(["TASK x MODEL"])
         w.writerow(["task", "model", "interogari", "cost_usd"])
         for r in sorted(by_task_model, key=lambda x: ((x["task"] or ""), -x["calls"])):
             w.writerow([r["task"], _lbl(r["model"]), r["calls"], "%.6f" % r["cost"]])
+        w.writerow([])
+        w.writerow(["ECONOMIE DIN CACHE"])
+        w.writerow(["prefix", "hituri", "cost_evitat_usd"])
+        for c in cache_savings:
+            w.writerow([c["task_prefix"], c["hits"], "%.6f" % c["saved_cost"]])
         data = buf.getvalue().encode("utf-8-sig")
         fname = "raport-costuri-ai_%s_%s.csv" % (date_from, date_to)
         return Response(content=data, media_type="text/csv; charset=utf-8",
@@ -529,16 +574,17 @@ def ai_cost_report(date_from: str = Query(...), date_to: str = Query(...),
             "calls": sum(t["calls"] for t in rest), "cost": sum(t["cost"] for t in rest),
             "tokens_in": sum(t["tokens_in"] for t in rest), "tokens_out": sum(t["tokens_out"] for t in rest),
             "errors": sum(t["errors"] for t in rest), "top_model": None, "top_share": None,
+            "failed_cost": sum(t["failed_cost"] for t in rest),
         })
     top_names = set(t["task"] for t in by_task[:DETAIL_CAP])
     pdf_btm = [r for r in by_task_model if r["task"] in top_names]
 
-    from app.services import cost_report as _cr
     s_ = get_settings()
     meta = {"app_name": s_.app_name, "app_env": s_.app_env, "app_version": s_.app_version,
             "date_from": date_from, "date_to": date_to,
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    pdf = _cr.generate_cost_report_pdf(meta, totals, by_model, pdf_tasks, pdf_btm)
+    pdf = _cr.generate_cost_report_pdf(meta, totals, by_model, pdf_tasks, pdf_btm,
+                                       by_flow=by_flow, cache_savings=cache_savings)
     fname = "raport-costuri-ai_%s_%s.pdf" % (date_from, date_to)
     return Response(content=pdf, media_type="application/pdf",
                     headers={"Content-Disposition": 'attachment; filename="%s"' % fname})
