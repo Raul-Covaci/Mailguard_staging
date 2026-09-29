@@ -851,6 +851,150 @@ def _cache_ok_salvage(res) -> bool:
     return isinstance(parsed, dict)
 
 
+# ── T3-O14: „Haiku întâi" + shadow pe vision-ul de CLASIFICARE (doc_classify_vision, doc_segment) ──
+# Vision-ul de documente rula tot pe Sonnet (380,99 din 406,09 USD în W-BEFORE); Haiku 4.5 are vision
+# și costă ~o treime. Calitatea NU se schimbă orbește:
+#   - shadow (settings documents.haiku_shadow_tasks, eșantion documents.haiku_shadow_sample): producția
+#     rămâne pe Sonnet; pentru un eșantion se cheamă în plus Haiku pe un fir separat, fără să blocheze
+#     și fără să atingă rezultatul, iar ETICHETELE celor două modele se compară în doc_model_shadow;
+#   - „Haiku întâi" (documents.haiku_first_tasks): Haiku se acceptă DOAR dacă trece exact validarea
+#     apelantului (_cache_ok_salvage) și are confidence >= documents.haiku_min_confidence (0.90);
+#     altfel Sonnet, ca azi.
+# Ambele liste sunt goale implicit = comportamentul de azi. Cache-ul T3-L1 are modelul în cheie, deci
+# rezultatele Haiku și Sonnet se păstrează separat.
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+_HAIKU_FIRST_KEY = "documents.haiku_first_tasks"
+_HAIKU_MIN_CONF_KEY = "documents.haiku_min_confidence"
+_HAIKU_SHADOW_KEY = "documents.haiku_shadow_tasks"
+_HAIKU_SHADOW_SAMPLE_KEY = "documents.haiku_shadow_sample"
+_HAIKU_MIN_CONF_DEFAULT = 0.90
+_HAIKU_SHADOW_SAMPLE_DEFAULT = 0.3
+_SHADOW_SLOTS = threading.BoundedSemaphore(2)   # max 2 apeluri shadow simultan; plin -> eșantion sărit
+_DOC_CATEGORIES = ("vehicul", "sofer", "contract")
+
+
+def _haiku_listed(key: str, task_prefix: str) -> bool:
+    v = feature_flags.get_value(key, [])
+    return isinstance(v, list) and task_prefix in v
+
+
+def _haiku_min_conf() -> float:
+    try:
+        return float(feature_flags.get_value(_HAIKU_MIN_CONF_KEY, _HAIKU_MIN_CONF_DEFAULT))
+    except (TypeError, ValueError):
+        return _HAIKU_MIN_CONF_DEFAULT
+
+
+def _vision_parsed(res):
+    """Parsarea apelantului: `parsed` dict sau `_salvage_json(text)`; None dacă apelantul l-ar respinge."""
+    if not res or not (res.get("ok") or res.get("text")) or not _cache_ok_salvage(res):
+        return None
+    return res.get("parsed") if isinstance(res.get("parsed"), dict) else _salvage_json(res.get("text"))
+
+
+def _haiku_accept(res):
+    """Rezultatul Haiku, doar dacă trece validarea apelantului ȘI pragul de încredere. Altfel None."""
+    parsed = _vision_parsed(res)
+    if parsed is None:
+        return None
+    try:
+        conf = float(parsed.get("confidence"))
+    except (TypeError, ValueError):
+        return None                       # schema are confidence: lipsa lui = nesigur -> Sonnet
+    return parsed if conf >= _haiku_min_conf() else None
+
+
+def _shadow_labels(task_prefix: str, parsed):
+    """DOAR etichete (id-uri, categorii, limite de pagină, încredere) — niciun text extras, niciun
+    `reason` (poate cita date personale din document)."""
+    if not isinstance(parsed, dict):
+        return None
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    try:
+        conf = round(float(parsed.get("confidence")), 3)
+    except (TypeError, ValueError):
+        conf = None
+    lab = {"type_id": _i(parsed.get("type_id")), "confidence": conf}
+    if task_prefix == "doc_segment":
+        lab["starts_new"] = bool(parsed.get("starts_new", True))
+    else:
+        cat = str(parsed.get("category") or "").strip().lower()
+        lab["category"] = cat if cat in _DOC_CATEGORIES else None
+        lab["is_document"] = parsed.get("is_document") if isinstance(parsed.get("is_document"), bool) else None
+        docs = parsed.get("documents") if isinstance(parsed.get("documents"), list) else []
+        lab["documents"] = sorted((_i(d.get("type_id")) for d in docs if isinstance(d, dict)),
+                                  key=lambda x: (x is None, x or 0))
+    return lab
+
+
+def _shadow_match(task_prefix: str, a, b) -> bool:
+    if not a or not b or a.get("type_id") != b.get("type_id"):
+        return False
+    if task_prefix == "doc_segment":
+        return a.get("starts_new") == b.get("starts_new")
+    return a.get("documents") == b.get("documents")
+
+
+def _shadow_write(task_prefix, input_hash, s_res, s_parsed, h_res, h_parsed) -> None:
+    s_lab, h_lab = _shadow_labels(task_prefix, s_parsed), _shadow_labels(task_prefix, h_parsed)
+
+    def _cost(r):
+        return ((r or {}).get("usage") or {}).get("cost_usd")
+    db = SessionLocal()
+    try:
+        db.execute(text(
+            "INSERT INTO doc_model_shadow (task_prefix, input_hash, sonnet_model, haiku_model, "
+            "  sonnet_labels, haiku_labels, sonnet_type_id, haiku_type_id, haiku_valid, match, "
+            "  sonnet_cost_usd, haiku_cost_usd) "
+            "VALUES (:t, :h, :sm, :hm, CAST(:sl AS jsonb), CAST(:hl AS jsonb), :st, :ht, :hv, :m, :sc, :hc)"),
+            {"t": task_prefix, "h": input_hash, "sm": (s_res or {}).get("model"),
+             "hm": (h_res or {}).get("model"), "sl": json.dumps(s_lab), "hl": json.dumps(h_lab),
+             "st": (s_lab or {}).get("type_id"), "ht": (h_lab or {}).get("type_id"),
+             "hv": h_parsed is not None, "m": _shadow_match(task_prefix, s_lab, h_lab),
+             "sc": _cost(s_res), "hc": _cost(h_res)})
+        db.commit()
+    except Exception:
+        logger.warning("doc_model_shadow: scriere esuata (%s)", task_prefix, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _shadow_maybe(task_prefix, input_bytes, s_res, s_parsed, call_haiku) -> bool:
+    """Pornește (poate) comparația Haiku pe un fir separat. Nu blochează, nu întoarce nimic util
+    apelantului și nu atinge rezultatul Sonnet. True dacă firul a pornit (pentru teste)."""
+    import hashlib
+    import random
+    if s_parsed is None or not _haiku_listed(_HAIKU_SHADOW_KEY, task_prefix):
+        return False
+    try:
+        sample = float(feature_flags.get_value(_HAIKU_SHADOW_SAMPLE_KEY, _HAIKU_SHADOW_SAMPLE_DEFAULT))
+    except (TypeError, ValueError):
+        sample = _HAIKU_SHADOW_SAMPLE_DEFAULT
+    if random.random() >= sample or not _SHADOW_SLOTS.acquire(blocking=False):
+        return False
+    input_hash = hashlib.sha256(input_bytes or b"").hexdigest()
+
+    def _run():
+        try:
+            h_res = call_haiku()
+            _shadow_write(task_prefix, input_hash, s_res, s_parsed, h_res, _vision_parsed(h_res))
+        except Exception:
+            logger.warning("doc_model_shadow: apel Haiku esuat (%s)", task_prefix, exc_info=True)
+        finally:
+            _SHADOW_SLOTS.release()
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def _cache_ok_parsed_dict(res) -> bool:
     """Validator de cache (T3-L1) pentru apelurile json care cer `parsed` dict (ca apelantul)."""
     return isinstance(res.get("parsed"), dict)
@@ -2081,18 +2225,26 @@ def _classify_attachment_vision(classify_system: str, path: str, mime: str,
         content += "\n\nText OCR brut (indiciu, poate fi gresit):\n" + _clip_doc_text(doc_text, 4000)
     digest = hashlib.sha1(raw).hexdigest()[:12]
     task = "cargo360:doc_classify_vision:%s:%s" % (digest, _cache_salt(classify_system, content))
-    res = None
     _attempts, _ctimeout = _ai_budget(vision=True)
+
+    def _call(model_hint):
+        return iris_ai.run_prompt(classify_system, content, response_format="text", model_hint=model_hint,
+                                  temperature=0.0, max_tokens=1200, task=task, timeout=_ctimeout,
+                                  attachments=atts, cache_ok=_cache_ok_salvage)
+    if _haiku_listed(_HAIKU_FIRST_KEY, "doc_classify_vision"):          # T3-O14
+        h_parsed = _haiku_accept(_call(HAIKU_MODEL))
+        if h_parsed is not None:
+            return h_parsed, HAIKU_MODEL, None
+    res = None
     for attempt in range(_attempts):
-        res = iris_ai.run_prompt(classify_system, content, response_format="text", model_hint="sonnet",
-                                 temperature=0.0, max_tokens=1200, task=task, timeout=_ctimeout,
-                                 attachments=atts, cache_ok=_cache_ok_salvage)
+        res = _call("sonnet")
         if res.get("ok") or (res.get("error") or {}).get("code") not in _RETRY_CODES:
             break
         time.sleep(1.2 * (attempt + 1))
     if res and (res.get("ok") or res.get("text")):
         parsed = res.get("parsed") if isinstance(res.get("parsed"), dict) else _salvage_json(res.get("text"))
         if isinstance(parsed, dict):
+            _shadow_maybe("doc_classify_vision", raw, res, parsed, lambda: _call(HAIKU_MODEL))   # T3-O14
             return parsed, res.get("model"), None
     err = ((res.get("error") or {}).get("message") if res else "fail") or "raspuns invalid"
     return None, (res.get("model") if res else None), err
@@ -2941,8 +3093,17 @@ def _segment_pages(path, mime, catalog, page_count):
         task = "cargo360:doc_segment:%s:%s" % (hashlib.sha1(raw).hexdigest()[:12], (prev_label or "_")[:10])
         _attempts, _ctimeout = _ai_budget(vision=True)
         parsed, last_err = None, None
+
+        def _seg_call(model_hint, _atts=atts, _content=content, _task=task, _t=_ctimeout):
+            return iris_ai.run_prompt(system, _content, response_format="text", model_hint=model_hint,
+                                      temperature=0.0, max_tokens=400, task=_task, timeout=_t,
+                                      attachments=_atts, cache_ok=_cache_ok_salvage)
+        haiku_used = False
+        if _haiku_listed(_HAIKU_FIRST_KEY, "doc_segment"):                   # T3-O14
+            parsed = _haiku_accept(_seg_call(HAIKU_MODEL))
+            haiku_used = parsed is not None
         # Incearca pe seg_model; daca esueaza ne-tranzitoriu pe haiku, cade o data pe sonnet (si ramane).
-        for mdl in ([seg_model] if seg_model == "sonnet" else [seg_model, "sonnet"]):
+        for mdl in ([] if haiku_used else ([seg_model] if seg_model == "sonnet" else [seg_model, "sonnet"])):
             res = None
             for attempt in range(_attempts):
                 res = iris_ai.run_prompt(system, content, response_format="text", model_hint=mdl,
@@ -2959,6 +3120,8 @@ def _segment_pages(path, mime, catalog, page_count):
                 if mdl == "sonnet" and seg_model != "sonnet":
                     logger.info("doc_segment: fallback haiku->sonnet (att pagina %d)", i + 1)
                     seg_model = "sonnet"
+                if mdl == "sonnet":
+                    _shadow_maybe("doc_segment", raw, res, parsed, lambda c=_seg_call: c(HAIKU_MODEL))   # T3-O14
                 break
             if _is_transient_ai_err(last_err):
                 break  # tranzitoriu: nu mai schimba modelul, semnaleaza retry

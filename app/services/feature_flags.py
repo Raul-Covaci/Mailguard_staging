@@ -60,3 +60,38 @@ def is_enabled(key: str) -> bool:
     with _lock:
         _cache[key] = (now, val)
     return val
+
+
+_MISSING = object()
+
+
+def _read_value(key: str):
+    db = None
+    try:
+        db = _session()
+        row = db.execute(text("SELECT value FROM settings WHERE key = :k"), {"k": key}).fetchone()
+    except Exception:
+        logger.warning("feature_flags: nu pot citi %s — valoarea implicita", key)
+        return _MISSING
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+    return row[0] if row else _MISSING
+
+
+def get_value(key: str, default=None):
+    """Valoarea jsonb din settings (listă, număr...), memorată 30 s. Lipsă/eroare -> `default`."""
+    now = time.monotonic()
+    ck = ("value", key)
+    with _lock:
+        hit = _cache.get(ck)
+        if hit is not None and now - hit[0] < _TTL_S:
+            val = hit[1]
+            return default if val is _MISSING else val
+    val = _read_value(key)
+    with _lock:
+        _cache[ck] = (now, val)
+    return default if val is _MISSING else val
