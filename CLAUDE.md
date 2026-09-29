@@ -76,6 +76,29 @@ modificările durabile se fac în fișierul din repo.
 
 ---
 
+## 🗄️ CACHE DE REZULTAT AI — `ai_result_cache` (T3-L1, 2026-09-29)
+
+Același document/atașament nu mai ajunge la model de două ori cu intrare identică. Interceptare în
+`iris_ai.run_prompt()` (`app/services/ai_cache.py`); doc complet: **`docs/AI_CACHE.md`**.
+
+- **Flag:** `settings['ai_cache.enabled']` — implicit `false`. Prefixe: `settings['ai_cache.prefixes']`
+  (potrivire EXACTĂ pe funcția din task: `doc_segment`, `doc_classify[_vision]`, `doc_extract[_vision]`,
+  `doc_vision_ocr`, `doc_rename`, `doc_autogroup`, `op_series`). TTL `ai_cache.ttl_days` (10).
+- **Cheia** = sha256 pe payload-ul EFECTIV (prompt, transcript, atașamente, model, format, max_tokens,
+  temperature, epoch) — NU numele task-ului. `temperature > 0` nu se cache-uiește niciodată.
+- ⛔ **Orice apelant nou pe un prefix din listă trimite `cache_ok=`** cu EXACT verificarea lui, și are
+  test prin funcția reală. Fără el, un răspuns pe care apelantul îl respinge devine eșec permanent.
+- ⚠️ `no_cache=True` NU ocolește acest cache (e pentru cache-ul curated al gateway-ului). Singura
+  ocolire: „Reidentifică" (`ai_cache_bypass`) — sare citirea, iar scrierea înlocuiește intrarea.
+- ⚠️ `result` e `json`, nu `jsonb` (ordinea cheilor contează pentru `_normalize_keys`). Nu schimba.
+- **Invalidare:** totală — `UPDATE settings SET value = to_jsonb((value)::int + 1) WHERE key = 'ai_cache.epoch';`
+  punctuală — `DELETE FROM ai_result_cache WHERE task_prefix = '<prefix>';`
+- Rândurile conțin date extrase din documente: curățarea orară rulează și cu flag-ul OFF;
+  `scripts/purge_documents_before.py` șterge și cache-ul de dinainte de prag.
+- Măsurare: `scripts/metrics/ai_cache_savings.sql`.
+
+---
+
 ## 📧 RAPOARTE LUNARE PRODUCTIVITATE — anti-duplicat prin REZERVARE, nu prin marcaj (2026-09-12)
 
 Emailul „Rezumat productivitate <luna> — <grup>" pleacă în prima zi lucrătoare a lunii, la ora
@@ -1285,7 +1308,7 @@ Schema: `MAJOR.MINOR.PATCH`
 | **MINOR** | Feature nou între release-uri (pe staging) | v1.0.0 → v1.1.0 |
 | **PATCH** | Fix între release-uri (pe staging) | v1.0.0 → v1.0.1 |
 
-**Versiunea curentă:** `v3.26.0` (staging, 2026-09-22)
+**Versiunea curentă:** `v3.31.0` (staging, 2026-09-29)
 **Ultimul release pe producție:** `v3.0.0`.
 
 Reguli impuse agentului:

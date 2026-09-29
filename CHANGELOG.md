@@ -24,14 +24,27 @@ deja clasificate.
   NU numele task-ului, care în `documents.py` nu garantează intrare identică.
 - În cache intră doar `ok: true` validat de apelant (parametru nou `cache_ok`); niciodată erori,
   `ok: false` sau `temperature > 0`. La hit: fără gateway, fără rând în `ai_call_log`, model ORIGINAL.
-- Ocolire: doar „Reidentifică" (ContextVar `ai_cache_bypass`).
-- TTL 10 zile; curățare din tick-ul existent, cel mult o dată pe oră, doar cu cache-ul activ.
+  Validatorul face EXACT verificarea apelantului: `op_series` acceptă doar un răspuns recunoscut de
+  `_parse_series_answer` (serie validă sau `NONE`, monedă validă/`NONE`/absentă) — un refuz sau
+  proză nu intră, altfel cele 3 încercări ale extragerii OP ar primi același răspuns; `doc_rename`
+  cere `nume_complet` nevid.
+- Ocolire: doar „Reidentifică" (ContextVar `ai_cache_bypass`): sare CITIREA; rezultatul nou, dacă
+  trece validatorul, ÎNLOCUIEȘTE intrarea existentă, deci un reprocess ulterior primește răspunsul
+  corectat de operator.
+- `result` stocat ca `json` (nu `jsonb`): ordinea cheilor rămâne a modelului — `_normalize_keys`
+  depinde de ea când modelul întoarce două variante ale aceleiași chei.
+- `no_cache` (cache-ul „curated" al gateway-ului) NU ocolește acest cache și nu intră în cheie.
+- TTL 10 zile; curățare din tick-ul existent, cel mult o dată pe oră — și cu flag-ul OFF (rândurile
+  conțin date extrase din documente), dacă tabelul există. `scripts/purge_documents_before.py` șterge
+  și cache-ul creat înainte de `--before`.
 - Orice eșec al cache-ului = apel normal + WARNING. Cache-ul nu poate opri procesarea.
 - Migrație `migrations/20260929_ai_result_cache.sql` (tabele `ai_result_cache`,
   `ai_cache_hit_log` + cheile de config, aditiv); down manual în
   `migrations/down/20260929_ai_result_cache.down.sql` (în afara glob-ului din `migrate.sh`).
 - Teste: `tests/test_ai_cache.py`, pe Postgres real local (`pgserver`, adăugat în
-  `requirements-dev.txt`). Documentație: `docs/AI_CACHE.md`.
+  `requirements-dev.txt`; lipsa lui face testele să PICE cu mesaj explicit, nu să fie sărite).
+  Fiecare apelant de pe prefixele cache-uite e testat prin funcția lui reală, cu un răspuns pe care
+  îl respinge: nu se scrie în cache. Documentație: `docs/AI_CACHE.md`.
 
 Flag-uri (`settings`): `ai_cache.enabled` (false), `ai_cache.prefixes` (`doc_segment`,
 `doc_classify_vision`, `doc_classify`, `doc_extract`, `doc_extract_vision`, `doc_vision_ocr`,
@@ -39,11 +52,12 @@ Flag-uri (`settings`): `ai_cache.enabled` (false), `ai_cache.prefixes` (`doc_seg
 `ai_cache.ttl_days` (10). Se recitesc în ≤30 s, fără restart.
 
 Activare: `UPDATE settings SET value='true'::jsonb WHERE key='ai_cache.enabled';`
-Măsurare: `psql … -f scripts/metrics/ai_cache_savings.sql` (pe zi și prefix: hit-uri,
-`saved_cost_usd`, apeluri reale, `hit_ratio`). Rapoartele existente nu se schimbă.
+Măsurare: `psql … -f scripts/metrics/ai_cache_savings.sql` (pe zi și prefix: `hits`,
+`saved_cost_usd`, `real_calls`, `real_cost_usd`, `hits_vs_real_calls` — `real_calls` include
+eșecurile și reîncercările, deci nu e o rată de hit). Rapoartele existente nu se schimbă.
 Invalidare totală: `UPDATE settings SET value = to_jsonb((value)::int + 1) WHERE key='ai_cache.epoch';`
-Oprire: `ai_cache.enabled=false`, apoi `DELETE FROM ai_result_cache;` (rândurile conțin date extrase
-din documente, iar cu cache-ul oprit curățarea automată nu mai rulează).
+Oprire: `ai_cache.enabled=false`. Rândurile rămase expiră singure (curățarea orară rulează și cu
+flag-ul OFF); pentru ștergere imediată: `DELETE FROM ai_result_cache;`.
 
 ## v3.30.2 - 2026-09-29
 
