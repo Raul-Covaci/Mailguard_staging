@@ -16912,6 +16912,17 @@ function CallAiAnalysis({ scores, callId, onRescored }) {
     ]);
   }
 
+  // T3-S1: apel sarit la scorare (transcript sub calls.score_min_transcript_chars) — fara apel AI,
+  // fara scoruri. Butonul forteaza scorarea (decizia operatorului are prioritate).
+  if (scores.skip_reason === 'too_short') {
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-start' } }, [
+      h('div', { key: 'm', style: { color: 'var(--t3)', fontSize: 13 } },
+        'Prea scurt pentru scorare — transcriptul e sub pragul setat, deci nu s-a facut nicio analiza AI. ' +
+        '„Analizeaza acum" il scoreaza oricum.'),
+      rescoreBtn,
+    ]);
+  }
+
   var badge = function (key, txt, col) {
     return h('span', { key: key, style: { display: 'inline-block', padding: '2px 9px', borderRadius: 12, fontSize: 11, fontWeight: 700,
       background: col + '22', color: col, border: '1px solid ' + col + '55' } }, txt);

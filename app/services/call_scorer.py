@@ -391,8 +391,29 @@ def _safe_int(v) -> Optional[int]:
         return None
 
 
-def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
-    """Scorează un singur apel. Persistă în call_ai_scores. Returnează dict cu rezultatele."""
+# ── T3-S1: prag minim de transcript (settings calls.score_min_transcript_chars, 0 = oprit) ─────────
+# Mesageriile vocale și apelurile închise imediat (7,6% din apelurile scorate au sub 300 de caractere)
+# plăteau toate cele ~21 de prompturi (~0,058 USD) pentru scoruri fără sens. Sub prag: niciun apel AI,
+# iar apelul primește un rând în call_ai_scores cu skip_reason='too_short' și fără scoruri — astfel
+# score_batch nu-l mai reselectează. Lungimea se măsoară pe `calls.transcript` (textul brut).
+MIN_TRANSCRIPT_KEY = "calls.score_min_transcript_chars"
+SKIP_TOO_SHORT = "too_short"
+
+
+def _min_transcript_chars() -> int:
+    from app.services import feature_flags
+    try:
+        v = int(feature_flags.get_value(MIN_TRANSCRIPT_KEY, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, v)
+
+
+def score_call(call_id: int, db=None, force: bool = False,
+               ignore_min_length: bool = False) -> Dict[str, Any]:
+    """Scorează un singur apel. Persistă în call_ai_scores. Returnează dict cu rezultatele.
+
+    `ignore_min_length=True` (score-now cu force, decizie manuală) scorează și sub prag."""
     close_db = db is None
     if db is None:
         db = SessionLocal()
@@ -413,6 +434,24 @@ def score_call(call_id: int, db=None, force: bool = False) -> Dict[str, Any]:
         ), {"id": call_id}).fetchone()
         if not call_row:
             return {"ok": False, "reason": "not_found", "call_id": call_id}
+
+        min_chars = 0 if ignore_min_length else _min_transcript_chars()
+        if min_chars and len(call_row.transcript or "") < min_chars:
+            try:
+                db.execute(text(
+                    "INSERT INTO call_ai_scores (call_id, scored_at, skip_reason) "
+                    "VALUES (:id, NOW(), :r) ON CONFLICT (call_id) DO NOTHING"),
+                    {"id": call_id, "r": SKIP_TOO_SHORT})
+                db.commit()
+            except Exception:
+                # Fără marcaj apelul va fi reselectat, dar tot fără niciun apel AI (pragul se aplică
+                # din nou) — deci eșecul costă doar o interogare pe tick, nu bani.
+                db.rollback()
+                logger.warning("call_scorer: marcajul too_short a esuat pentru call_id=%s", call_id,
+                               exc_info=True)
+            logger.info("call_scorer: call_id=%s sarit (transcript %d < %d caractere)",
+                        call_id, len(call_row.transcript or ""), min_chars)
+            return {"ok": False, "reason": SKIP_TOO_SHORT, "skipped": True, "call_id": call_id}
 
         transcript = _build_transcript(call_row)
         if not transcript.strip():
@@ -589,6 +628,7 @@ def score_batch(limit: int = _BATCH_DEFAULT_LIMIT, days_back: int = 1, progress_
             deleted = db.execute(text("""
                 DELETE FROM call_ai_scores
                 WHERE agent_score_total IS NULL
+                  AND skip_reason IS NULL          -- T3-S1: sărite intenționat, nu „goale"
                   AND call_id IN (
                       SELECT c.id FROM calls c
                       WHERE c.started_at >= NOW() - INTERVAL '1 day' * :days
@@ -620,10 +660,13 @@ def score_batch(limit: int = _BATCH_DEFAULT_LIMIT, days_back: int = 1, progress_
 
         ok_count = 0
         fail_count = 0
+        skipped_count = 0
         for call_id in call_ids:
             result = score_call(call_id)
             if result.get("ok"):
                 ok_count += 1
+            elif result.get("skipped"):
+                skipped_count += 1
             else:
                 fail_count += 1
             if progress_cb:
@@ -637,6 +680,7 @@ def score_batch(limit: int = _BATCH_DEFAULT_LIMIT, days_back: int = 1, progress_
             "total": total,
             "scored": ok_count,
             "failed": fail_count,
+            "skipped_too_short": skipped_count,
         }
     except Exception:
         logger.exception("call_scorer: score_batch failed")

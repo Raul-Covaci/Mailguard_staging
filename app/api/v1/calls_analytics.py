@@ -275,7 +275,7 @@ def analytics_dashboard(
             COALESCE(SUM(cas.customer_unacknowledged_count), 0) AS unacknowledged_requests,
             COUNT(cas.id) AS scored_calls
         FROM calls c
-        LEFT JOIN call_ai_scores cas ON cas.call_id = c.id
+        LEFT JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
         WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
     """
     kpi = db.execute(text(kpi_sql), params).fetchone()
@@ -303,7 +303,7 @@ def analytics_dashboard(
                 COUNT(*) FILTER (WHERE c.call_status='ANSWERED') AS answered,
                 ROUND(AVG(cas.agent_score_total)::numeric, 2) AS avg_score
             FROM calls c
-            LEFT JOIN call_ai_scores cas ON cas.call_id = c.id
+            LEFT JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
             WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
             GROUP BY date(c.started_at)
         )
@@ -433,7 +433,7 @@ def analytics_scores(
             COUNT(*) FILTER (WHERE cas.agent_next_steps_clear IS NOT NULL) AS next_steps_scored_count,
             COALESCE(SUM(cas.customer_unacknowledged_count), 0) AS unacknowledged_requests
         FROM calls c
-        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
         WHERE {date_filter}
           AND c.agent_extension IS NOT NULL
           {agent_filter} {bl_sql} {dup_sql}
@@ -494,7 +494,7 @@ def analytics_agent_calls(
             cas.issue_main_problem, cas.scored_at,
             {bin_cols}
         FROM calls c
-        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
         LEFT JOIN clients cl ON cl.id = c.client_id
         WHERE {date_filter}
           AND c.agent_extension = :agent
@@ -509,7 +509,7 @@ def analytics_agent_calls(
     total = db.execute(text(f"""
         SELECT COUNT(*)
         FROM calls c
-        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
         WHERE {date_filter}
           AND c.agent_extension = :agent
           {bl_sql} {dup_sql}
@@ -566,7 +566,8 @@ def analytics_score_now(
         db.execute(text("DELETE FROM call_ai_scores WHERE call_id = :id"), {"id": call_id})
         db.commit()
     from app.services import call_scorer
-    result = call_scorer.score_call(call_id)
+    # T3-S1: cu force, operatorul scorează și un transcript sub pragul minim.
+    result = call_scorer.score_call(call_id, ignore_min_length=bool(force))
     return result
 
 
@@ -663,7 +664,7 @@ def analytics_rescore_missing_binary(
     from app.services import call_scorer
     rows = db.execute(text(
         "SELECT call_id FROM call_ai_scores "
-        "WHERE ("
+        "WHERE skip_reason IS NULL AND (("      # T3-S1: sărite intenționat, nu incomplete
         "  agentul_sa_prezentat IS NULL AND clientul_aminta_judecata IS NULL "
         "  AND clientul_aminta_renuntare IS NULL AND clientul_contactat_anterior IS NULL"
         ") OR masini_care_nu_transmit IS NULL OR ("
@@ -671,7 +672,7 @@ def analytics_rescore_missing_binary(
         # pași următori (agentActions V2)
         "  agent_transparency IS NULL OR issue_within_company_scope IS NULL "
         "  OR agent_next_steps_clear IS NULL"
-        ") "
+        ")) "
         "LIMIT 50"
     )).fetchall()
     call_ids = [r[0] for r in rows]
@@ -879,7 +880,7 @@ def analytics_binary_stats(
                 COUNT(*) FILTER (WHERE {expr} = false) AS negative,
                 COUNT(*) FILTER (WHERE {expr} IS NOT NULL) AS total
             FROM calls c
-            INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+            INNER JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
             WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
         """
         row = db.execute(text(sql), params).fetchone()
@@ -940,7 +941,7 @@ def analytics_score_stats(
             ROUND(AVG(cas.customer_politeness)::numeric, 2)      AS customer_politeness,
             ROUND(AVG(cas.customer_empathy)::numeric, 2)         AS customer_empathy
         FROM calls c
-        INNER JOIN call_ai_scores cas ON cas.call_id = c.id
+        INNER JOIN call_ai_scores cas ON cas.call_id = c.id AND cas.skip_reason IS NULL
         WHERE {date_filter} {agent_filter} {bl_sql} {dup_sql}
     """
     row = db.execute(text(sql), params).fetchone()
