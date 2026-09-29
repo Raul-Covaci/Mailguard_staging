@@ -8,6 +8,30 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.33.0 - 2026-09-29
+
+### MINOR — T3-D1: reluări tranzitorii limitate, imagini normalizate pentru vision, BAD_JSON logat
+
+- **`processing.doc_retry_limit_enabled`** (implicit OFF): `retry_transient` nu mai reia la infinit.
+  Contor pe atașament (`attachments.doc_transient_attempts` / `doc_transient_last_at`), debounce de
+  10 minute în selecția drain-ului, maximum 3 încercări; după a treia, rând `needs_review` cu motivul
+  (un rând `part_no=0` existent doar se marchează, datele extrase rămân). „Reprocesează ID-uri"
+  resetează contorul. Tot sub acest flag, `_vision_transcribe` nu mai are bucla proprie de
+  reîncercări (iris_ai reîncearcă deja; până la 9 POST-uri pe document).
+- **`processing.vision_image_normalize_enabled`** (implicit OFF): înainte de orice apel vision
+  (`documents.py`, `op_extractor.py` — `app/services/vision_image.py`), TIFF/BMP → PNG, iar peste
+  4,5 MB sau 2.000 px pe latura lungă → micșorare proporțională. PDF-urile nu se ating. Dacă nu
+  încape sau nu se poate decoda: fără apel AI, pe calea existentă de revizuire. O imagine deja în
+  limite pleacă cu octeții identici; cheia cache-ului T3-L1 se calculează pe octeții trimiși.
+- **`iris_ai`**: răspunsul fără JSON (`BAD_JSON`) scrie acum rând în `ai_call_log` (ok=false), ca
+  celelalte erori. Fără flag.
+- Migrație `migrations/20260929b_doc_transient_attempts.sql` (coloane + cele 2 chei, OFF); down în
+  `migrations/down/`. Teste: `tests/test_doc_transient_vision.py`.
+
+Activare (independent una de alta):
+`UPDATE settings SET value='true'::jsonb WHERE key IN ('processing.doc_retry_limit_enabled',
+'processing.vision_image_normalize_enabled');` — prinde în ≤30 s, fără restart.
+
 ## v3.32.0 - 2026-09-29
 
 ### MINOR — T3-L3: call_category recuperează JSON-ul din raw_text (flag OFF implicit)
