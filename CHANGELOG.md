@@ -8,6 +8,43 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.31.0 - 2026-09-29
+
+### MINOR — T3-L1: cache de rezultat AI pentru documente și seria OP (flag OFF implicit)
+
+Același document / atașament ajungea la model de mai multe ori cu intrare identică. Producție,
+24.08–20.09.2026: 8.975 de repetări plătite pe `doc_*` (159,81 USD) și 61% repetări la
+`op_series` (29,44 USD total). Cauza principală la `doc_segment`: `retry_transient` nu scrie rând în
+`document_extractions`, deci drain-ul (la 5 minute) resegmentează TOATE paginile, inclusiv pe cele
+deja clasificate.
+
+- Interceptare centrală în `iris_ai.run_prompt()` (`app/services/ai_cache.py`). Cheia = sha256 pe
+  payload-ul efectiv (prefix funcție · model_hint · response_format · max_tokens · temperature ·
+  sha256 system · sha256 transcript după tăiere · (mime, sha256) atașamente, în ordine · epoch) —
+  NU numele task-ului, care în `documents.py` nu garantează intrare identică.
+- În cache intră doar `ok: true` validat de apelant (parametru nou `cache_ok`); niciodată erori,
+  `ok: false` sau `temperature > 0`. La hit: fără gateway, fără rând în `ai_call_log`, model ORIGINAL.
+- Ocolire: doar „Reidentifică" (ContextVar `ai_cache_bypass`).
+- TTL 10 zile; curățare din tick-ul existent, cel mult o dată pe oră, doar cu cache-ul activ.
+- Orice eșec al cache-ului = apel normal + WARNING. Cache-ul nu poate opri procesarea.
+- Migrație `migrations/20260929_ai_result_cache.sql` (tabele `ai_result_cache`,
+  `ai_cache_hit_log` + cheile de config, aditiv); down manual în
+  `migrations/down/20260929_ai_result_cache.down.sql` (în afara glob-ului din `migrate.sh`).
+- Teste: `tests/test_ai_cache.py`, pe Postgres real local (`pgserver`, adăugat în
+  `requirements-dev.txt`). Documentație: `docs/AI_CACHE.md`.
+
+Flag-uri (`settings`): `ai_cache.enabled` (false), `ai_cache.prefixes` (`doc_segment`,
+`doc_classify_vision`, `doc_classify`, `doc_extract`, `doc_extract_vision`, `doc_vision_ocr`,
+`doc_rename`, `doc_autogroup`, `op_series` — potrivire exactă), `ai_cache.epoch` (1),
+`ai_cache.ttl_days` (10). Se recitesc în ≤30 s, fără restart.
+
+Activare: `UPDATE settings SET value='true'::jsonb WHERE key='ai_cache.enabled';`
+Măsurare: `psql … -f scripts/metrics/ai_cache_savings.sql` (pe zi și prefix: hit-uri,
+`saved_cost_usd`, apeluri reale, `hit_ratio`). Rapoartele existente nu se schimbă.
+Invalidare totală: `UPDATE settings SET value = to_jsonb((value)::int + 1) WHERE key='ai_cache.epoch';`
+Oprire: `ai_cache.enabled=false`, apoi `DELETE FROM ai_result_cache;` (rândurile conțin date extrase
+din documente, iar cu cache-ul oprit curățarea automată nu mai rulează).
+
 ## v3.30.2 - 2026-09-29
 
 ### PATCH — raportul lunar de productivitate nu mai pleacă din afara producției
