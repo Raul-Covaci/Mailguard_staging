@@ -8,6 +8,28 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.34.0 - 2026-09-29
+
+### MINOR — T3-G2: fără apeluri AI automate în afara producției
+
+Staging-ul a costat 502 USD de AI în 4 săptămâni fără folos (decizie business). Pe producție nu se
+schimbă nimic (`env_guard.ai_allowed()` e mereu adevărat acolo).
+
+- Plasă în `iris_ai.run_prompt`: în afara producției, fără permisiune, nimic nu pleacă la gateway și
+  nu se scrie în `ai_call_log`; răspunsul e `ok=false`, `error.code='AI_DISABLED_ENV'`. Codul nu e
+  în `_RETRY_CODES`, iar mesajul nu e recunoscut ca tranzitoriu → nicio buclă de reluări.
+- Tick-ul `/process/run-now` sare pașii AI: clasificarea emailurilor (categorie, departament,
+  prioritate, asignare, context client, intent gate — mailurile trec pe calea „AI OFF", eligibile
+  CTS, nu în `error_nova`), vision-ul `op_series` (mailul se finalizează imediat pe fallback, fără
+  cele 3 reîncercări), drain-ul de documente, categoria/diarizarea/scorarea apelurilor (audio și
+  transcrierea rulează), rezumatul AI din raportul de productivitate (template). Satisfacția lunară
+  (`run_monthly_snapshot`) iese imediat cu `skipped_env`. Un singur log INFO pe tick cu pașii săriți.
+- Teste: `tests/test_ai_env_gate.py`; `tests/conftest.py` rulează testele implicit ca pe producție.
+
+Permisiune (teste locale / staging), prinde în ≤30 s, fără restart:
+`INSERT INTO settings(key, value) VALUES ('ai.allow_non_production', 'true'::jsonb)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;`  — oprire: `'false'::jsonb`.
+
 ## v3.33.0 - 2026-09-29
 
 ### MINOR — T3-D1: reluări tranzitorii limitate, imagini normalizate pentru vision, BAD_JSON logat
