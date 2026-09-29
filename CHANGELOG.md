@@ -8,6 +8,31 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.37.0 - 2026-09-29
+
+### MINOR — T3-S1: apelurile cu transcript prea scurt nu se mai scorează
+
+Scorarea costă ~0,058 USD per apel telefonic și rula pe orice transcript nevid; 641 de apeluri scorate
+(7,6%, 24.08–20.09) aveau sub 300 de caractere (mesagerie vocală, apeluri închise).
+
+- `settings['calls.score_min_transcript_chars']` (implicit 0 = oprit): sub prag — măsurat pe
+  `calls.transcript`, nu pe textul diarizat — niciun apel AI; apelul primește un rând în
+  `call_ai_scores` cu `skip_reason='too_short'` și fără scoruri, deci nu mai e reselectat de
+  `score_batch`, `rescore_null` sau `rescore-missing-binary`.
+- `score-now/{id}?force=true` scorează oricum (decizia operatorului). UI: „Prea scurt pentru scorare"
+  în loc de câmpuri goale, cu butonul „Analizează acum".
+- Agregările din `calls_analytics.py` exclud rândurile sărite (nescorate, nu scor 0).
+- Fix inclus: `rescore-missing-binary` avea `AND`/`OR` fără paranteză exterioară.
+- Migrație `migrations/20260929d_call_score_min_transcript.sql` (+ down). Măsurare:
+  `scripts/metrics/call_score_skipped.sql` (pe zi, scorate vs. sărite). Teste:
+  `tests/test_call_score_min.py`.
+
+⚠️ `call_ai_scores` nu e creată de nicio migrație din repo, deci constrângerile ei NOT NULL nu se pot
+verifica local. Înainte de activare, pe staging: `\d call_ai_scores` — dacă o coloană de scor e
+NOT NULL, marcajul nu se scrie (WARNING), dar apelul tot nu primește AI.
+
+Activare (prag propus 300): `UPDATE settings SET value='300'::jsonb WHERE key='calls.score_min_transcript_chars';`
+
 ## v3.36.1 - 2026-09-29
 
 ### PATCH — T3-R1: rând TOTAL în tabelul pe task din PDF
