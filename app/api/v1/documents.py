@@ -770,7 +770,7 @@ def _rename_doc(db, att_id: int, part_no: int, tip_document: str, raw_text: str,
         res = iris_ai.run_prompt(
             RENAME_SYSTEM_PROMPT, content,
             response_format="json", temperature=0.0, max_tokens=300,
-            task=task, timeout=25, cache_ok=_cache_ok_parsed_dict)
+            task=task, timeout=25, cache_ok=_cache_ok_rename)
         if res and res.get("ok") and isinstance(res.get("parsed"), dict):
             renamed = (res["parsed"].get("nume_complet") or "").strip() or None
         else:
@@ -845,6 +845,16 @@ def _cache_ok_salvage(res) -> bool:
 def _cache_ok_parsed_dict(res) -> bool:
     """Validator de cache (T3-L1) pentru apelurile json care cer `parsed` dict (ca apelantul)."""
     return isinstance(res.get("parsed"), dict)
+
+
+def _cache_ok_rename(res) -> bool:
+    """Validator de cache (T3-L1) pentru `doc_rename`: `parsed` dict CU `nume_complet` nevid. Un nume
+    gol lasă documentul neredenumit; în cache, l-ar lăsa așa 10 zile, oricâte reprocesări ar urma."""
+    parsed = res.get("parsed")
+    if not isinstance(parsed, dict):
+        return False
+    name = parsed.get("nume_complet")
+    return isinstance(name, str) and bool(name.strip())
 
 
 def _extract_doc_vision(system: str, files, type_id: int,
@@ -4862,7 +4872,9 @@ def reidentify_extraction(ex_id: int, type_id: int = None, db: Session = Depends
     ales manual si re-extrage cu campurile acelui tip (cheile difera de extragerea veche).
 
     Singura actiune care OCOLESTE cache-ul de rezultat AI (T3-L1): operatorul cere o incercare
-    noua pe un singur document. reprocess-by-ids / ungroup / unsplit / drain folosesc cache-ul."""
+    noua pe un singur document. Ocolirea sare doar CITIREA; rezultatul nou (daca trece validatorul)
+    INLOCUIESTE intrarea din cache, deci un reprocess ulterior primeste raspunsul corectat.
+    reprocess-by-ids / ungroup / unsplit / drain folosesc cache-ul."""
     tok = ai_cache.ai_cache_bypass.set(True)
     try:
         return _reidentify_extraction(ex_id, type_id, db, admin)

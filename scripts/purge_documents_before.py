@@ -10,6 +10,10 @@ Ce face (in aceasta ordine):
      la fel ca in scripts/storage_cleanup.sh.
   2. fisierele native ale atasamentelor acelor mailuri; randul din `attachments` RAMANE
      (storage_path intact), ca in pasul 1 din storage_cleanup.sh.
+  3. cache-ul de rezultat AI (`ai_result_cache`, T3-L1) creat inainte de --before. Contine date
+     extrase din documente, dar cheia e un sha256 pe payload-ul trimis la model — nu se poate lega
+     de un document anume. Se sterge deci tot ce e mai vechi decat pragul. Un rezultat creat DUPA
+     prag pentru un document vechi (ex. reprocesare tarzie) ramane pana la expirare (TTL 10 zile).
 
 Ce NU face: nu sterge mailuri, nu atinge `cts_document_tracking` (acolo e trasabilitatea CTS) si nu
 marcheaza atasamentele ca `doc_discarded` — reprocesarea e blocata de fereastra de procesare
@@ -54,6 +58,20 @@ def _fmt_mb(n):
     return "%.1f MB" % (n / 1048576.0)
 
 
+def purge_ai_cache(db, before: str, apply: bool) -> int:
+    """Randurile din ai_result_cache create inainte de `before` (numarate; sterse doar cu `apply`).
+    0 daca tabelul nu exista (migratia T3-L1 neaplicata). Commit-ul ramane la apelant."""
+    if db.execute(text("SELECT to_regclass('ai_result_cache')")).scalar() is None:
+        return 0
+    if not apply:
+        return db.execute(text(
+            "SELECT count(*) FROM ai_result_cache WHERE created_at < CAST(:b AS date)"),
+            {"b": before}).scalar() or 0
+    return db.execute(text(
+        "DELETE FROM ai_result_cache WHERE created_at < CAST(:b AS date)"),
+        {"b": before}).rowcount or 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -78,6 +96,7 @@ def main():
             "SELECT count(*) FROM document_extractions d JOIN emails e ON e.id=d.email_id "
             "WHERE e.received_at < CAST(:b AS date)"), {"b": args.before}).scalar() or 0
         print("  extrageri de sters: %d" % n_ext)
+        print("  rezultate AI in cache de sters: %d" % purge_ai_cache(db, args.before, apply=False))
 
         files = []
         if not args.no_files:
@@ -112,8 +131,10 @@ def main():
             "DELETE FROM document_extractions d USING emails e "
             "WHERE e.id=d.email_id AND e.received_at < CAST(:b AS date) "
             "AND d.grouped_into IS NULL"), {"b": args.before}).rowcount
+        del_cache = purge_ai_cache(db, args.before, apply=True)
         db.commit()
         print("  sterse: %d grupate + %d root = %d extrageri" % (del1, del2, del1 + del2))
+        print("  sterse: %d rezultate AI din cache" % del_cache)
 
         # 2) fisiere native (randul din attachments ramane)
         removed, freed, errors = 0, 0, 0

@@ -14,7 +14,7 @@
 CREATE TABLE IF NOT EXISTS ai_result_cache (
     cache_key            char(64)     PRIMARY KEY,           -- sha256 hex, vezi ai_cache.cache_key()
     task_prefix          varchar(80)  NOT NULL,              -- ex. doc_segment, op_series
-    result               jsonb        NOT NULL,              -- exact ce întoarce run_prompt(), cu model-ul ORIGINAL
+    result               json         NOT NULL,              -- exact ce întoarce run_prompt(), cu model-ul ORIGINAL; json (nu jsonb): păstrează ordinea cheilor
     original_cost_usd    numeric(12,6),
     original_tokens_in   integer,
     original_tokens_out  integer,

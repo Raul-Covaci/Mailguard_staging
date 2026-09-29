@@ -13,7 +13,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-pgserver = pytest.importorskip("pgserver")
+try:
+    import pgserver
+except ImportError:          # NU skip tăcut: fără Postgres local, cache-ul nu e testat deloc
+    pgserver = None
 
 import sqlalchemy as sa  # noqa: E402
 from sqlalchemy import event  # noqa: E402
@@ -53,6 +56,10 @@ def _run_file(eng, path):
 
 @pytest.fixture(scope="session")
 def pg(tmp_path_factory):
+    if pgserver is None:
+        pytest.fail("pgserver lipsește — testele cache-ului AI (T3-L1) rulează pe un Postgres local "
+                    "efemer. Instalează dependințele de test: "
+                    "venv/bin/pip install -r requirements.txt -r requirements-dev.txt", pytrace=False)
     srv = pgserver.get_server(str(tmp_path_factory.mktemp("pg")), cleanup_mode="stop")
     eng = sa.create_engine(srv.get_uri())
     with eng.begin() as c:
@@ -285,16 +292,52 @@ def test_document_validators_unit():
 
 # ── Ocolire (reidentify) ──────────────────────────────────────────────────────
 
-def test_bypass_skips_read_and_write(env):
+def test_bypass_skips_read_and_overwrites_entry(env):
     call()
     tok = ai_cache.ai_cache_bypass.set(True)
+    env.gw.return_value = _gw_ok(text='{"type_id": 7}')
     try:
-        call(), call(system="nou")
+        assert call()["text"] == '{"type_id": 7}'          # nu citește: gateway-ul e apelat
     finally:
         ai_cache.ai_cache_bypass.reset(tok)
-    assert env.gw.call_count == 3
+    assert env.gw.call_count == 2
     assert env.q("SELECT count(*) FROM ai_cache_hit_log")[0][0] == 0
-    assert len(_rows(env)) == 1
+    [row] = _rows(env)
+    assert row[5]["text"] == '{"type_id": 7}' and row[4] == 0   # intrarea validă a fost înlocuită
+
+
+def test_bypass_result_rejected_by_validator_keeps_old_entry(env):
+    call()
+    tok = ai_cache.ai_cache_bypass.set(True)
+    env.gw.return_value = _gw_ok(text="fara json")
+    try:
+        call(cache_ok=documents._cache_ok_salvage)
+    finally:
+        ai_cache.ai_cache_bypass.reset(tok)
+    assert [r[5]["text"] for r in _rows(env)] == ['{"type_id": 3, "starts_new": true}']
+
+
+def test_reidentify_corrects_cache_for_later_reprocess(env, tmp_path, monkeypatch):
+    """drain pune type_id 1 în cache → „Reidentifică" obține type_id 3 → un reprocess ulterior
+    primește type_id 3 (din cache, fără gateway)."""
+    img = tmp_path / "act.png"
+    img.write_bytes(PNG)
+
+    def classify():
+        return documents._classify_attachment_vision("SYS", str(img), "image/png", "", "act.png")
+
+    env.gw.return_value = _gw_ok(text='{"type_id": 1}')
+    assert classify()[0] == {"type_id": 1}                 # drain: răspuns greșit, cache-uit
+
+    env.gw.return_value = _gw_ok(text='{"type_id": 3}')
+    monkeypatch.setattr(documents, "_reidentify_extraction",
+                        lambda ex_id, type_id, db, admin: classify())
+    assert documents.reidentify_extraction(1, None, db=None, admin={})[0] == {"type_id": 3}
+    assert env.gw.call_count == 2
+
+    env.gw.return_value = _gw_ok(text='{"type_id": 99}')   # n-ar trebui să mai fie cerut
+    assert classify()[0] == {"type_id": 3}
+    assert env.gw.call_count == 2
 
 
 def test_reidentify_endpoint_sets_bypass_only_for_its_duration(monkeypatch):
@@ -350,11 +393,26 @@ def test_purge_deletes_expired_at_most_once_per_hour(env):
     assert ai_cache.purge_expired_if_due() == 0
 
 
-def test_purge_is_noop_when_disabled(env):
+def test_purge_runs_when_disabled(env):
+    """Rândurile rămase dintr-o perioadă cu cache activ conțin date din documente: expiră și cu
+    flag-ul OFF."""
+    call()
+    with env.pg.begin() as c:
+        c.exec_driver_sql("UPDATE ai_result_cache SET expires_at = now() - interval '1 second'")
     env.setting("ai_cache.enabled", False)
-    assert ai_cache.purge_expired_if_due() is None
-    assert env.q("SELECT count(*) FROM settings WHERE key = 'ai_cache.last_purge_at'")[0][0] == 0
-    assert _cache_stmts(env) == []
+    assert ai_cache.purge_expired_if_due() == 1
+    assert _rows(env) == []
+
+
+def test_purge_without_table_does_nothing(env):
+    with env.pg.begin() as c:
+        c.exec_driver_sql("ALTER TABLE ai_result_cache RENAME TO ai_result_cache_x")
+    try:
+        assert ai_cache.purge_expired_if_due() is None
+        assert env.q("SELECT count(*) FROM settings WHERE key = 'ai_cache.last_purge_at'")[0][0] == 0
+    finally:
+        with env.pg.begin() as c:
+            c.exec_driver_sql("ALTER TABLE ai_result_cache_x RENAME TO ai_result_cache")
 
 
 # ── Eșecul cache-ului = comportamentul de azi ─────────────────────────────────
@@ -454,9 +512,9 @@ def test_metrics_query(env):
         rows = c.exec_driver_sql(open(METRICS, encoding="utf-8").read()).fetchall()
     assert len(rows) == 1                                   # email_category nu e în prefixe
     r = rows[0]._mapping
-    assert (r["task_prefix"], r["hits"], r["misses"]) == ("doc_segment", 2, 2)
-    assert float(r["saved_cost_usd"]) == 0.05 and float(r["miss_cost_usd"]) == 0.05
-    assert float(r["hit_ratio"]) == 0.5
+    assert (r["task_prefix"], r["hits"], r["real_calls"]) == ("doc_segment", 2, 2)
+    assert float(r["saved_cost_usd"]) == 0.05 and float(r["real_cost_usd"]) == 0.05
+    assert float(r["hits_vs_real_calls"]) == 0.5
 
 
 def test_migration_down_then_up_is_clean_and_idempotent(pg):
@@ -472,3 +530,232 @@ def test_migration_down_then_up_is_clean_and_idempotent(pg):
                          {"p": "ai_cache.%"}).scalar() == 4
         assert c.exec_driver_sql("SELECT value FROM settings WHERE key='ai_cache.enabled'").scalar() is False
         assert c.exec_driver_sql("SELECT value FROM settings WHERE key='ai_cache.prefixes'").scalar() == PREFIXES
+
+
+# ── Legarea validatorului în apelanții REALI (T3-L1, review: mutațiile M4/M5) ─────
+# Fiecare apelant de pe un prefix cache-uit, cu un răspuns pe care EL îl respinge azi, dar pe
+# care validatorul implicit (`default_ok`) l-ar accepta: dacă apelantul nu-și trimite validatorul,
+# răspunsul intră în cache și devine eșec permanent. Aici: nimic scris, a doua rulare cheamă
+# gateway-ul din nou.
+
+PROSE = "Nu pot clasifica documentul, imaginea e neclara."
+REJECTED_JSON = [{"type_id": 3}]            # `parsed` nenul (trece de default_ok), dar nu e dict
+
+
+def _gw_parsed(parsed, text="[]"):
+    return _Resp(200, {"ok": True, "raw_text": text, "parsed": parsed, "usage": dict(USAGE),
+                       "model": MODEL})
+
+
+def _twice_rejected(env, fn):
+    first, second = fn(), fn()
+    assert env.gw.call_count == 2, "al doilea apel n-a ajuns la gateway: răspunsul respins e în cache"
+    assert _rows(env) == []
+    return first, second
+
+
+@pytest.fixture
+def img(tmp_path):
+    p = tmp_path / "pagina.png"
+    p.write_bytes(PNG)
+    return str(p)
+
+
+def test_caller_segment_pages_rejects_prose(env, img, monkeypatch):
+    monkeypatch.setattr(documents, "_render_page_image", lambda path, i: (PNG, "image/png"))
+    catalog = [{"id": 3, "name": "Talon", "category": "vehicul"}]
+    env.gw.return_value = _gw_ok(text=PROSE)
+    first, _ = _twice_rejected(env, lambda: documents._segment_pages(img, "application/pdf", catalog, 1))
+    assert first[0]["reason"] == "clasificare pagina esuata"
+
+
+def test_caller_extract_doc_rejects_non_dict(env):
+    env.gw.return_value = _gw_parsed(REJECTED_JSON)
+    first, _ = _twice_rejected(env, lambda: documents._extract_doc("SYS", "text document", 7, "Talon"))
+    assert first[0] is None
+
+
+def test_caller_classify_rejects_non_dict(env):
+    env.gw.return_value = _gw_parsed(REJECTED_JSON)
+    first, _ = _twice_rejected(env, lambda: documents._classify_attachment("SYS", "text document", "a.pdf"))
+    assert first[0] is None
+
+
+def test_caller_classify_vision_rejects_prose(env, img):
+    env.gw.return_value = _gw_ok(text=PROSE)
+    first, _ = _twice_rejected(
+        env, lambda: documents._classify_attachment_vision("SYS", img, "image/png", "", "a.png"))
+    assert first[0] is None
+
+
+def test_caller_extract_vision_rejects_prose(env, img):
+    env.gw.return_value = _gw_ok(text=PROSE)
+    first, _ = _twice_rejected(
+        env, lambda: documents._extract_doc_vision("SYS", (img, "image/png"), 7, "Talon"))
+    assert first[0] is None
+
+
+def test_caller_rename_rejects_empty_name(env, monkeypatch):
+    monkeypatch.setattr(documents, "_vehicle_std_name", lambda *a, **k: None)
+    db = MagicMock(name="db")
+    env.gw.return_value = _gw_parsed({"nume_complet": "  "}, text='{"nume_complet": "  "}')
+    _twice_rejected(env, lambda: documents._rename_doc(db, 11, 0, "Contract", "text", "c.pdf"))
+    db.execute.assert_not_called()                          # apelantul n-a redenumit nimic
+
+
+def test_caller_vision_ocr_rejects_blank(env, img):
+    env.gw.return_value = _gw_ok(text="   ")
+    first, _ = _twice_rejected(env, lambda: documents._vision_transcribe(img, "image/png"))
+    assert first == ("", None)                              # apelantul: text gol = fara transcriere
+
+
+def test_caller_op_series_rejects_unrecognized_format(env, img):
+    """Refuz / proză: apelantul îl tratează ca „serie negăsită" și reîncearcă (MAX_EXTRACT_ATTEMPTS)
+    — deci nu are voie în cache; un NONE|NONE real are (vezi testul de mai sus)."""
+    env.gw.return_value = _gw_ok(text="Nu pot citi imaginea")
+    assert op_extractor._vision_extract_series(img, "image/png") == {"series": None, "currency": None}
+    assert _rows(env) == []
+    env.gw.return_value = _gw_ok(text="PPCB|RON")
+    assert op_extractor._vision_extract_series(img, "image/png") == {"series": "PPCB", "currency": "RON"}
+    assert env.gw.call_count == 2
+    assert len(_rows(env)) == 1
+
+
+class _FakeDB:
+    """document_extractions pentru un email cu 2 imagini incerte de același tip: declanșează toate
+    cele trei treceri de autogrupare (holistic, pass 1, pass 2)."""
+
+    def __init__(self, rows):
+        self.rows, self.writes = rows, []
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if not sql.lstrip().upper().startswith("SELECT"):
+            self.writes.append(sql)
+        return SimpleNamespace(fetchall=lambda: [SimpleNamespace(_mapping=dict(r)) for r in self.rows])
+
+    def commit(self):
+        pass
+
+
+def test_caller_autogroup_all_passes_reject_prose(env, tmp_path, monkeypatch):
+    env.setting("ai_cache.prefixes", PREFIXES + ["doc_autogroup_holistic", "doc_autogroup_p2"])
+    monkeypatch.setattr(documents, "_host_path", lambda p: p)
+    rows = []
+    for i, raw in enumerate((PNG, PNG2), 1):
+        f = tmp_path / ("IMG_%d.png" % i)
+        f.write_bytes(raw)
+        rows.append({"ex_id": 100 + i, "attachment_id": 200 + i, "document_type_id": 5,
+                     "category": "vehicul", "detected_type": "Talon", "confidence": 0.5,
+                     "raw_text": "text", "att_name": f.name, "content_type": "image/png",
+                     "storage_path": str(f)})
+    db = _FakeDB(rows)
+    env.gw.return_value = _gw_ok(text=PROSE)
+    assert documents._autogroup_email_images(db, 1) == 0
+    assert env.gw.call_count == 3                           # holistic + pass 1 + pass 2
+    assert documents._autogroup_email_images(db, 1) == 0
+    assert env.gw.call_count == 6, "o trecere a servit din cache un răspuns respins"
+    assert _rows(env) == [] and db.writes == []
+    tasks = {c.kwargs["json"]["task"].split(":")[1] for c in env.gw.call_args_list}
+    assert tasks == {"doc_autogroup_holistic", "doc_autogroup", "doc_autogroup_p2"}
+
+
+def test_rename_validator_unit():
+    assert documents._cache_ok_rename({"parsed": {"nume_complet": "RO_B123ABC_VP.pdf"}})
+    assert not documents._cache_ok_rename({"parsed": {"nume_complet": " "}})
+    assert not documents._cache_ok_rename({"parsed": {"nume_complet": None}})
+    assert not documents._cache_ok_rename({"parsed": ["x"]})
+
+
+@pytest.mark.parametrize("answer,series,currency,recognized", [
+    ("PPCB|RON", "PPCB", "RON", True),
+    ("NONE|NONE", None, None, True),
+    ("NONE|MDL", None, "MDL", True),
+    ("ppcb", "PPCB", None, True),
+    ("RON|RON", None, "RON", False),                        # seria = moneda: apelantul o respinge
+    ("PPCB|LEI ROMANESTI", "PPCB", None, False),           # moneda nerecunoscută
+    ("Nu pot citi imaginea", None, None, False),
+    ("", None, None, False),
+])
+def test_op_series_parse_matches_caller_rule(answer, series, currency, recognized):
+    assert op_extractor._parse_series_answer(answer) == {
+        "series": series, "currency": currency, "recognized": recognized}
+
+
+# ── Ordinea cheilor: `json`, nu `jsonb` ───────────────────────────────────────
+
+def test_hit_keeps_key_order_for_duplicate_normalized_keys(env):
+    """Modelul întoarce și 'Vin (E.)', și 'Vin'; `_normalize_keys` le mapează pe aceeași cheie
+    canonică și câștigă ULTIMA. Cu `jsonb` (chei sortate) hit-ul ar alege cealaltă valoare."""
+    fields = [{"name": "Vin (E.)"}]
+    env.gw.return_value = _gw_parsed({"Vin (E.)": "WVWZZZ1", "Vin": "WVWZZZ2"})
+    miss = documents._extract_doc("SYS", "text document", 7, "Talon", fields=fields)
+    hit = documents._extract_doc("SYS", "text document", 7, "Talon", fields=fields)
+    assert env.gw.call_count == 1
+    assert miss[0] == hit[0] == {"Vin (E.)": "WVWZZZ2"}
+    assert list(_rows(env)[0][5]["parsed"]) == ["Vin (E.)", "Vin"]
+
+
+# ── purge_documents_before.py: și cache-ul AI ─────────────────────────────────
+
+def _load_purge_script(monkeypatch):
+    import importlib.util
+    real_isfile = os.path.isfile
+    # scriptul încarcă `.env` la import; în teste nu vrem variabilele reale în mediu
+    monkeypatch.setattr(os.path, "isfile", lambda p: False if str(p).endswith(".env") else real_isfile(p))
+    spec = importlib.util.spec_from_file_location(
+        "purge_documents_before", os.path.join(ROOT, "scripts", "purge_documents_before.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(os.path, "isfile", real_isfile)
+    return mod
+
+
+def test_purge_documents_script_clears_ai_cache_before_cutoff(env, monkeypatch):
+    mod = _load_purge_script(monkeypatch)
+    call(), call(system="al doilea")
+    with env.pg.begin() as c:
+        c.exec_driver_sql("UPDATE ai_result_cache SET created_at = '2026-08-01' "
+                          "WHERE cache_key = (SELECT min(cache_key) FROM ai_result_cache)")
+    Session = sessionmaker(bind=env.pg)
+    db = Session()
+    try:
+        assert mod.purge_ai_cache(db, "2026-08-24", apply=False) == 1
+        assert len(_rows(env)) == 2                         # dry-run: nimic șters
+        assert mod.purge_ai_cache(db, "2026-08-24", apply=True) == 1
+        db.commit()
+    finally:
+        db.close()
+    assert len(_rows(env)) == 1
+
+
+def test_purge_documents_script_without_cache_table(env, monkeypatch):
+    mod = _load_purge_script(monkeypatch)
+    with env.pg.begin() as c:
+        c.exec_driver_sql("ALTER TABLE ai_result_cache RENAME TO ai_result_cache_x")
+    db = sessionmaker(bind=env.pg)()
+    try:
+        assert mod.purge_ai_cache(db, "2026-08-24", apply=True) == 0
+    finally:
+        db.close()
+        with env.pg.begin() as c:
+            c.exec_driver_sql("ALTER TABLE ai_result_cache_x RENAME TO ai_result_cache")
+
+
+def test_purge_documents_script_main_apply_clears_ai_cache(env, monkeypatch, capsys):
+    """`main()` cu --apply: pasul de cache chiar e legat în flux, nu doar funcția."""
+    import sys
+    mod = _load_purge_script(monkeypatch)
+    with env.pg.begin() as c:                                # doar coloanele atinse de script
+        c.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS emails (id bigint PRIMARY KEY, received_at timestamptz);"
+            "CREATE TABLE IF NOT EXISTS document_extractions (id bigint PRIMARY KEY, email_id bigint, "
+            "  grouped_into bigint);")
+    call()
+    with env.pg.begin() as c:
+        c.exec_driver_sql("UPDATE ai_result_cache SET created_at = '2026-08-01'")
+    monkeypatch.setattr(mod, "SessionLocal", sessionmaker(bind=env.pg))
+    monkeypatch.setattr(sys, "argv", ["purge", "--before", "2026-08-24", "--apply", "--no-files"])
+    assert mod.main() == 0
+    assert _rows(env) == []
+    assert "sterse: 1 rezultate AI din cache" in capsys.readouterr().out

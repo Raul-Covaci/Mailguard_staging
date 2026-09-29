@@ -229,8 +229,9 @@ def run_prompt(system: str, content: str, *,
 
     # T3-L1: cache de rezultat, cheiat pe payload-ul de mai sus. Inert cât timp
     # settings['ai_cache.enabled'] e false; orice eșec al lui = apel normal (vezi ai_cache).
+    # Ocolirea („Reidentifică") sare doar citirea; scrierea de mai jos înlocuiește intrarea veche.
     _cache = ai_cache.prepare(task, payload, temperature)
-    if _cache is not None:
+    if _cache is not None and not _cache.get("bypass"):
         _hit = ai_cache.lookup(_cache)
         if _hit is not None:
             return {**_hit, "task": task}

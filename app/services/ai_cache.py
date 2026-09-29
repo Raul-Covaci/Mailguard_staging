@@ -13,8 +13,12 @@ Reguli (decizie T3-L1, 2026-09-29):
 - activ doar cu settings['ai_cache.enabled']=true ȘI prefixul funcției în settings['ai_cache.prefixes'];
 - niciodată cu temperature > 0 (generare intenționat variabilă: doc_prompt_gen, doc_detect_gen);
 - în cache intră doar ok:true validat de apelant (`cache_ok`), niciodată erori;
-- `ai_cache_bypass` (ContextVar) ocolește complet cache-ul — setat doar de „Reidentifică";
-- TTL settings['ai_cache.ttl_days'] (implicit 10), curățare din tick, cel mult o dată pe oră;
+- `ai_cache_bypass` (ContextVar) — setat doar de „Reidentifică": sare CITIREA, iar scrierea
+  înlocuiește necondiționat intrarea existentă (rezultatul nou al operatorului corectează cache-ul);
+- TTL settings['ai_cache.ttl_days'] (implicit 10), curățare din tick, cel mult o dată pe oră —
+  și cu flag-ul OFF (rândurile conțin date extrase din documente), dacă tabelul există;
+- `result` e `json`, nu `jsonb`: ordinea cheilor rămâne cea a modelului (`_normalize_keys` din
+  documents.py depinde de ea când modelul întoarce două variante ale aceleiași chei);
 - la hit: nimic spre gateway, nimic în ai_call_log; un rând în ai_cache_hit_log (măsurare);
 - ORICE eșec al cache-ului = comportamentul de azi (apel normal) + WARNING. Cache-ul nu are voie
   să oprească procesarea.
@@ -34,7 +38,8 @@ from sqlalchemy import text
 
 logger = logging.getLogger("mailguard.ai_cache")
 
-# Ocolire explicită (acțiune manuală pe un singur document). Nici citire, nici scriere.
+# Ocolire explicită (acțiune manuală pe un singur document): fără citire; scrierea, dacă rezultatul
+# trece validatorul, înlocuiește intrarea existentă (nu doar una expirată).
 ai_cache_bypass: contextvars.ContextVar = contextvars.ContextVar("ai_cache_bypass", default=False)
 
 KEY_ENABLED = "ai_cache.enabled"
@@ -157,8 +162,6 @@ def cache_key(prefix: str, payload: dict, temperature: float, epoch: int) -> str
 def prepare(task, payload: dict, temperature) -> Optional[dict]:
     """Context de cache pentru acest apel sau None (cache neaplicabil). Nu aruncă niciodată."""
     try:
-        if ai_cache_bypass.get():
-            return None
         if temperature is None or float(temperature) > 0:
             return None
         prefix = task_prefix(task)
@@ -169,7 +172,7 @@ def prepare(task, payload: dict, temperature) -> Optional[dict]:
             return None
         return {"prefix": prefix, "task": (str(task) if task else "")[:120],
                 "key": cache_key(prefix, payload, float(temperature), cfg["epoch"]),
-                "ttl_days": cfg["ttl_days"]}
+                "ttl_days": cfg["ttl_days"], "bypass": bool(ai_cache_bypass.get())}
     except Exception:
         logger.warning("ai_cache: pregătire eșuată — apel normal", exc_info=True)
         return None
@@ -222,7 +225,9 @@ def default_ok(result: dict, response_format: str) -> bool:
 def store(ctx: dict, result: dict, response_format: str,
           cache_ok: Optional[Callable[[dict], bool]] = None) -> bool:
     """Scrie rezultatul dacă e ok:true și validat. Un rând expirat cu aceeași cheie se înlocuiește;
-    unul valid rămâne (două miss-uri simultane: câștigă primul). Nu aruncă niciodată."""
+    unul valid rămâne (două miss-uri simultane: câștigă primul) — cu excepția ocolirii
+    („Reidentifică", `ctx["bypass"]`), unde upsert-ul e necondiționat: operatorul a cerut o încercare
+    nouă tocmai fiindcă rezultatul vechi era greșit. Nu aruncă niciodată."""
     try:
         if not result.get("ok"):
             return False
@@ -233,20 +238,20 @@ def store(ctx: dict, result: dict, response_format: str,
         logger.warning("ai_cache: validatorul a eșuat (%s) — nu scriu", ctx.get("prefix"), exc_info=True)
         return False
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    only_expired = "" if ctx.get("bypass") else " WHERE ai_result_cache.expires_at <= now()"
     db = None
     try:
         db = _session()
         db.execute(text(
             "INSERT INTO ai_result_cache (cache_key, task_prefix, result, original_cost_usd, "
             "  original_tokens_in, original_tokens_out, created_at, expires_at) "
-            "VALUES (:k, :p, CAST(:r AS jsonb), :c, :ti, :to, now(), "
+            "VALUES (:k, :p, CAST(:r AS json), :c, :ti, :to, now(), "
             "        now() + make_interval(days => :ttl)) "
             "ON CONFLICT (cache_key) DO UPDATE SET task_prefix = EXCLUDED.task_prefix, "
             "  result = EXCLUDED.result, original_cost_usd = EXCLUDED.original_cost_usd, "
             "  original_tokens_in = EXCLUDED.original_tokens_in, "
             "  original_tokens_out = EXCLUDED.original_tokens_out, created_at = now(), "
-            "  expires_at = EXCLUDED.expires_at, hit_count = 0, last_hit_at = NULL "
-            " WHERE ai_result_cache.expires_at <= now()"),
+            "  expires_at = EXCLUDED.expires_at, hit_count = 0, last_hit_at = NULL" + only_expired),
             {"k": ctx["key"], "p": ctx["prefix"], "r": json.dumps(result, default=str),
              "c": usage.get("cost_usd"), "ti": usage.get("input_tokens"),
              "to": usage.get("output_tokens"), "ttl": int(ctx["ttl_days"])})
@@ -263,16 +268,16 @@ def store(ctx: dict, result: dict, response_format: str,
 def purge_expired_if_due() -> Optional[int]:
     """Șterge rândurile expirate, cel mult o dată pe oră pe tot clusterul (poarta e un UPSERT
     condiționat pe settings[ai_cache.last_purge_at], atomic între workerii gunicorn).
-    Doar cu cache-ul activ: cu flag-ul OFF, tick-ul rămâne identic cu azi. Nu aruncă niciodată.
-    Întoarce numărul de rânduri șterse, sau None dacă nu era momentul / cache oprit / eroare."""
-    try:
-        if not load_config()["enabled"]:
-            return None
-    except Exception:
-        return None
+    Rulează și cu flag-ul OFF: rândurile rămase dintr-o perioadă cu cache activ conțin date
+    extrase din documente și trebuie să expire oricum. Fără tabel (migrație neaplicată): nimic,
+    nici măcar poarta. Nu aruncă niciodată.
+    Întoarce numărul de rânduri șterse, sau None dacă nu era momentul / tabel lipsă / eroare."""
     db = None
     try:
         db = _session()
+        if db.execute(text("SELECT to_regclass('ai_result_cache')")).scalar() is None:
+            db.rollback()
+            return None
         due = db.execute(text(
             "INSERT INTO settings (key, value, description, updated_by, updated_at) "
             "VALUES (:k, to_jsonb(now()::text), 'T3-L1: ultima curățare a cache-ului AI', "

@@ -261,6 +261,39 @@ def _attachment_mime(path: str, mime: str) -> str:
             ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp"}.get(ext, "image/jpeg")
 
 
+_ISO_CURRENCIES = {"RON", "EUR", "USD", "MDL", "HUF", "BGN", "PLN", "CZK", "CHF", "GBP", "SEK", "NOK", "DKK"}
+
+
+def _parse_series_answer(text: str) -> dict:
+    """Răspunsul vision `SERIE|MONEDA` (ex. `PPCB|RON`, `NONE|MDL`) -> {series, currency, recognized}.
+
+    `series`/`currency` = exact ce folosea apelantul (valoare invalidă -> None). `recognized` = FIECARE
+    parte e în formatul acceptat de aceleași reguli: seria e validă sau `NONE`, moneda e validă, `NONE`
+    sau lipsește. Un refuz sau proză („Nu pot citi imaginea") dă series=None ca un `NONE` real, dar NU
+    e recunoscut — de el depinde validatorul de cache (T3-L1): un răspuns nerecunoscut n-are voie în
+    cache, altfel cele MAX_EXTRACT_ATTEMPTS încercări ar primi toate același răspuns."""
+    answer = (text or "").strip().upper()
+    parts = answer.split("|", 1)
+    raw_series = parts[0].strip() if parts else ""
+    raw_currency = parts[1].strip() if len(parts) > 1 else ""
+    currency = raw_currency if (raw_currency and raw_currency != "NONE"
+                                and re.match(r'^[A-Z]{2,3}$', raw_currency)) else None
+    series_invalid = (not raw_series or raw_series == "NONE"
+                      or not re.match(r'^[A-Z]{2,6}$', raw_series)
+                      or raw_series in _ISO_CURRENCIES
+                      or raw_series == raw_currency)
+    series = None if series_invalid else raw_series
+    recognized = ((series is not None or raw_series == "NONE")
+                  and (currency is not None or raw_currency in ("", "NONE")))
+    return {"series": series, "currency": currency, "recognized": recognized}
+
+
+def _cache_ok_op_series(res) -> bool:
+    """Validator de cache (T3-L1, `iris_ai.run_prompt(cache_ok=…)`): doar un răspuns în formatul
+    `SERIE|MONEDA` / `NONE`, recunoscut de `_parse_series_answer`."""
+    return bool(res.get("ok")) and _parse_series_answer(res.get("text"))["recognized"]
+
+
 def _vision_extract_series(path: str, mime: str) -> dict:
     """Trimite atașamentul la vision AI și extrage seria facturii + moneda.
     Returnează {"series": str|None, "currency": str|None}."""
@@ -287,22 +320,12 @@ def _vision_extract_series(path: str, mime: str) -> dict:
         res = iris_ai.run_prompt(
             _VISION_OP_SYSTEM, "", response_format="text", model_hint="sonnet",
             temperature=0.0, max_tokens=50, task=task,
-            attachments=[{"mime_type": amime, "data_base64": b64}])
+            attachments=[{"mime_type": amime, "data_base64": b64}],
+            cache_ok=_cache_ok_op_series)
         if res and res.get("ok"):
-            answer = (res.get("text") or "").strip().upper()
             # Format așteptat: SERIE|MONEDA (ex: PPCB|RON, NONE|MDL)
-            parts = answer.split("|", 1)
-            raw_series = parts[0].strip() if parts else ""
-            raw_currency = parts[1].strip() if len(parts) > 1 else ""
-            _ISO_CURRENCIES = {"RON", "EUR", "USD", "MDL", "HUF", "BGN", "PLN", "CZK", "CHF", "GBP", "SEK", "NOK", "DKK"}
-            currency = raw_currency if (raw_currency and raw_currency != "NONE"
-                                        and re.match(r'^[A-Z]{2,3}$', raw_currency)) else None
-            series_invalid = (not raw_series or raw_series == "NONE"
-                              or not re.match(r'^[A-Z]{2,6}$', raw_series)
-                              or raw_series in _ISO_CURRENCIES
-                              or raw_series == raw_currency)
-            series = None if series_invalid else raw_series
-            return {"series": series, "currency": currency}
+            parsed = _parse_series_answer(res.get("text"))
+            return {"series": parsed["series"], "currency": parsed["currency"]}
     except Exception as e:
         logger.warning("op_extractor vision call failed %s: %s", path, e)
     return empty
