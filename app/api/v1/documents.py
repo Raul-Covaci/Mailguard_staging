@@ -29,6 +29,8 @@ from app.database import get_db, SessionLocal
 from app.api.v1.auth import get_current_admin
 from app.services import iris_ai
 from app.services import ai_cache
+from app.services import feature_flags
+from app.services import vision_image
 from app.services import iris_docsvc
 from app.services.doc_stats import STATS_SINCE
 from app.services import doc_window
@@ -352,11 +354,18 @@ def _vision_transcribe(path: str, mime: str):
             raw = fh.read()
     except Exception as e:
         return "", "citire fisier esuata: " + str(e)[:120]
+    prep = vision_image.prepare(raw, amime)       # T3-D1: TIFF/BMP -> PNG, micsorare (flag)
+    if prep is None:
+        return "", "imagine nesuportata/prea mare pentru vision dupa normalizare"
+    raw, amime = prep
     digest = hashlib.sha1(raw).hexdigest()[:12]   # acelasi document -> acelasi task -> cache gateway
     b64 = base64.b64encode(raw).decode("ascii")
     task = "cargo360:doc_vision_ocr:" + digest
     res = None
     _attempts, _ctimeout = _ai_budget(vision=True)
+    if _retry_limit_enabled():
+        # T3-D1: iris_ai reincearca deja transportul/5xx (3x); a doua bucla aici ducea la 9 POST-uri.
+        _attempts = 1
     for attempt in range(_attempts):
         res = iris_ai.run_prompt(
             _VISION_OCR_SYSTEM, "", response_format="text", model_hint="sonnet",
@@ -884,6 +893,11 @@ def _extract_doc_vision(system: str, files, type_id: int,
             except Exception:
                 continue
             amime = _attachment_mime(p, m)
+        prep = vision_image.prepare(raw, amime)   # T3-D1 (flag); None = fara apel AI pentru pagina
+        if prep is None:
+            continue
+        raw, amime = prep
+        sz = len(raw)
         if sz > VISION_MAX_BYTES or (total + sz) > VISION_MAX_BYTES:
             continue   # peste limita gateway-ului -> sari pagina (mai bine partial decat esec total)
         total += sz
@@ -2055,7 +2069,11 @@ def _classify_attachment_vision(classify_system: str, path: str, mime: str,
             raw = fh.read()
     except Exception as e:
         return None, None, "citire fisier esuata: " + str(e)[:120]
-    atts = [{"mime_type": _attachment_mime(path, mime),
+    prep = vision_image.prepare(raw, _attachment_mime(path, mime))   # T3-D1 (flag)
+    if prep is None:
+        return None, None, "imagine nesuportata/prea mare pentru vision-classify dupa normalizare"
+    raw, amime = prep
+    atts = [{"mime_type": amime,
              "data_base64": base64.b64encode(raw).decode("ascii")}]
     content = ("NUME FISIER: " + (att_name or "?") + "\n\nImaginea/PDF-ul ATASAT e sursa AUTORITARA "
                "(poate contine MAI MULTE documente fizice distincte). Clasifica si raspunde DOAR JSON.")
@@ -2903,6 +2921,8 @@ def _segment_pages(path, mime, catalog, page_count):
     prev_label = None    # tipul stabilit pe pagina anterioara (text)
     for i in range(n):
         rendered = _render_page_image(path, i)
+        if rendered:
+            rendered = vision_image.prepare(*rendered)   # T3-D1 (flag); None = pagina neclasificata
         if not rendered or len(rendered[0]) > VISION_MAX_BYTES:
             out.append({"page": i, "type_id": None, "type_name": None, "category": None,
                         "confidence": None, "starts_new": True, "reason": "pagina nerandata/prea mare"})
@@ -3608,6 +3628,63 @@ def _reclassify_part(db, att, part_row, catalog):
     logger.info("reclassify_part -> %s (av=%s cs=%.2f) att=%s part=%s", status, av, cs, att.get("id"), part_row["id"])
 
 
+# ── T3-D1: limita de reluari pentru erorile tranzitorii (flag, implicit OFF) ──────────────────────
+# `retry_transient` iese FARA rand in document_extractions, iar predicatul drain-ului ia orice atasament
+# fara rand — deci la fiecare tick (5 min) totul se relua de la zero (OCR vision, resegmentarea TUTUROR
+# paginilor, clasificare), fara limita, cat mailul statea in fereastra. Debounce-ul de 10 minute exista
+# doar pentru randurile `failed`. Cu settings['processing.doc_retry_limit_enabled']: contor pe atasament
+# (attachments.doc_transient_attempts / doc_transient_last_at), debounce de 10 minute, maximum 3
+# incercari; dupa a treia, rand `needs_review` cu motivul, ca drain-ul sa nu-l mai ia. Tot sub flag:
+# _vision_transcribe nu mai are bucla proprie de reincercari (iris_ai reincearca deja).
+_RETRY_LIMIT_KEY = "processing.doc_retry_limit_enabled"
+TRANSIENT_MAX_ATTEMPTS = 3
+_TRANSIENT_DEBOUNCE_SQL = (" AND (a.doc_transient_last_at IS NULL "
+                           "OR a.doc_transient_last_at < NOW() - INTERVAL '10 minutes')")
+
+
+def _retry_limit_enabled() -> bool:
+    return feature_flags.is_enabled(_RETRY_LIMIT_KEY)
+
+
+def _transient_give_up(db, att, attempts: int) -> str:
+    """Opreste reluarile: rand `needs_review` cu motivul (fara apel AI). Un rand part_no=0 existent
+    (calea retry-reclassify) se marcheaza doar, fara sa i se piarda datele extrase."""
+    reason = ("Eroare AI tranzitorie repetata (%d incercari) — reluarea automata oprita, "
+              "de verificat manual." % attempts)
+    err = "retry_transient x%d" % attempts
+    n = db.execute(text(
+        "UPDATE document_extractions SET status='needs_review', retry_reclassify=2, "
+        "  confidence_reason=:r, error=:e, updated_at=now() "
+        "WHERE attachment_id=:a AND part_no=0 AND NOT COALESCE(reviewed, false)"),
+        {"r": reason, "e": err, "a": att["id"]}).rowcount
+    db.commit()
+    if not n:
+        _save_extraction(db, att, status="needs_review", confidence_reason=reason, error=err)
+    logger.warning("doc transient: att %s oprit dupa %d incercari tranzitorii", att.get("id"), attempts)
+    return "transient_exhausted"
+
+
+def _drain_process(db, att, force=False) -> str:
+    """_process_attachment pentru drain-ul automat, cu limita de reluari tranzitorii (flag)."""
+    if not _retry_limit_enabled():
+        return _process_attachment(db, att, force=force)
+    done = db.execute(text("SELECT COALESCE(doc_transient_attempts, 0) FROM attachments WHERE id=:a"),
+                      {"a": att["id"]}).scalar() or 0
+    if done >= TRANSIENT_MAX_ATTEMPTS:
+        return _transient_give_up(db, att, done)
+    status = _process_attachment(db, att, force=force)
+    if status != "retry_transient":
+        return status
+    done = db.execute(text(
+        "UPDATE attachments SET doc_transient_attempts = COALESCE(doc_transient_attempts, 0) + 1, "
+        "  doc_transient_last_at = now() WHERE id=:a RETURNING doc_transient_attempts"),
+        {"a": att["id"]}).scalar() or 0
+    db.commit()
+    if done >= TRANSIENT_MAX_ATTEMPTS:
+        return _transient_give_up(db, att, done)
+    return status
+
+
 def _drain_doc_extractions(scope="recent", limit=500, force=False):
     """scope: 'today' (azi), 'recent'/'all'/'ids' (fereastra de procesare), 'auto' (in plus: doar
     emailuri primite DUPA activarea automatizarii — `enabled_at`).
@@ -3656,6 +3733,9 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
             skip = sorted(_skip_senders(db))
             if skip:
                 base += " AND lower(e.from_address) NOT IN :skip"
+            _retry_limit = _retry_limit_enabled()
+            if _retry_limit:
+                base += _TRANSIENT_DEBOUNCE_SQL      # T3-D1: 10 min intre reluarile tranzitorii
             since = None
             if scope == "today":
                 base += " AND e.received_at::date = CURRENT_DATE"
@@ -3691,7 +3771,7 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
                     return "stopped"
                 wdb = SessionLocal()
                 try:
-                    return _process_attachment(wdb, att)
+                    return _drain_process(wdb, att)
                 except Exception as e:
                     logger.exception("process attachment %s failed", att.get("id"))
                     try:
@@ -3762,12 +3842,13 @@ def _drain_doc_extractions(scope="recent", limit=500, force=False):
                     "AND d.updated_at < NOW() - INTERVAL '10 minutes' "
                     "AND NOT COALESCE(a.doc_discarded, false) "
                     "AND e.received_at >= CURRENT_DATE - make_interval(days => :wdays)"
+                    + (_TRANSIENT_DEBOUNCE_SQL if _retry_limit else "")
                 ), {"wdays": _retry_wdays}).fetchall()]
                 for _r in _sr:
                     try:
                         _wdb = SessionLocal()
                         try:
-                            _process_attachment(_wdb, _r, force=False)
+                            _drain_process(_wdb, _r, force=False)
                         finally:
                             _wdb.close()
                     except Exception:
@@ -4131,9 +4212,11 @@ def _autogroup_holistic(db, email_id):
                 sz = os.path.getsize(path)
                 if sz <= VISION_MAX_BYTES and total + sz <= VISION_MAX_BYTES:
                     with open(path, "rb") as fh:
-                        atts.append({"mime_type": _attachment_mime(path, m.get("content_type")),
-                                     "data_base64": base64.b64encode(fh.read()).decode("ascii")})
-                        total += sz
+                        prep = vision_image.prepare(fh.read(), _attachment_mime(path, m.get("content_type")))
+                    if prep is not None:                     # T3-D1 (flag)
+                        atts.append({"mime_type": prep[1],
+                                     "data_base64": base64.b64encode(prep[0]).decode("ascii")})
+                        total += len(prep[0])
             except Exception:
                 pass
     system = (
@@ -4253,8 +4336,12 @@ def _autogroup_email_images(db, email_id):
                     raw = fh.read()
             except Exception:
                 continue
+            prep = vision_image.prepare(raw, _attachment_mime(path, m.get("content_type")))   # T3-D1
+            if prep is None:
+                continue
+            raw, amime = prep
             total += len(raw)
-            atts.append({"mime_type": _attachment_mime(path, m.get("content_type")),
+            atts.append({"mime_type": amime,
                          "data_base64": base64.b64encode(raw).decode("ascii")})
             listing.append("Imaginea %d: fisier=\"%s\", att_id=%s"
                            % (idx, m.get("att_name") or "?", m.get("attachment_id")))
@@ -4349,8 +4436,12 @@ def _autogroup_email_images(db, email_id):
                     raw2 = fh2.read()
             except Exception:
                 continue
+            prep2 = vision_image.prepare(raw2, _attachment_mime(path2, m2.get("content_type")))   # T3-D1
+            if prep2 is None:
+                continue
+            raw2, amime2 = prep2
             total2 += len(raw2)
-            atts2.append({"mime_type": _attachment_mime(path2, m2.get("content_type")),
+            atts2.append({"mime_type": amime2,
                           "data_base64": base64.b64encode(raw2).decode("ascii")})
             listing2.append("Imaginea %d: fisier=\"%s\", att_id=%s"
                             % (idx2, m2.get("att_name") or "?", m2.get("attachment_id")))
@@ -4564,6 +4655,12 @@ def documents_reprocess_by_ids(body: dict, db: Session = Depends(get_db),
         WHERE email_id = ANY(:ids)
     """), {"ids": existing})
     db.commit()
+    if _retry_limit_enabled():
+        # T3-D1: reprocesarea manuala e un nou inceput — altfel un atasament oprit dupa 3 erori
+        # tranzitorii ar primi din nou `needs_review` fara nicio incercare.
+        db.execute(text("UPDATE attachments SET doc_transient_attempts = 0, doc_transient_last_at = NULL "
+                        "WHERE email_id = ANY(:ids)"), {"ids": existing})
+        db.commit()
 
     n_atts = db.execute(text(
         "SELECT COUNT(*) FROM attachments WHERE email_id = ANY(:ids)"

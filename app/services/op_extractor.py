@@ -312,6 +312,11 @@ def _vision_extract_series(path: str, mime: str) -> dict:
         logger.warning("op_extractor vision read failed %s: %s", path, e)
         return empty
 
+    from app.services import vision_image
+    prep = vision_image.prepare(raw, amime)       # T3-D1: TIFF/BMP -> PNG, micsorare (flag)
+    if prep is None:
+        return empty
+    raw, amime = prep
     digest = hashlib.sha1(raw).hexdigest()[:12]
     b64 = base64.b64encode(raw).decode("ascii")
     task = "cargo360:op_series:" + digest

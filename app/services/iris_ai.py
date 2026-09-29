@@ -272,6 +272,9 @@ def run_prompt(system: str, content: str, *,
     try:
         data = r.json()
     except Exception as e:
+        # T3-D1: și acest eșec intră în ai_call_log (ca celelalte erori). Corpul nu e JSON, deci
+        # nu avem usage/model de raportat — rândul numără eșecul, costul rămâne necunoscut.
+        _log_call(task, None, None, False, "BAD_JSON", email_id=email_id)
         return {"ok": False, "text": "", "parsed": None, "usage": None, "task": task,
                 "error": {"code": "BAD_JSON", "message": str(e)[:200]}}
 
