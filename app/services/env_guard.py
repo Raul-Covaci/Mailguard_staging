@@ -36,6 +36,21 @@ def is_production() -> bool:
     return _is_production()
 
 
+AI_ALLOW_KEY = "ai.allow_non_production"
+
+
+def ai_allowed() -> bool:
+    """T3-G2: apelurile AI sunt permise pe producție; în rest doar cu
+    settings['ai.allow_non_production'] = true (sau {"enabled": true}). Implicit NU.
+
+    Staging-ul a costat 502 USD de AI în 4 săptămâni fără folos (decizie business 2026-09-29).
+    Plasa e în `iris_ai.run_prompt` (AI_DISABLED_ENV); tick-ul sare și pașii care ar declanșa AI."""
+    if is_production():
+        return True
+    from app.services import feature_flags
+    return feature_flags.is_enabled(AI_ALLOW_KEY)
+
+
 def env_name() -> str:
     """Numele mediului, pentru loguri și audit. Nu decide nimic."""
     explicit = os.environ.get("MAILGUARD_ENV", "").strip().lower()

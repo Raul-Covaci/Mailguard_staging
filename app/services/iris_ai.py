@@ -24,6 +24,7 @@ import logging
 import httpx
 
 from app.services import ai_cache
+from app.services import env_guard
 
 logger = logging.getLogger("mailguard.iris_ai")
 
@@ -166,6 +167,14 @@ def run_prompt(system: str, content: str, *,
     if _ai_disabled():
         return {"ok": False, "text": "", "parsed": None, "usage": None, "task": task,
                 "error": {"code": "AI_DISABLED", "message": "External AI calls disabled on this environment (AI_DISABLED=true in .env)"}}
+    # T3-G2: în afara producției nimic nu pleacă la gateway fără permisiune explicită. Fără rând în
+    # ai_call_log (nu e un apel). Mesajul NU conține cuvinte „tranzitorii" (timeout/502/transport...),
+    # deci apelanții îl tratează ca eroare permanentă, fără reluări în buclă.
+    if not env_guard.ai_allowed():
+        return {"ok": False, "text": "", "parsed": None, "usage": None, "task": task,
+                "error": {"code": "AI_DISABLED_ENV",
+                          "message": "AI dezactivat in afara productiei "
+                                     "(settings ai.allow_non_production nu e true)"}}
     url = _resolve_url()
     key = _resolve_key()
     if not url:
