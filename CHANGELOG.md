@@ -8,6 +8,13 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.36.1 - 2026-09-29
+
+### PATCH — T3-R1: rând TOTAL în tabelul pe task din PDF
+
+Tabelul „Per tip de task" din PDF nu avea total, deci lipseau „cost eșuate" și „% cost eșuate" pe
+tot raportul (CSV-ul le avea). Adăugat rândul TOTAL; testul verifică procentul total în PDF.
+
 ## v3.36.0 - 2026-09-29
 
 ### MINOR — T3-R1: raportul de costuri AI arată fluxuri, costul eșecurilor și economia din cache

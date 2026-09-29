@@ -410,8 +410,12 @@ def generate_cost_report_pdf(meta, totals, by_model, by_task, by_task_model, by_
         dom = model_label(t.get("top_model")) + ((" " + str(int(round(share))) + "%") if share is not None else "")
         trows.append([t.get("task") or "—", grp(t.get("calls")), usd(t.get("cost")), dom, str(t.get("errors") or 0),
                       usd(t.get("failed_cost") or 0), _pct(t.get("failed_cost") or 0, t.get("cost") or 0)])
+    ttot = ["TOTAL", grp(totals.get("calls", 0)), usd(totals.get("cost", 0)), "",
+            grp(totals.get("errors", 0)), usd(totals.get("failed_cost", 0)),
+            _pct(totals.get("failed_cost", 0), totals.get("cost", 0))]
     rep.table(["Task", "Interogări", "Cost", "Model dominant", "Apeluri eșuate", "Cost eșuate", "% cost eșuate"],
-              [150, 55, 70, 90, 55, 65, 50], trows, ["l", "r", "r", "l", "r", "r", "r"], money_cols=(2, 5))
+              [150, 55, 70, 90, 55, 65, 50], trows, ["l", "r", "r", "l", "r", "r", "r"],
+              total_row=ttot, money_cols=(2, 5))
 
     top_tasks = sorted(by_task, key=lambda x: x.get("calls", 0), reverse=True)[:12]
     rep.hbar("Interogări pe task (top 12)",

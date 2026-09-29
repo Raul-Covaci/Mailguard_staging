@@ -140,6 +140,8 @@ def test_pdf_renders_with_new_sections(db):
     text = "".join(p.get_text() for p in fitz.open(stream=resp.body, filetype="pdf"))
     for needle in ("Pe flux", "Cost eșuate", "Economie din cache", "email_classification", "Per model AI"):
         assert needle in text
+    # totalul pe task, cu % cost pe eșecuri (0,033 din 0,12 = 27,5%)
+    assert "%.1f%%" % (100 * EXPECTED_FAILED / EXPECTED_COST) in text
 
 
 @pytest.mark.parametrize("task,flow", [
