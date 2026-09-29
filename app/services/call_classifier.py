@@ -26,6 +26,7 @@ from app.database import SessionLocal
 from app.services import iris_ai
 from app.services import assignee_classifier
 from app.services import phone_match
+from app.services.json_salvage import salvage_json
 
 logger = logging.getLogger("mailguard.call_classifier")
 
@@ -127,6 +128,20 @@ _BASE_TAIL = (
     '{"categorie": "...", "stil": "...", "motivare_scurta": "..."}'
 )
 
+# ── T3-L3: parsare tolerantă (flag settings['processing.call_category_v2_enabled'], implicit OFF) ──
+# 92% din apelurile plătite ale `call_category` se terminau cu JSON_PARSE_ERROR (doar ~1% ating
+# max_tokens, deci nu e trunchiere): modelul învelește JSON-ul în ``` sau adaugă text. Rezultatul era
+# aruncat, `ai_category` rămânea NULL și `process_pending_batch` plătea aceeași conversație la fiecare
+# tick. Cu flag-ul ON: instrucțiune explicită în prompt + extragere din raw_text (`json_salvage`,
+# același utilitar ca scorarea apelurilor), validată pe câmpurile obligatorii și pe CATEGORIES.
+# Cu flag-ul OFF: prompt și parsare identice cu versiunea anterioară.
+_V2_KEY = "processing.call_category_v2_enabled"
+_JSON_ONLY = "Răspunde DOAR cu obiectul JSON, fără alt text și fără ```.\n"
+_V2_REQUIRED = ("categorie", "stil", "motivare_scurta")
+_BASE_TAIL_V2 = _BASE_TAIL.replace(
+    "Raspunde STRICT in format JSON, fara text in plus:\n",
+    "Raspunde STRICT in format JSON, fara text in plus:\n" + _JSON_ONLY, 1)
+
 
 def load_call_prompts() -> Dict[str, str]:
     """Prompturile editabile pe categorie (DB peste default-urile din cod)."""
@@ -145,14 +160,62 @@ def load_call_prompts() -> Dict[str, str]:
     return out
 
 
-def build_call_system_prompt(prompts: Optional[Dict[str, str]] = None) -> str:
+def build_call_system_prompt(prompts: Optional[Dict[str, str]] = None, json_only: bool = False) -> str:
+    """`json_only=True` (T3-L3, doar cu flag-ul v2) adaugă instrucțiunea explicită „DOAR JSON"."""
     p = prompts or load_call_prompts()
     defs = (
         "   - informatie: " + p["informatie"] + "\n"
         "   - sesizare: " + p["sesizare"] + "\n"
         "   - reclamatie: " + p["reclamatie"] + "\n"
     )
-    return _BASE_HEAD + defs + _TONE_INSTRUCTIONS + _BASE_TAIL
+    return _BASE_HEAD + defs + _TONE_INSTRUCTIONS + (_BASE_TAIL_V2 if json_only else _BASE_TAIL)
+
+
+def call_category_v2_enabled() -> bool:
+    """settings['processing.call_category_v2_enabled']: `true` sau {"enabled": true}.
+    Absent / altă valoare / eroare de citire => OFF (comportamentul vechi)."""
+    try:
+        db = SessionLocal()
+        try:
+            row = db.execute(text("SELECT value FROM settings WHERE key=:k"), {"k": _V2_KEY}).fetchone()
+        finally:
+            db.close()
+    except Exception:
+        logger.warning("citire %s esuata — call_category v2 OFF", _V2_KEY)
+        return False
+    if not row:
+        return False
+    v = row[0]
+    if isinstance(v, dict):
+        v = v.get("enabled")
+    return v is True
+
+
+def _parse_v2(res: Dict[str, Any]):
+    """(parsed, salvaged) sau (None, motiv). `parsed` dict de la gateway = tratamentul de azi;
+    altfel JSON-ul se extrage din raw_text și trebuie să aibă câmpurile cerute + o categorie din
+    CATEGORIES — un fragment oarecare nu devine clasificare."""
+    parsed = res.get("parsed") if res.get("ok") else None
+    if isinstance(parsed, dict):
+        return parsed, False
+    raw = (res.get("error") or {}).get("raw_text") or res.get("text") or ""
+    salvaged = salvage_json(raw)
+    if not isinstance(salvaged, dict):
+        return None, "no_json"
+    if any(k not in salvaged for k in _V2_REQUIRED):
+        return None, "missing_keys"
+    if str(salvaged.get("categorie") or "").strip().lower() not in CATEGORIES:
+        return None, "bad_category"
+    return salvaged, True
+
+
+def _log_unusable(res: Dict[str, Any], why: str) -> None:
+    """Doar STRUCTURA răspunsului (fără conținut): cauzele rămase după activarea v2."""
+    raw = (res.get("error") or {}).get("raw_text") or res.get("text") or ""
+    t = raw.strip()
+    logger.warning("call_category v2: raspuns neutilizabil motiv=%s ok=%s code=%s len=%d "
+                   "first=%r last=%r fences=%s", why, bool(res.get("ok")),
+                   (res.get("error") or {}).get("code"), len(raw), t[:1], t[-1:], "```" in raw)
 
 
 def classify_call(transcript: str, no_cache: bool = False) -> Optional[Dict[str, Any]]:
@@ -175,15 +238,23 @@ def classify_call(transcript: str, no_cache: bool = False) -> Optional[Dict[str,
     activ (comportament neschimbat, default no_cache=False)."""
     if not iris_ai.is_configured() or not (transcript or "").strip():
         return None
-    system = build_call_system_prompt()
+    v2 = call_category_v2_enabled()
+    system = build_call_system_prompt(json_only=v2)
     res = iris_ai.run_prompt(
         system, transcript, response_format="json", temperature=0.0, max_tokens=250,
         task="cargo360:call_category", no_cache=no_cache)
-    if not res.get("ok"):
-        return None
-    parsed = res.get("parsed")
-    if not isinstance(parsed, dict):
-        return None
+    salvaged = False
+    if not v2:
+        if not res.get("ok"):
+            return None
+        parsed = res.get("parsed")
+        if not isinstance(parsed, dict):
+            return None
+    else:
+        parsed, salvaged = _parse_v2(res)
+        if parsed is None:
+            _log_unusable(res, salvaged)
+            return None
     cat = str(parsed.get("categorie") or "").strip().lower()
     if cat not in CATEGORIES:
         cat = "necunoscut"
@@ -199,6 +270,8 @@ def classify_call(transcript: str, no_cache: bool = False) -> Optional[Dict[str,
     out = {"category": cat, "tone": tone, "reason": reason, "model": res.get("model")}
     if unknown_fallback:
         out["unknown_fallback"] = True
+    if salvaged is True:
+        out["salvaged"] = True          # JSON extras din raw_text (T3-L3), vizibil în ai_result
     return out
 
 

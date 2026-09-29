@@ -8,6 +8,30 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.32.0 - 2026-09-29
+
+### MINOR — T3-L3: call_category recuperează JSON-ul din raw_text (flag OFF implicit)
+
+92% din apelurile plătite `call_category` se terminau cu `JSON_PARSE_ERROR` (doar 215 din 22.334
+ating `max_tokens=250`, deci nu e trunchiere). Rezultatul se arunca, `ai_category` rămânea NULL și
+`process_pending_batch` plătea aceeași conversație la fiecare tick.
+
+- `_salvage_json` mutat din `call_scorer.py` în `app/services/json_salvage.py`, neschimbat
+  (`call_scorer` îl reimportă sub numele vechi).
+- Cu `settings['processing.call_category_v2_enabled']` = `true` (sau `{"enabled": true}`):
+  instrucțiune explicită în prompt („Răspunde DOAR cu obiectul JSON, fără alt text și fără ```"),
+  iar când gateway-ul nu parsează, JSON-ul se extrage din raw_text (fences, text înainte/după).
+  Rezultatul extras e acceptat doar cu `categorie`, `stil`, `motivare_scurta` prezente și categoria
+  din lista din cod; altfel rămâne eșec. Un rezultat extras are `salvaged: true` în `ai_result`.
+- Eșecul final se loghează WARNING doar ca structură (motiv, lungime, primul/ultimul caracter,
+  fences da/nu), fără conținut.
+- Flag OFF (implicit): prompt și parsare identice cu 3.31.0. Neschimbate: `no_cache`,
+  `max_tokens`, selecția apelurilor din pipeline.
+- Teste: `tests/test_call_category_v2.py`.
+
+Activare: `INSERT INTO settings(key, value) VALUES ('processing.call_category_v2_enabled',
+'true'::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;`
+
 ## v3.31.0 - 2026-09-29
 
 ### MINOR — T3-L1: cache de rezultat AI pentru documente și seria OP (flag OFF implicit)
