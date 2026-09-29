@@ -8,6 +8,24 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.36.0 - 2026-09-29
+
+### MINOR — T3-R1: raportul de costuri AI arată fluxuri, costul eșecurilor și economia din cache
+
+`/ai/cost-report` (PDF și CSV), pe aceeași fereastră aleasă din UI, ca până acum:
+
+- **Pe flux** (nou, deasupra tabelului pe task): scoring, call_category, email_classification,
+  documente, op_series, satisfaction, client_context, altele — apeluri, cost, apeluri eșuate, cost
+  eșuate, cost per apel. O singură mapare (`cost_report.task_flow`) pentru tot raportul; task-urile cu
+  hash în nume (ex. `doc_segment:<hash>:Talon`) intră în fluxul lor, nu în „alte N taskuri". Sumele pe
+  flux = totalul.
+- **Pe task și în total**: coloane noi „cost eșuate" (`SUM(cost_usd)` unde `ok=false`) și „% cost
+  eșuate" (numărul de apeluri eșuate exista deja, „Erori").
+- **Economie din cache** (nou): hit-uri și `saved_cost_usd` pe prefix din `ai_cache_hit_log` (goală
+  dacă tabelul lipsește sau nu are rânduri în fereastră).
+- Rândurile `model='local_cache'` din `ai_call_log` nu intră în niciun calcul.
+- Restul raportului neschimbat. Teste: `tests/test_cost_report.py`.
+
 ## v3.35.0 - 2026-09-29
 
 ### MINOR — T3-O14: Haiku pe vision-ul de clasificare a documentelor (shadow, apoi „Haiku întâi")
