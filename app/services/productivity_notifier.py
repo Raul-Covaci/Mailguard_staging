@@ -689,7 +689,17 @@ def send_monthly_reports(db: Session, force: bool = False, claimed_by: str = "cr
     deja rezervat pentru (lună, grup) nu mai primește nimic. `force=True` (retrimitere manuală,
     explicită) șterge rezervarea existentă înainte de a o relua — singura cale de a trimite a doua
     oară aceluiași om pentru aceeași lună.
+
+    ⛔ Garda de mediu e PRIMA: ambele căi (cron și `send-now`) trec pe aici, iar un mediu
+    non-producție nu are voie să lase nici rezumat AI, nici PDF, nici rezervare, nici
+    `last_monthly_sent` — staging-ul are aceiași destinatari reali ca producția.
     """
+    from app.services import env_guard
+    blocked = env_guard.block_reason(env_guard.CHANNEL_PRODUCTIVITY_REPORT, db,
+                                     actor=claimed_by, context={"force": bool(force)})
+    if blocked:
+        return {"sent": 0, "errors": 0, "skipped": 0, "blocked": True, "reason": blocked}
+
     from app.services.productivity import department_report, forecast_report
 
     today = _dt.date.today()

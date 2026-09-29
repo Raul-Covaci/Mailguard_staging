@@ -74,11 +74,16 @@ def _day_window(col: str, days: int, date_from: Optional[str], date_to: Optional
 
 @router.get("/health")
 def health(db: Session = Depends(get_db)):
+    from app.services import env_guard
     s = get_settings()
     status = {
         "status": "healthy",
         "service": s.app_name,
         "version": s.app_version,
+        # Mediul văzut de garda de trimitere (`env_guard`) — singura cale de a verifica garda
+        # după deploy fără acces la server. `is_production=false` = nimic nu pleacă în afară.
+        "environment": env_guard.env_name(),
+        "is_production": env_guard.is_production(),
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "checks": {}
     }

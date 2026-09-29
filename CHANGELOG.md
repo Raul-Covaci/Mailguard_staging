@@ -8,6 +8,62 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.30.2 - 2026-09-29
+
+### PATCH — raportul lunar de productivitate nu mai pleacă din afara producției
+
+`productivity_notifier.py` nu verifica mediul. Staging-ul rulează pe o clonă cu aceiași
+destinatari și același cont SMTP no-reply, deci a trimis raportul lunar angajaților reali pe
+2026-08-03 și l-ar fi trimis din nou pe 2026-10-01 la 10:00.
+
+- Modul nou `app/services/env_guard.py`: `is_production()` refolosește
+  `vathub_send_guard.is_production()` (`MAILGUARD_ENV` are ultimul cuvânt, altfel `APP_ENV`;
+  config ilizibil = non-producție). `outbound_allowed(canal, db)` e True pe producție; în rest,
+  doar pentru canalele din `settings['outbound.allow_non_production']` (listă JSON, implicit
+  goală; orice altă formă = nimic permis).
+- Garda e PRIMA instrucțiune din `send_monthly_reports`, deci acoperă ambele căi: tick-ul de
+  5 minute (`send_monthly_reports_if_due`) și `POST /productivity/notifications/send-now`
+  (inclusiv `force=true`). Blocat = fără rezumat AI, fără PDF, fără rezervare în
+  `productivity_notification_log`, fără `last_monthly_sent`; log WARNING (canal, mediu, motiv) și
+  un rând `outbound_blocked` în `audit_log` (cel mult unul pe zi per canal și actor).
+- `send-now` blocat răspunde 200 cu `{"ok": false, "blocked": true, "reason": "blocat: mediu
+  non-producție …"}`, nu 500.
+- Tranzacția: orice eșec la citirea allow-list-ului sau la scrierea în `audit_log` face
+  `rollback` pe loc, deci sesiunea NU rămâne în „current transaction is aborted". În plus, în
+  tick-ul `/process/run-now` notificatorul are sesiunea lui (`emails.py:1086`, închisă în
+  `finally`), iar pașii următori își deschid propria sesiune.
+- `/api/v1/health` expune `environment` (`env_guard.env_name()`) și `is_production`
+  (`env_guard.is_production()`) — singura cale de a verifica garda după deploy fără SSH.
+  Restul răspunsului e neschimbat.
+- Teste (pytest, fără BD/rețea): `tests/test_env_guard_outbound.py` (căile de trimitere),
+  `tests/test_env_guard_transaction.py` (sesiune SQLAlchemy reală cu semantica Postgres de
+  tranzacție abortată emulată; audit_log care pică lasă sesiunea utilizabilă),
+  `tests/test_health_env.py`. Dependințe de test în `requirements-dev.txt` (nou, nu se
+  instalează pe servere); rulare în `docs/TESTS.md`.
+
+Verificare după deploy (staging):
+
+```bash
+curl -s http://95.216.144.102:8501/api/v1/health
+# → "version": "3.30.2", "environment": "staging", "is_production": false
+```
+
+Orice altceva decât `is_production: false` pe staging = garda NU blochează; de oprit înainte de
+2026-10-01 10:00.
+
+Permis explicit pe staging (ex. pentru un test real) — fără deploy:
+
+```sql
+INSERT INTO settings(key, value, updated_by, updated_at)
+VALUES ('outbound.allow_non_production', '["productivity_report"]'::jsonb, '<cine>', now())
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by,
+                                updated_at = now();
+```
+
+⚠️ Deschide canalul către TOȚI destinatarii activi din `productivity_notifications`, nu doar
+către o adresă de test. Închidere: `'[]'::jsonb` sau `DELETE FROM settings WHERE
+key='outbound.allow_non_production'`. Pe producție cheia nu are niciun efect.
+
 ## v3.30.1 - 2026-09-25
 
 ### PATCH — „Documente CargoTrack" merge pe Suport 1 cu prioritate P4

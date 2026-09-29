@@ -522,10 +522,15 @@ def send_notifications_now(force: bool = Query(False, description="retrimite chi
     NU ignoră evidența per destinatar: cine a primit deja raportul lunii respective e sărit, deci
     un click repetat nu mai trimite nimic. `force=true` e singura cale de retrimitere — decizie
     explicită, cerută în URL.
+
+    În afara producției răspunde 200 cu `blocked: true` (garda de mediu din
+    `send_monthly_reports`), nu 500: blocajul e comportamentul corect, nu o eroare.
     """
     from app.services import productivity_notifier as _pn
     try:
         result = _pn.send_monthly_reports(db, force=bool(force), claimed_by="manual")
+        if result.get("blocked"):
+            return {"ok": False, **result}
         return {"ok": True, **result}
     except Exception as exc:
         logger.exception("send_notifications_now failed")
