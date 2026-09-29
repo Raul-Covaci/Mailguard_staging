@@ -8,6 +8,35 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.35.0 - 2026-09-29
+
+### MINOR — T3-O14: Haiku pe vision-ul de clasificare a documentelor (shadow, apoi „Haiku întâi")
+
+Vision-ul de documente rula tot pe Sonnet (W-BEFORE: 380,99 USD Sonnet, 25,10 Haiku). Haiku 4.5 are
+vision și costă ~o treime. Primele task-uri: `doc_classify_vision`, `doc_segment` (clasificare, nu
+extragere de text). Implicit nimic nu se schimbă (liste goale).
+
+- **Shadow** (`documents.haiku_shadow_tasks`, eșantion `documents.haiku_shadow_sample`=0.3): producția
+  rămâne pe Sonnet; pentru eșantion, Haiku rulează pe un fir separat (max 2 simultan), fără să
+  blocheze și fără să atingă rezultatul. Tabel nou `doc_model_shadow` — DOAR etichete (type_id,
+  categorie, documents[], starts_new, încredere), fără text extras și fără `reason`; match + costul
+  fiecărui model.
+- **„Haiku întâi"** (`documents.haiku_first_tasks`): Haiku acceptat doar dacă trece exact validarea
+  apelantului (`_cache_ok_salvage`) și are `confidence` ≥ `documents.haiku_min_confidence` (0.90);
+  altfel Sonnet, ca azi.
+- Cache T3-L1: `model_hint` e în cheie → rezultatele Haiku și Sonnet stau separat (testat).
+- Măsurare: `scripts/metrics/doc_model_shadow.sql` (concordanță pe task, matricea diferențelor pe
+  type_id, cost pe model). Migrație `migrations/20260929c_doc_model_shadow.sql` (+ down).
+  Teste: `tests/test_haiku_vision.py`.
+
+Activare:
+(a) shadow 30% timp de 5–7 zile:
+`UPDATE settings SET value='["doc_classify_vision","doc_segment"]'::jsonb WHERE key='documents.haiku_shadow_tasks';`
+(b) doar dacă concordanța trece pragul decis de Raul (propunere: ≥ 95% pe type_id, `type_id_match_pct`
+și `match_pct`), comutare:
+`UPDATE settings SET value='["doc_classify_vision","doc_segment"]'::jsonb WHERE key='documents.haiku_first_tasks';`
+și oprirea shadow-ului (`'[]'::jsonb`). Revenire: listă goală, efect în ≤30 s.
+
 ## v3.34.0 - 2026-09-29
 
 ### MINOR — T3-G2: fără apeluri AI automate în afara producției
