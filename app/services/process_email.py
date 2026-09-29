@@ -662,7 +662,8 @@ def set_op_extract(enabled: bool, by: str = None) -> bool:
 
 def _inject_client_context(em: dict, cur) -> None:
     """Injecteaza _client_context si _context_summary pe email dict daca toggle-ul e activ. Fara exceptie."""
-    if not _ai_context_enabled(cur):
+    from app.services import env_guard
+    if not _ai_context_enabled(cur) or not env_guard.ai_allowed():   # T3-G2
         em['_client_context'] = {}
         return
     try:
@@ -679,6 +680,12 @@ def _inject_client_context(em: dict, cur) -> None:
     except Exception:
         logger.exception("inject_client_context esuat pentru email_id=%s", em.get('id'))
         em['_client_context'] = {}
+
+
+def _ai_allowed_env() -> bool:
+    """T3-G2: env_guard.ai_allowed(), izolat ca să poată fi folosit în condiții compuse."""
+    from app.services import env_guard
+    return env_guard.ai_allowed()
 
 
 def _find_duplicate_of(cur, email_id: int, em: dict, attachments: list):
@@ -1156,7 +1163,8 @@ def process_one(email_id: int) -> Dict[str, Any]:
         gate_flag = (os.getenv('STRICT_INTENT_GATE_ENABLED', '1') or '').strip().lower()
         if (ph_status in ('quarantined', 'quarantined_strict') and gate_flag not in ('0', 'false', 'no', 'off', '')
                 and _intent_detection_enabled(cur) and not _hard_block
-                and not _sender_blocked):  # blacklist-ul bate verdictul „benign" al AI
+                and not _sender_blocked  # blacklist-ul bate verdictul „benign" al AI
+                and _ai_allowed_env()):  # T3-G2: fără AI în afara producției -> rămâne carantinat
             try:
                 from app.services import strict_intent_gate
                 _gt, _gh, _gq = phishing_detector._new_content(em)
@@ -1216,7 +1224,11 @@ def process_one(email_id: int) -> Dict[str, Any]:
             _inject_client_context(em, cur)  # T1: injecteaza _client_context pe em (noop daca toggle off)
         ai_flag = (os.getenv('AI_CATEGORIZE_ENABLED', '1') or '').strip().lower()
         from app.services.iris_ai import _ai_disabled as _global_ai_disabled
-        _ai_off = (ai_flag in ('0', 'false', 'no', 'off', '')) or (not _ai_classify_enabled(cur)) or _global_ai_disabled()
+        from app.services import env_guard as _envg
+        # T3-G2: în afara producției (fără ai.allow_non_production) = aceeași cale ca switch-ul OFF:
+        # ai_status='skipped', mailul devine eligibil CTS — nu intră în error_nova, deci nu se reia.
+        _ai_off = ((ai_flag in ('0', 'false', 'no', 'off', '')) or (not _ai_classify_enabled(cur))
+                   or _global_ai_disabled() or not _envg.ai_allowed())
         if _on_clean_path and _ai_off:
             # Switch OFF (testare/import): NU clasificam categorie/departament (fara cost AI), DAR
             # emailul clean devine ELIGIBIL CTS ca sa poata fie preluat. Reclasificarea se face cand
@@ -1319,7 +1331,9 @@ def advance_one_clean(email_id: int) -> Dict[str, Any]:
         _inject_client_context(em, cur)  # T1: injecteaza _client_context pe em (noop daca toggle off)
         ai_flag = (os.getenv('AI_CATEGORIZE_ENABLED', '1') or '').strip().lower()
         from app.services.iris_ai import _ai_disabled as _global_ai_disabled
-        if (ai_flag in ('0', 'false', 'no', 'off', '')) or (not _ai_classify_enabled(cur)) or _global_ai_disabled():
+        from app.services import env_guard as _envg
+        if ((ai_flag in ('0', 'false', 'no', 'off', '')) or (not _ai_classify_enabled(cur))
+                or _global_ai_disabled() or not _envg.ai_allowed()):   # T3-G2
             # Switch OFF: nu clasificam, dar facem emailul eligibil CTS (nu il blocam in coada).
             cur.execute("UPDATE emails SET ai_status='skipped', ai_processed_at=NOW() WHERE id=%s",
                         (email_id,))

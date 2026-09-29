@@ -301,6 +301,11 @@ def _vision_extract_series(path: str, mime: str) -> dict:
     import hashlib
     amime = _attachment_mime(path, mime)
     empty = {"series": None, "currency": None}
+    from app.services import env_guard
+    if not env_guard.ai_allowed():
+        # T3-G2: în afara producției vision-ul nu rulează; apelantul finalizează imediat (fără
+        # să consume cele MAX_EXTRACT_ATTEMPTS tick-uri pe un apel care oricum nu pleacă).
+        return {"series": None, "currency": None, "ai_blocked": True}
     try:
         sz = os.path.getsize(path)
         if sz > VISION_MAX_BYTES:
@@ -438,6 +443,7 @@ def extract_op_series(email_id: int) -> dict:
             logger.info("op_extractor email=%d series=%s (subject/body)", email_id, series)
             return {"series": series, "department": _department_from_series(series)}
 
+    ai_blocked = False
     for row in rows:
         storage_path = row._mapping.get("storage_path") or ""
         mime = row._mapping.get("content_type") or ""
@@ -465,6 +471,7 @@ def extract_op_series(email_id: int) -> dict:
 
         # Pasul 3: vision AI (doar dacă text local nu a dat rezultat)
         vision_result = _vision_extract_series(path, mime)
+        ai_blocked = ai_blocked or bool(vision_result.get("ai_blocked"))
         v_series = vision_result.get("series")
         v_currency = vision_result.get("currency")
         if v_currency == "MDL":
@@ -475,6 +482,8 @@ def extract_op_series(email_id: int) -> dict:
             return {"series": v_series, "department": _department_from_series(v_series)}
 
     logger.info("op_extractor email=%d no series found → suport_1 fallback", email_id)
+    if ai_blocked:
+        return {"series": None, "department": "suport_1", "ai_blocked": True}
     return {"series": None, "department": "suport_1"}
 
 
@@ -587,6 +596,17 @@ def _process_one_op(email_id: int, results: dict):
             # Prioritatea a fost calculata SINCRON in pipeline, cand ai_op_series era inca NULL.
             # Acum ca seria e persistata, regula pay_op_series poate lovi -> P2 (plata).
             _recalc_priority_after_op(conn, cur, email_id)
+        elif result.get("ai_blocked"):
+            # T3-G2: vision-ul nu poate rula în acest mediu -> nicio reîncercare nu ar schimba
+            # rezultatul. Finalizare imediată, identică cu fallback-ul de după MAX_EXTRACT_ATTEMPTS.
+            cur.execute(
+                "UPDATE emails SET ai_department=CASE WHEN " + _DEPT_PINNED_SQL +
+                " THEN ai_department ELSE 'suport_1' END, ai_op_extract_at=NOW() WHERE id=%s",
+                (email_id,)
+            )
+            _set_queue(cur, email_id, 'ready_for_cts')
+            conn.commit()
+            results["fallback"] += 1
         else:
             # Serie negăsită la această tentativă — rămâne pending_op_extract pentru retry
             # dacă mai are attempts disponibile; altfel va prinde fallback la runda viitoare

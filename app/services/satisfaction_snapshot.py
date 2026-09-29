@@ -285,6 +285,13 @@ def run_monthly_snapshot(
     if not month_key:
         month_key = now.strftime("%Y-%m")
 
+    from app.services import env_guard
+    if not env_guard.ai_allowed():
+        # T3-G2: scorul vine exclusiv din AI (V6); în afara producției nu se calculează nimic.
+        logger.info("satisfaction snapshot %s: sarit (mediu non-productie)", month_key)
+        return {"processed": 0, "skipped": 0, "carry_forward": 0, "errors": 0, "ai_calls": 0,
+                "month_key": month_key, "skipped_env": True}
+
     start, end = _month_interval(month_key)
     # Momentul de referință pentru recency decay = ultima zi a lunii (sau now dacă luna e curentă)
     ref_now = min(end - timedelta(seconds=1), now)

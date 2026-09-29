@@ -46,6 +46,11 @@ def _run_pipeline(limit: int) -> None:
         except Exception:
             logger.exception("call_transcribe.process_pending_batch failed")
 
+        from app.services import env_guard
+        if not env_guard.ai_allowed():
+            # T3-G2: în afara producției — audio + transcriere rulează, pașii AI nu.
+            logger.info("calls pipeline: categorie/diarizare/scorare sarite (mediu non-productie)")
+            return
         try:
             r_cls = call_classifier.process_pending_batch(limit=limit)
             logger.info("calls_classify: %s", r_cls)

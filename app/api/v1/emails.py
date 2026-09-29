@@ -1025,7 +1025,15 @@ def sync_now(limit: int = Query(100, ge=1, le=1000),
 def process_now(limit: int = Query(50, ge=1, le=500)):
     """Trigger processing of pending emails + avansarea mailurilor de pe calea clean care
     așteaptă categorizare (manual_clean repus de operator + retry error_nova). Rulat de cron
-    la 5 min. advance_queue_batch e no-op dacă schema de cozi nu e încă aplicată."""
+    la 5 min. advance_queue_batch e no-op dacă schema de cozi nu e încă aplicată.
+
+    T3-G2: în afara producției (fără settings['ai.allow_non_production']) pașii care declanșează AI
+    sunt săriți: clasificarea emailurilor (categorie/departament/prioritate/asignare, context client,
+    intent gate — mailurile trec pe calea „AI OFF", eligibile CTS), vision-ul op_series (mailul se
+    finalizează imediat pe fallback), drain-ul de documente, pașii AI din pipeline-ul de apeluri și
+    rezumatul AI din raportul de productivitate. Ingestia și restul logicii rulează ca azi."""
+    from app.services import env_guard as _envg
+    _ai_ok = _envg.ai_allowed()
     res = process_email.process_pending_batch(limit=limit)
     try:
         res["queue_advance"] = process_email.advance_queue_batch(limit=limit)
@@ -1136,11 +1144,12 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
         logger.exception("quality_eval rolling sync failed")
     # STEP 2: proceseaza atasamentele noi (clasificare + extragere documente), fire-and-forget.
     # Daemon thread, best-effort — NU blocheaza si NU afecteaza procesarea emailurilor.
-    try:
-        from app.api.v1 import documents
-        res["doc_drain_started"] = documents._kick_drain("auto")
-    except Exception:
-        logger.exception("doc drain kick failed")
+    if _ai_ok:
+        try:
+            from app.api.v1 import documents
+            res["doc_drain_started"] = documents._kick_drain("auto")
+        except Exception:
+            logger.exception("doc drain kick failed")
     # T3-L1: curăță cache-ul de rezultat AI expirat — cel mult o dată pe oră (poartă atomică în
     # settings), doar cu cache-ul activ. Nu aruncă; blocul try e doar centură.
     try:
@@ -1158,6 +1167,13 @@ def process_now(limit: int = Query(50, ge=1, le=500)):
         res["calls_pipeline_started"] = calls_pipeline.kick(limit=limit)
     except Exception:
         logger.exception("calls pipeline kick failed")
+    if not _ai_ok:
+        _skipped = ["clasificare emailuri (categorie/departament/prioritate/asignare, context client, "
+                    "intent gate)", "op_series vision", "drain documente",
+                    "apeluri: categorie/diarizare/scorare", "rezumat AI productivitate"]
+        logger.info("tick: pasi AI sariti (mediu %s, ai.allow_non_production=false): %s",
+                    _envg.env_name(), "; ".join(_skipped))
+        res["ai_skipped_env"] = _skipped
     return res
 
 

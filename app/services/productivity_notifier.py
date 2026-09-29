@@ -286,6 +286,9 @@ def _generate_ai_summary(group: str, group_lbl: str, prev_year: int, prev_month:
         from app.services import iris_ai
         if not iris_ai.is_configured():
             raise RuntimeError("AI not configured")
+        from app.services import env_guard
+        if not env_guard.ai_allowed():          # T3-G2: fără AI în afara producției -> template
+            raise RuntimeError("AI disabled outside production")
 
         prev_lbl = f"{_luna_label(prev_month)} {prev_year}"
         curr_lbl = f"{_luna_label(curr_month)} {curr_year}"
