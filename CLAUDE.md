@@ -752,6 +752,12 @@ Suport 3, dar SLA-ul de contact (NEW → In progress) curge pe fereastra departa
 fără departament/program rămân pe Suport 3. Aceeași regulă în `_fetch_reclamatie_rows` ȘI
 `breakdown_rows` — se schimbă împreună.
 
+🎯 **Suport 3 — praguri FIXE 82 / 72 (2026-09-30).** `productivity._FIXED_TARGETS` suprascrie
+obiectivul real/minim DUPĂ calculul dinamic și după citirea snapshot-ului, în `department_report`,
+`aggregate_reports` și `forecast_report`. Doar `suport_3`; nu se editează din UI. Snapshot-ul își
+păstrează valorile dinamice (nefolosite pentru Suport 3). Chip-ul „coeficient” rămâne afișat, dar
+nu mai determină ținta Suport 3.
+
 Excluderi din calcul: **doar** flagul `clients.productivity_exclude` (fără liste hardcodate în cod).
 Se aplică pe toate canalele, cu legături diferite per sursă: mail = `emails.client_id` + clientul
 atribuit în CTS (`extra.client_id` = ID IRIS); task = ID IRIS + nume; apel = cheia locală;

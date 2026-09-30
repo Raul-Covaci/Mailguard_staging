@@ -8,6 +8,19 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.39.0 - 2026-09-30
+
+### MINOR — Suport 3: obiectiv real 82% și minim 72%, FIXE
+
+Doar pentru `suport_3`: obiectivul real = **82%** și minimul = **72%**, pe orice lună, independent
+de ore, concedii sau snapshot-ul lunii (bat și valorile deja fixate în snapshot). Restul
+departamentelor rămân pe calculul dinamic (ore disponibile × coeficient, minim = real − 5).
+
+- Sursa: `productivity._FIXED_TARGETS` (în cod, deliberat, nu editabil din UI), aplicată în
+  `department_report`, `aggregate_reports` (interval pe mai multe luni) și `forecast_report`.
+- Statusul (atins / parțial / neatins), gauge-ul și emailul lunar folosesc automat noile praguri.
+- Iulie–septembrie 2026 rămân „atins” (scor 95,61 / 91,27 / 97,41 ≥ 82).
+
 ## v3.38.0 - 2026-09-30
 
 ### MINOR — Productivitate Suport 3: preluarea reclamației curge pe programul departamentului ei

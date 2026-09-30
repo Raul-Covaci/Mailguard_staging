@@ -30,6 +30,14 @@ from sqlalchemy.orm import Session
 from app.services import reclamatie_dept as _reclamatie_dept
 
 _MINIM_DELTA = 5.0          # obiectiv_minim = obiectiv_real - 5
+# Praguri FIXE (real, minim), independente de ore/concedii/snapshot. Decizie business 2026-09-30:
+# DOAR Suport 3; restul departamentelor raman pe calculul dinamic. In cod, deliberat, nu in config
+# editabil din UI.
+_FIXED_TARGETS = {"suport_3": (82.0, 72.0)}
+
+
+def _targets(department: str, obiectiv_real, obiectiv_minim) -> tuple:
+    return _FIXED_TARGETS.get(department, (obiectiv_real, obiectiv_minim))
 _DEFAULT_WORK_HOURS = 8
 _NOTE_INSUFFICIENT = (
     "Nicio solutionare masurabila in aceasta luna (lipsa timp created->solved)."
@@ -1974,6 +1982,7 @@ def department_report(db: Session, department: str, year: int, month: int) -> di
         if not _future:
             _save_snapshot(db, department, year, month, baza_procent, zile_lucratoare_cal,
                            ore_planificate, ore_disponibile, coeficient, obiectiv_real, obiectiv_minim)
+    obiectiv_real, obiectiv_minim = _targets(department, obiectiv_real, obiectiv_minim)
 
     # 4) acumulatori generici, per (tip, categorie) si per operator -- populati mai jos, cate un
     #    bloc per tip de obiectiv. Cheia __general__ marcheaza obiectivul fara categorie.
@@ -2459,6 +2468,7 @@ def aggregate_reports(reports: list) -> dict:
     coeficient = round(baza_procent / ore_plan_ideale_total, 4) if ore_plan_ideale_total > 0 else None
     obiectiv_real = round(ore_disp * coeficient, 2) if coeficient is not None else baza_procent
     obiectiv_minim = round(obiectiv_real - _MINIM_DELTA, 2)
+    obiectiv_real, obiectiv_minim = _targets(department, obiectiv_real, obiectiv_minim)
 
     # Obiective — agregate pe (tip, categorie)
     obj_acc: dict = {}  # key -> {meta, total, measurable, in_timp}
@@ -2747,6 +2757,7 @@ def forecast_report(db: Session, department: str, year: int, month: int) -> dict
         if not _future_fc:
             _save_snapshot(db, department, year, month, baza_procent, zile_lucratoare,
                            ore_planificate, ore_disponibile, coeficient, obiectiv_real, obiectiv_minim)
+    obiectiv_real, obiectiv_minim = _targets(department, obiectiv_real, obiectiv_minim)
 
     # Volume istorice: ultimele 2 luni complete disponibile
     hist_months = []

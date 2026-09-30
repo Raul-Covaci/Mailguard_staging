@@ -45,3 +45,10 @@ def test_evening_complaint_on_suport_1_counts_suport_1_hours():
     s3 = c.business_minutes("suport_3", None, start, taken)
     assert s1 == 4 * 60 + 2 * 60        # 17-21 + 07-09 = 360 min -> overdue la limita de 240
     assert s3 == 60                     # 08-09 = 60 min -> on time pe programul vechi
+
+
+def test_fixed_targets_only_suport_3():
+    assert P._targets("suport_3", 49.76, 44.76) == (82.0, 72.0)
+    assert P._targets("suport_3", None, None) == (82.0, 72.0)
+    for d in ("suport_1", "suport_2", "taxe_drum", "contabilitate", "recuperare_tva"):
+        assert P._targets(d, 90.5, 85.5) == (90.5, 85.5)
