@@ -8,6 +8,26 @@
      Istoricul pre-release (v0.x) păstrat mai jos pentru referință.
 -->
 
+## v3.38.0 - 2026-09-30
+
+### MINOR — Productivitate Suport 3: preluarea reclamației curge pe programul departamentului ei
+
+SLA-ul de contact (NEW → In progress, 240 min) se număra pe programul Suport 3 (08:00–16:30), deși
+reclamațiile se deschid și pe Suport 1 / Suport 2, care lucrează până seara. Acum:
+
+- **Contact**: minutele curg pe programul departamentului pe care e deschisă reclamația în CTS
+  (`cts_quality_evaluation.department_id`, tradus în slug prin departamentul dominant al
+  angajaților — aceeași treaptă ca `cts_email_log`). Programul = regula existentă: pontaj real,
+  apoi `department_schedule`.
+- Reclamația deschisă direct pe Suport 3, fără departament, cu ID CTS netradus sau pe un
+  departament fără program în aplicație (comercial, instalari, product_management) → programul
+  Suport 3, ca până acum.
+- **Soluționarea** rămâne pe programul Suport 3. Scorul rămâne integral la Suport 3.
+- Se aplică pe toate lunile (calcul live); rapoartele lunare deja trimise nu se retrimit.
+- Lista din detaliu (modal) folosește aceeași regulă; câmp nou `program_contact` per rând.
+- Cod: `app/services/reclamatie_dept.py`, `productivity._fetch_reclamatie_rows` + `breakdown_rows`.
+  Teste: `tests/test_reclamatie_contact_dept.py`.
+
 ## v3.37.0 - 2026-09-29
 
 ### MINOR — T3-S1: apelurile cu transcript prea scurt nu se mai scorează

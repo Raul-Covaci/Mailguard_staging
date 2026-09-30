@@ -27,6 +27,8 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.services import reclamatie_dept as _reclamatie_dept
+
 _MINIM_DELTA = 5.0          # obiectiv_minim = obiectiv_real - 5
 _DEFAULT_WORK_HOURS = 8
 _NOTE_INSUFFICIENT = (
@@ -1373,7 +1375,9 @@ def _fetch_apel_rows(db: Session, department: str, first: _dt.date):
 # Nu exista `in_progress_at` daca CTS a trecut-o direct in 'solved' (17 din 123 pe 01.07-13.08).
 #
 # Durata se masoara in minute de PROGRAM, ca la mailuri si task-uri (business_minutes), ca sa nu
-# curga noaptea si in weekend.
+# curga noaptea si in weekend. PRELUAREA curge pe programul departamentului pe care e deschisa
+# reclamatia in CTS (Suport 1/2 lucreaza pina seara), SOLUTIONAREA pe al Suport 3 -- vezi
+# reclamatie_dept.py.
 _RECLAMATIE_CATEGORII = {
     "contact":     "in_progress_at",
     "solutionare": "solved_at",
@@ -1397,7 +1401,8 @@ def _fetch_reclamatie_rows(db: Session, department: str, first: _dt.date, catego
         text(f"""
             SELECT COALESCE(edm_u.id, edm_any.id) AS op_id,
                    qe.created_at AS p_start,
-                   qe.{end_col}  AS p_end
+                   qe.{end_col}  AS p_end,
+                   qe.department_id AS cts_dept
             FROM cts_quality_evaluation qe
             -- Persoana care a miscat reclamatia, daca e din departamentul scorat.
             -- LATERAL + LIMIT 1 e obligatoriu: `cts_dv_employee` e oglinda bruta a DV-ului si are
@@ -1425,8 +1430,31 @@ def _fetch_reclamatie_rows(db: Session, department: str, first: _dt.date, catego
     ).fetchall()
     if biz is None:
         return [(r[0], None) for r in rows]
-    return [(op_id, biz.business_minutes(department, op_id, p_start, p_end, holidays))
-            for op_id, p_start, p_end in rows]
+    if end_col != "in_progress_at":
+        return [(op_id, biz.business_minutes(department, op_id, p_start, p_end, holidays))
+                for op_id, p_start, p_end, _cts in rows]
+    clock, slug_map = _reclamatie_contact_clock(db, first, holidays)
+    return [(op_id, clock.business_minutes(_contact_dept(department, cts, slug_map),
+                                           op_id, p_start, p_end, holidays))
+            for op_id, p_start, p_end, cts in rows]
+
+
+def _reclamatie_contact_clock(db: Session, first: _dt.date, holidays: Optional[list]):
+    """Cache de program pe toate departamentele cu fereastra + traducerea ID CTS -> slug.
+
+    Preluarea curge pe programul departamentului pe care e deschisa reclamatia (vezi
+    reclamatie_dept.py), deci cache-ul departamentului scorat nu ajunge."""
+    last = _month_bounds(first.year, first.month)[1]
+    # Pontajul si din luna precedenta: o reclamatie inregistrata pe 31 si preluata pe 1 ar cadea
+    # altfel pe programul configurat in ziua inregistrarii.
+    clock = _make_biz_cache(db, sorted(_DEPT_WINDOW_DEPARTMENTS), first - _dt.timedelta(days=31), last,
+                            holidays)
+    return clock, _reclamatie_dept.cts_dept_slug_map(db)
+
+
+def _contact_dept(department: str, cts_dept_id, slug_map: dict) -> str:
+    return _reclamatie_dept.contact_clock_dept(department, cts_dept_id, slug_map,
+                                               _DEPT_WINDOW_DEPARTMENTS)
 
 
 def _bd_status(mins: Optional[float], limit: Optional[float], allow_zero: bool = False) -> str:
@@ -1636,6 +1664,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                        cl.name AS client,
                        qe.entity AS entity, qe.entity_id AS entity_id,
                        qe.observations AS observations,
+                       qe.department_id AS cts_dept,
                        qe.is_according_to_the_procedure AS conform,
                        edm_r.name AS evaluat,
                        edm_r.department AS dept_evaluat,
@@ -1680,15 +1709,18 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
         ).fetchall()
         _ENTITY_LABEL = {"client_contact_email_log": "email", "task": "task",
                          "client_call_log": "apel"}
+        clock, slug_map = _reclamatie_contact_clock(db, first, holidays_arr)
         for r in raw:
-            mins = biz.business_minutes(department, r.op_id, r.p_start, r.p_end, holidays_arr)
             # Ambele durate se masoara DIN MOMENTUL INREGISTRARII (created_at), nu una din alta:
             # contact = inregistrare -> preluare, solutionare = inregistrare -> inchidere. Asa e
             # definit SLA-ul, deci timpul de solutionare il include pe cel de contact.
-            mins_contact = (biz.business_minutes(department, r.op_id, r.p_start, r.contact_at, holidays_arr)
+            # Contactul curge pe programul departamentului reclamatiei, solutionarea pe al celui scorat.
+            dept_contact = _contact_dept(department, r.cts_dept, slug_map)
+            mins_contact = (clock.business_minutes(dept_contact, r.op_id, r.p_start, r.contact_at, holidays_arr)
                             if r.contact_at else None)
             mins_solutionare = (biz.business_minutes(department, r.op_id, r.p_start, r.solutionat_at, holidays_arr)
                                 if r.solutionat_at else None)
+            mins = mins_contact if end_col == "in_progress_at" else mins_solutionare
             # is_according_to_the_procedure: 1 = s-a respectat procedura => NEFONDATA.
             fondata = (r.conform == 0)
             out.append({
@@ -1704,6 +1736,7 @@ def breakdown_rows(db: Session, department: str, tip: str, first: _dt.date,
                 "contact_at": _iso(r.contact_at),
                 "solutionat_at": _iso(r.solutionat_at),
                 "durata_contact": round(mins_contact, 1) if mins_contact is not None else None,
+                "program_contact": dept_contact,
                 "durata_solutionare": round(mins_solutionare, 1) if mins_solutionare is not None else None,
                 "durata": round(mins, 1) if mins is not None else None,
                 "status": _bd_status(mins, limita),

@@ -746,6 +746,12 @@ deduplică** — acolo un `BUSY`/`NO ANSWER` urmat de reușită e reapelare real
 `calls.ring_seconds`; pe rândurile vechi e NULL → „nemăsurat", se completează cu
 `POST /calls/backfill-ring?date_from&date_to`.
 
+📝 **Reclamații — preluarea pe programul departamentului CTS (2026-09-30).** Scorul e integral al
+Suport 3, dar SLA-ul de contact (NEW → In progress) curge pe fereastra departamentului din
+`cts_quality_evaluation.department_id` (`app/services/reclamatie_dept.py`); soluționarea și cazurile
+fără departament/program rămân pe Suport 3. Aceeași regulă în `_fetch_reclamatie_rows` ȘI
+`breakdown_rows` — se schimbă împreună.
+
 Excluderi din calcul: **doar** flagul `clients.productivity_exclude` (fără liste hardcodate în cod).
 Se aplică pe toate canalele, cu legături diferite per sursă: mail = `emails.client_id` + clientul
 atribuit în CTS (`extra.client_id` = ID IRIS); task = ID IRIS + nume; apel = cheia locală;
